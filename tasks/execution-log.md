@@ -36,3 +36,21 @@ Date: 2026-02-08 (session). Worker: implement_T01, model openrouter/z-ai/glm-5.3
 - Fixture 11 (Pi ordering, matched injection, redaction-active/template-expanded variants) is spec-level; T08/T12/T13 must implement it against Pi 0.85.0 source before T12/T13 land.
 - `_meta["kiwi.etag"]` key names in read fixtures are fixture conventions pending live confirmation in the T04 runner capability pass.
 - `config/kiwifs-test.local.json` was never opened, printed, or staged; only its existence and ignore status were verified.
+
+## T01 follow-up — devenv test validation gap closed
+
+Date: 2026-02-08 (session). Worker: close_T01_gate, model openrouter/z-ai/glm-5.3-flash per standing instruction.
+
+Prior worker had skipped `devenv test` citing network npm ci/Nix eval; this run confirms it as authorized normal testing and executes it.
+
+### Tests run (actual evidence)
+
+- `devenv test` — **pass** (7.69s): `npm ci` over the network, then `npm run check` (typecheck + prettier + node --test, 3/3 pass) and `npm run pack:check` (Package OK, 4 files; packed extension loads in Pi RPC and reports scaffold status). Full log: "Tests passed :)".
+- `npm run check` — re-run directly: **pass** (3/3 tests, formatting clean).
+- `npm run pack:check` — re-run directly: **pass**.
+- T01 defect inspection: all 20 `test/fixtures/mcp/*.json` files parse as valid JSON; commit `03ede0c` diff reviewed for secrets — none; `config/kiwifs-test.local.json` still ignored and untouched.
+
+### Result
+
+- No T01 defects found; no code changes. Required gate `devenv test` now recorded as completed for T01, not skipped.
+- T01 acceptance criteria remain satisfied; follow-ups unchanged (T04 cursor replay/ETag integration, T16 msg_id framing live confirmation).
