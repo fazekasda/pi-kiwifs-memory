@@ -13,16 +13,31 @@ type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 
 function loadCommand(): Command {
   const commands = new Map<string, Command>();
+  const events: string[] = [];
   const api = {
     registerCommand(name: string, command: Command) {
       assert.equal(commands.has(name), false);
       commands.set(name, command);
     },
-  } satisfies Pick<ExtensionAPI, "registerCommand">;
+    on(event: string) {
+      events.push(event);
+    },
+  } satisfies Pick<ExtensionAPI, "registerCommand"> & {
+    on: (event: string) => void;
+  };
 
-  // Deliberately expose only registration: unexpected startup effects fail.
-  kiwifsMemory(api as ExtensionAPI);
+  // Registration must be synchronous and side-effect free; session handlers
+  // (T08) are registered by event name only.
+  kiwifsMemory(api as unknown as ExtensionAPI);
   assert.deepEqual([...commands.keys()], ["kiwifs-status"]);
+  assert.deepEqual([...events].sort(), [
+    "session_before_fork",
+    "session_before_switch",
+    "session_before_tree",
+    "session_shutdown",
+    "session_start",
+    "session_tree",
+  ]);
   const command = commands.get("kiwifs-status");
   assert.ok(command);
   return command;

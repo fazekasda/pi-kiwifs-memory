@@ -258,11 +258,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Tests exercise startup, new session, resume, fork, branch navigation, reload and shutdown.
-- [ ] Delayed results from a previous generation cannot alter current context or cursors.
-- [ ] Shared ancestor entries are not captured repeatedly merely because a fork occurs.
-- [ ] Duplicate event delivery and repeated teardown are harmless.
-- [ ] Headless/RPC paths never require TUI-only APIs.
+- [x] Tests exercise startup, new session, resume, fork, branch navigation, reload and shutdown. _T08: `test/pi-coordinator.test.ts` drives the full Pi 0.85.0 lifecycle sequence (startup / new / resume / fork / `session_tree` navigation / reload / shutdown) against the documented event order (session_before_switch → shutdown → start, before_fork → shutdown → start{fork})._
+- [x] Delayed results from a previous generation cannot alter current context or cursors. _T08: monotonic generation minted-and-persisted-before-publish; `applyIfCurrent` test proves a late result from the pre-fork generation is discarded and the cursor callback never fires. Review amendment: `session_tree` dedups on the `(oldLeafId, newLeafId)` pair (Pi appends without emitting `session_tree`, so re-visiting the mint-time leaf after appends is a genuine navigation); test extends to navigate-back-to-recorded-leaf after appends._
+- [x] Shared ancestor entries are not captured repeatedly merely because a fork occurs. _T08: durable consumed-entry registry shared across fork boundaries and restarts. Review amendment: `session_before_tree` (cancellable hook) stashes `preparation.entriesToSummarize` and `session_tree` commits them post-navigation — cancelled/absent navigation leaves entries unconsumed, no invisible coverage gap (deliberate deviation from arch §3.3 wording, logged)._
+- [x] Duplicate event delivery and repeated teardown are harmless. _T08: duplicate `session_start` for the live session and duplicate `session_tree` deliveries of the identical `(oldLeafId, newLeafId)` pair do not re-mint; triple `session_shutdown` is a no-op; restart afterwards works._
+- [x] Headless/RPC paths never require TUI-only APIs. _T08: handlers read only `ctx.sessionManager` accessors and `ctx.cwd`; test drives all six handlers with a `ctx.ui` throwing getter; `registerCommand` keeps its existing `hasUI` guard._
 
 ### T09 — Implement incremental observer scheduling
 

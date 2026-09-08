@@ -290,3 +290,40 @@ Date: 2026-09-08 (session). Worker: implement_T07, model openrouter/z-ai/glm-5.3
 
 - No blockers. Follow-ups: T08+ feature code (observation/backup/board) must enqueue through this outbox with redacted payloads and a deterministic idempotency key — the T05 review's pass-discriminator note still applies to provenance-only keys across repeated extraction passes; `kiwi_changes` reconciliation is wired against a fake page provider here — T19 extends it to the live feed; T09 extraction jobs persist opId/source entries here before the model call; a timer/interval driving periodic `tick()` and post-resume delivery lands with T08 hook wiring (the worker currently ticks on demand and on gate resume) and must also schedule `runRetention()`, which is pull-only — capacity is freed only when it is called. A permission check for a pre-existing over-permissive `cursors.json` / outbox directory (currently only the journal file is checked) remains open.
 - `config/kiwifs-test.local.json` was never opened, printed or staged. No live-service contact, no REST fallback, no pushes, tags or deployments.
+
+## T08 — Pi session coordinator
+
+Date: 2026-09-08 (session). Worker: implement_T08, model openrouter/z-ai/glm-5.3-flash per standing instruction. Dependencies T03 (9e1502b), T05 (3fc0b6d), T07 (100a01e): completed receipts verified before starting.
+
+### What landed
+
+1. `src/pi/coordinator.ts` — `SessionCoordinator` per architecture.md §3.3: monotonic generation tokens minted and durably persisted BEFORE publish (tmp → fsync → rename → dir fsync, same pattern as `CursorFile`); `applyIfCurrent` discards delayed results carrying stale generations (never applied to context or cursors); `registerWork`/`runExclusive` bind in-flight work to a generation with abort signals, invalidated on `session_before_switch`/`session_tree`/`session_shutdown`; durable consumed-entry registry shared across forks so shared ancestors are never re-captured (`session_before_tree` stashes `preparation.entriesToSummarize`, `session_tree` commits them post-navigation — see review amendment); idempotent, reentrant `session_shutdown` (timer stop + work abort + flush; triple delivery no-op); duplicate `session_start` for the live session and duplicate `session_tree` deliveries of the identical `(oldLeafId, newLeafId)` pair do not re-mint; corrupt state file fails safe (fresh counter — `applyIfCurrent` equality check still rejects any pre-restart generation); newer `schemaVersion` → `StateSchemaError` fail-closed with visible status, never rewritten.
+2. `src/index.ts` — `registerSessionHandlers` wires all six verified Pi 0.85.0 boundaries (`session_start`, `session_before_fork`, `session_before_switch`, `session_before_tree`, `session_tree`, `session_shutdown`); handlers read only `ctx.sessionManager` accessors and `ctx.cwd` — headless/RPC safe, no TUI APIs. Coordinator init failure disables lifecycle tracking visibly via status output (`session coordinator: DISABLED — …`), never crashes extension startup. State dir convention: `KIWIFS_MEMORY_STATE_DIR` env override else project-local `<cwd>/.kiwifs/memory/` (provisional; final discovery convention is the documented T18 UX follow-up).
+3. Periodic tick + retention (T07 follow-up closed): `SessionCoordinator` owns an interval (default 30 s) started at `session_start`, stopped at `session_shutdown`; every Nth tick (default 10) also invokes the pull-only `runRetention()`. Tick/retention callbacks are injected; the outbox worker and retention are connected when T09 lands feature wiring (the coordinator is constructed without callbacks in `src/index.ts` today, so no timer runs until a pipeline registers work — noted below).
+4. `test/pi-coordinator.test.ts` — 9 tests: full lifecycle sequence (startup/new/resume/fork/tree/reload/shutdown with Pi's documented event order), stale-generation rejection (cursor callback never fires for the pre-fork generation), shared-ancestor no-recapture across fork AND process restart, duplicate delivery + repeated teardown harmlessness, stale-work cancellation (`token.aborted`, `runExclusive` fail-fast, shutdown aborts in-flight work), `before_tree` stash/commit lifecycle incl. already-aborted signal (see review amendment), headless safety with a throwing `ctx.ui` getter, newer-schema fail-closed + visible DISABLED status, timer tick/retention between start and shutdown.
+
+### Review amendment (post-review, pre-commit)
+
+Reviewer verdict: changes requested (2 blockers). Both fixed, plus the two missing tests; remaining review items recorded as follow-ups.
+
+1. **B-1 — navigate-back-to-recorded-leaf now re-mints.** `session_tree` dedup moved from `newLeafId` alone to the `(oldLeafId, newLeafId)` pair: Pi appends messages without emitting `session_tree`, so `branchId` (the leaf at last mint) can be legitimately re-visited later; dedup on the leaf alone silently skipped the re-mint and `invalidateWork`, letting the pre-navigation pack/cursor result pass `applyIfCurrent` on the wrong branch. Duplicate deliveries replay the identical pair and are still skipped. Test added: navigate back to the start leaf after appends discards the late result (cursor callback never fires).
+2. **B-2 — `before_tree` no longer marks consumed durably.** It is a cancellable hook (`SessionBeforeTreeResult.cancel`), so durable consumption there could strand entries in the live branch permanently if navigation is cancelled — an invisible coverage gap. The handler now stashes pending IDs; `session_tree` commits them post-navigation (commit-once dedup via `markConsumed`); shutdown or a never-firing tree drops the stash so entries stay unconsumed and recapturable. **Deliberate deviation from architecture §3.3's "marked consumed at session_before_tree" wording — the code follows the cancellation-safe reading.** Test added: cancelled/absent `session_tree` leaves entries unconsumed and recapturable later.
+
+Reviewer follow-ups (non-blocking, left for later tasks): cross-life generation collision after corrupt-state reset (seed counter from time/random base on reset); `runExclusive` is fail-fast, not a mutex (T09 must not read exclusivity into the name); unbounded `consumedEntries` growth (retention with T09/T18); timer not `unref()`ed; `setCoordinatorErrorProbe` test hook exported from production `src/index.ts`.
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass** (after review amendment): `tsc --noEmit` clean, prettier clean, `node --test` 160/160 (150 prior + 9 + 2 new amendment tests, one reworked for the stash/commit split).
+- `npm run pack:check` — **pass**: Package OK; packed extension loads in Pi RPC and reports scaffold status.
+- `devenv test` — **pass** (12.1s, "Tests passed :)"): npm ci + check + pack:check green in the Nix sandbox (network npm ci is authorized normal testing, not a reason to skip).
+- Node compatibility: devenv Node v24.19.0, engines >=22.19.0; stable APIs only (`node:fs` sync primitives, `node:path`, `setInterval`, `AbortController`) — no version-gated surface. No TUI behavior introduced; no manual TUI check required or performed (headless safety is proven by the throwing-`ui` test).
+- No live-service contact (T08 is local lifecycle only); no REST fallback; no deployments, pushes, tags.
+
+### Acceptance coverage (PRD T08)
+
+All five criteria trace to concrete tests in `test/pi-coordinator.test.ts` as itemized above; PRD checkboxes marked with inline traceability notes.
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups: T09 passes the real outbox tick + retention callbacks into the coordinator (timer currently dormant without them); T09 consumes `markConsumed`/`isConsumed` as its source-coverage registry and feeds `preparation.entriesToSummarize` (T08 handles the shape it was given); state-dir location convention finalized in T18 (loader discovery + scope resolver's real `git remote -v` consumption); T12/T13 own fixture 11 (Pi-side matched injection) as previously recorded.
+- `config/kiwifs-test.local.json` was never opened, printed or staged.
