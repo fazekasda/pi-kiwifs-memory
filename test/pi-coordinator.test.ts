@@ -23,6 +23,7 @@ import {
   StateSchemaError,
 } from "../src/pi/coordinator.ts";
 import {
+  buildSessionRuntime,
   registerSessionHandlers,
   resolveStatusText,
   setCoordinatorErrorProbe,
@@ -332,10 +333,7 @@ test("headless/RPC safety: handlers never require TUI-only APIs", async () => {
     },
   } as unknown as ExtensionAPI;
 
-  registerSessionHandlers(
-    api,
-    (cwd) => new SessionCoordinator({ stateDir: join(cwd, "state") }),
-  );
+  registerSessionHandlers(api, (cwd) => buildSessionRuntime(cwd));
 
   // ctx.ui is a throwing getter: any TUI access fails loudly.
   const ctx = {
@@ -370,7 +368,10 @@ test("headless/RPC safety: handlers never require TUI-only APIs", async () => {
   }
 
   const state = JSON.parse(
-    readFileSync(join(dir, "state", "session-coordinator.json"), "utf8"),
+    readFileSync(
+      join(dir, ".kiwifs", "memory", "session-coordinator.json"),
+      "utf8",
+    ),
   ) as { generation: number };
   assert.equal(state.generation >= 1, true);
 });

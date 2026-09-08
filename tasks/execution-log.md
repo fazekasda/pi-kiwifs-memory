@@ -327,3 +327,45 @@ All five criteria trace to concrete tests in `test/pi-coordinator.test.ts` as it
 
 - No blockers. Follow-ups: T09 passes the real outbox tick + retention callbacks into the coordinator (timer currently dormant without them); T09 consumes `markConsumed`/`isConsumed` as its source-coverage registry and feeds `preparation.entriesToSummarize` (T08 handles the shape it was given); state-dir location convention finalized in T18 (loader discovery + scope resolver's real `git remote -v` consumption); T12/T13 own fixture 11 (Pi-side matched injection) as previously recorded.
 - `config/kiwifs-test.local.json` was never opened, printed or staged.
+
+## T09 — Incremental observer scheduling (2026-09-08)
+
+Status: implemented, independent review passed (no blockers), all gates green, committed.
+
+### Independent review outcome (pre-commit)
+
+Reviewer verdict: correct and complete per all six acceptance criteria; no blockers — no correctness, security, privacy, lifecycle, concurrency or package defect at blocker level. Reviewer re-ran `node --test test/observation.test.ts` locally: 16/16 pass. Non-blocking findings disposition:
+
+- Fixed in this task (trivial, actionable now):
+  - Stale comment fix (`src/observation/scheduler.ts`): `PendingBatchRecord.sources` doc claimed "entry views captured at batch creation (redaction re-applied at run)" but the record stores only entry IDs; comment now states views/redaction are re-derived from the provider at run.
+  - Abort-listener leak fix (`src/observation/scheduler.ts`): `onBeforeCompact` now removes the `abort` listener in the `finally` block so a shared signal does not accumulate one listener per compaction.
+- Deferred as already-planned follow-ups (reviewer concurred): sessionId refresh limited to `session_start` + `branchId` not passed into the idempotency key (T10); per-batch extraction retry cooldown on `agent_settled` (T10); oversized-first-entry soft budget (T13 enforced cap); unbounded `consumedEntries`/pending registries (T18).
+- Re-run after fixes: `npm run check` pass (176/176), `npm run pack:check` pass, `devenv test` pass.
+
+### What landed
+
+1. `src/observation/scheduler.ts` (new) — `ObserverScheduler` per architecture.md §3.2 / decisions.md #6:
+   - Selection: unprocessed entries = message text present, not in the coordinator's durable consumed registry, not in a pending batch, not extension-internal (`toSourceViews` skips Pi `custom_message`/`custom` entries — in particular every `kiwifs.`-prefixed one — and non-user/assistant messages), not excluded by compiled exclusion rules (scope + pattern dimensions; pathPrefix rules can never fire on source entries).
+   - Batching ([P] §13 defaults): ≥2,000 tokens or ≥10 turns or 5-min idle, whichever first; budgets 6,000/3,000 tokens; pending-batch queue caps at 20 — excess MERGES into the oldest pending range (never dropped, never silently dropped). `estimateTokens` is a disclosed ~4-chars/token approximation — the model-compatible tokenizer (with framing) is a hard requirement only for the T13 enforced injection cap, not for these scheduling thresholds.
+   - Durability: each batch is persisted to `observer-state.json` (tmp → fsync → rename → dir fsync, same pattern as the coordinator/cursor) with `opId` + entry IDs + batch parameters BEFORE the model call; the extraction result is enqueued as a durable outbox job (`kind: "observation"`, deterministic idempotency key over `{sessionId, branchId?, entryIds}`) BEFORE `markConsumed` — the cursor advances only on durable outbox acceptance. Crash re-derivation re-runs pending batches under their ORIGINAL opIds; corrupt/newer-schema state files fail safe (empty pending — worst case is an idempotent re-extraction, never a loss or duplicate).
+   - Generation safety: the result is applied only if `coordinator.isCurrent(gen)`; stale results leave the batch pending on the new generation for re-derivation.
+   - Pre-compaction flush: one attempt bounded by a 5 s self-timeout AND the event signal; never returns `cancel` (index.ts handler always returns `{}`); on timeout/abort the batch stays durably pending with visible status.
+   - Privacy: the real `createRedactor()` (T06) guards the model-call edge; a redaction failure holds the batch (fail closed); enqueue re-screens queue bytes.
+2. `src/index.ts` — `buildSessionRuntime`: lazily at first `session_start` opens the durable outbox (`<stateDir>/outbox`), builds the `OutboxWorker` with a retryable `SenderNotWiredError` stub sender (uncapped attempts — an availability gap, replaced by T10's real sender; jobs stay pending, never quarantined/dropped), and passes REAL `onTick`/`onRetention` callbacks into the coordinator, closing the T08 dormant-timer follow-up. New hooks: `agent_settled` → `onAgentSettled()`, `session_before_compact` → bounded flush that never cancels compaction. Observer/outbox init failures are visible in status (`observer: DISABLED — …`), never crash startup. T08's headless test now drives the full runtime (outbox + observer included) through all lifecycle events with a throwing `ctx.ui`.
+3. `test/observation.test.ts` (new) — 16 tests covering all six acceptance criteria (traceability notes inline in the PRD) plus queue-cap merge, idle batching, input-budget capping, stale generation, manual extraction, and redaction-before-model.
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 176/176 (160 prior + 16 new).
+- `npm run pack:check` — **pass**: Package OK, 28 files; packed extension loads in Pi RPC.
+- `devenv test` — **pass** (10.0s, "Tests passed :)"): npm ci + check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0 vs engines >=22.19.0; stable APIs only (`node:fs` sync, `node:crypto.randomUUID`, `setTimeout.unref`). No TUI behavior introduced; headless safety preserved (no new TUI access; T08's throwing-`ui` test still green over the full runtime).
+- Staged-diff secret scan (pre-commit): synthetic test strings only; `config/kiwifs-test.local.json` never opened or staged; no live-service contact (all scheduler tests are local fakes); no REST fallback; no pushes/tags/deployments.
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups:
+  - T10: replace the `SenderNotWiredError` stub with the real model-observation sender; wire config-driven scope/model/exclusion plumbing into `buildSessionRuntime` (scope is the provisional `"local"` and sessionId is refreshed at `session_start` only).
+  - T13: enforced evidence cap requires a model-compatible tokenizer incl. framing; `estimateTokens` here is scheduling-only and disclosed as approximate; visible skip of automatic injection if unavailable stays T13's obligation.
+  - T18: manual `/kiwifs-extract` command wiring to `extractNow()`; finalize state-dir discovery; consumedEntries/pending-state retention policy (both registries grow unbounded in this iteration).
+  - T11+: reflections/conflicts consume the same batch pipeline; extraction failure policy for compaction (always-continue) matches decisions.md #6 — pre-compaction cancellation policy stays unimplemented by design (explicit decision recorded in the PRD research constraints).

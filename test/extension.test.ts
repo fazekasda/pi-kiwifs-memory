@@ -31,6 +31,8 @@ function loadCommand(): Command {
   kiwifsMemory(api as unknown as ExtensionAPI);
   assert.deepEqual([...commands.keys()], ["kiwifs-status"]);
   assert.deepEqual([...events].sort(), [
+    "agent_settled",
+    "session_before_compact",
     "session_before_fork",
     "session_before_switch",
     "session_before_tree",
