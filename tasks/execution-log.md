@@ -83,7 +83,7 @@ Date: 2026-09-08 (session). Worker: implement_T02, model openrouter/z-ai/glm-5.3
 
 ## T03 — Implement validated configuration and scope identity
 
-Date: 2026-02-09 (session). Worker: implement_T03, model openrouter/z-ai/glm-5.3-flash per standing instruction.
+Date: 2026-09-08 (session). Worker: implement_T03, model openrouter/z-ai/glm-5.3-flash per standing instruction.
 
 ### Prior state verified
 
