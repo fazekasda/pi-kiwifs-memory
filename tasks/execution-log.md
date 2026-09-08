@@ -115,3 +115,63 @@ Date: 2026-09-08 (session). Worker: implement_T03, model openrouter/z-ai/glm-5.3
 ### Blockers / follow-ups
 
 - No blockers. Follow-ups for later tasks: status output later extended per-feature as domains land (T08+); loader file location convention (project-local vs user-global discovery) is a T08/T18 UX decision; scope resolver consumes real `git remote -v` output starting T08 (module accepts remotes as input already).
+
+## T04 — Implement backend adapter and contract tests
+
+Date: 2026-09-08 (session). Worker: implement_T04, model openrouter/z-ai/glm-5.3-flash per standing instruction.
+
+### Prior state verified
+
+- Dependency receipts confirmed: T01 `03ede0c` (+ gate closure `c0e0f1a`), T02 `68cb432`, T03 `92b1520` (+ review fix `9e1502b`). All T04-relevant fixtures existed in `test/fixtures/mcp/` with the catalog in `docs/research/adapter-fixtures.md`; the live-runner spec existed in `docs/research/live-mcp-runner.md`. No T04 code existed yet.
+
+### Work done
+
+1. `src/backend/errors.ts` — typed error taxonomy (auth/validation/conflict/timeout/cancelled/availability/response-format/capability/not-persisted); authorization failures are terminal, only availability faults are retryable.
+2. `src/backend/opid.ts` — op-id minting + ledger interface; every mutation calls `assertPersisted` and refuses side effects for unpersisted opIds (architecture.md §2; durable persistence wiring lands with the T07 outbox).
+3. `src/backend/transport.ts` — MCP Streamable HTTP: stateless initialize per logical connection, `tools/list`, `tools/call`; `redirect: "error"` + 3xx refusal (no credential forwarding); content-length + streamed bounded reads; per-request timeout combined with the caller AbortSignal; typed Timeout/Cancelled errors; JSON-RPC id-mismatch and protocol-error handling.
+4. `src/backend/adapter.ts` — capability-discovery gate on connect (required-tool set only; no hard-coded count), client-side limits (clamp 50 / 32 MiB / 500-char path), all verified operations (read with `if_not_etag` + not_modified, write, append, delete, FTS/semantic/hybrid search, brief, changes, query_meta, forget), B2 read-before-write `writeImmutable` (identical replay → no-op, differing content → fail-closed ConflictError), hybrid degradation from rank attribution only, isError → typed ValidationError, single availability retry, sanitized error messages. Missing-path reads return a typed `missing` state (read-back is control flow for B2/guard step 1).
+5. `src/backend/guard.ts` — the 5-step fail-closed guard pipeline (fresh read-back → memory_status absent/active → scope ∈ authorized set → `{scope}/memory/` prefix → pluggable privacy redaction; real redaction rules are T06), advisory `QueryMetaTombstoneCache` (5-min TTL, §13 row 7), brief scope gate with 25%-threshold fallback rebuild from scoped search (§13 row 4).
+6. `src/backend/ids.ts` — `msg_id` = 16-hex SHA-256 of slash-joined `'{channel}/{from}/{opId}'`, asserted against the real-SHA-256 vectors in `board-msg-id-vectors.json` (dual-sender distinctness + replay stability).
+7. `src/backend/parse.ts` — typed parsers over KiwiFS text results; non-throwing on unexpected shapes.
+8. `test/fake-mcp-server.ts` — in-memory fake KiwiFS MCP server (initialize/tools/list/tools/call, frontmatter-aware store, forget rewrites status, fault injection: 401/302/hang/invalid-JSON/oversized body). All synthetic.
+9. `src/backend/live/runner.ts` + `npm run test:live` — the opt-in live runner per `docs/research/live-mcp-runner.md`: opt-in gate (`KIWIFS_LIVE_TESTS=1` + local config), fail-closed preconditions incl. exact safety-policy match, capability discovery before mutation, routing check (sentinel absent) before first write, synthetic CRUD/FTS round trip under `integration-tests/{random-run-id}/`, manifest-owned reverse-order cleanup with post-delete verification and leftover reporting, per-request/run deadlines, redacted diagnostics, exit codes 0/2/3/4.
+10. `docs/backend-adapter.md` — configuration and observable-behavior documentation for the adapter surface and the runner.
+11. PRD T04 checkboxes updated with evidence; `docs/research/adapter-fixtures.md` honest-gap items dispositioned as recorded below.
+
+### Live evidence (opt-in runner only; config file consumed programmatically, never read or emitted)
+
+- `KIWIFS_LIVE_TESTS=1 npm run test:live` — **clean-pass**, run id `0b7c88c743aa`: 71 tools advertised (matches `docs/test-environment.md`), no required tool missing, routing check ok, synthetic create/read-back/update/FTS (hit pending async indexing — disclosed)/delete + post-delete absence verified, cleanup zero leftovers. Auth note: connectivity evidence only, never auth/isolation proof.
+- ETag carrier probe (synthetic path, deleted and verified after): live `kiwi_write` returns `Written <path> (ETag: <64-hex>)` in the **text result**; `kiwi_read` `_meta` is **empty** live. Adapter updated: not_modified ETag now falls back to parsing the text; read `_meta["kiwi.etag"]` remains a synthetic-fixture convention only (fixtures catalog gap dispositioned). The 16-hex `msg_id` truncation stays a [P] default for T16 live confirmation.
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 75/75 (44 pre-existing + 31 new across `backend.test.ts`, `guard.test.ts`, `live-runner.test.ts`).
+- `npm run pack:check` — **pass**: Package OK, 16 files (src only; fixtures and fake server are test-only and correctly excluded), packed extension loads in Pi RPC.
+- `devenv test` — **pass** (8.58s, "Tests passed :)"): network `npm ci`, then check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0, engines >=22.19.0; only stable APIs used (`fetch`, `AbortController`/`AbortSignal`, `crypto.randomUUID`/`createHash`, streams) — no version-gated surface.
+- No TUI behavior introduced; no manual TUI check required or performed.
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups: fixture 11 (Pi-side ordering/matched injection) remains T08/T12/T13-owned; 16-hex `msg_id` truncation default to confirm live in T16; guard redaction is a pluggable identity placeholder until the T06 privacy gate lands; live-runner suite extensions (semantic/hybrid legs, changes replay) are T19 scope; `kiwi.etag` read `_meta` fixture key documented as synthetic-only.
+- `config/kiwifs-test.local.json` was never opened, printed or staged; the runner and probe consumed it programmatically and emitted only redacted diagnostics. No production space was contacted; no REST fallback used; no pushes, tags or deployments.
+
+## T04 review fixes — transport deadline coverage and non-idempotent retry policy
+
+Date: 2026-09-08 (session). Worker: commit_T04, model openrouter/z-ai/glm-5.3-flash per standing instruction.
+
+Independent review verdict: implementation and gates verified, two blockers to fix before commit. Both fixed.
+
+### Fixes
+
+1. **Per-request deadline now covers the response body** (`src/backend/transport.ts`): the timeout `clearTimeout` moved from the fetch-leg `finally` to a single outer `finally` wrapping fetch + `readBounded`. An abort during the body read maps to the same typed `TimeoutError`/`CancelledError` as the fetch leg. New fake-server behavior `stallBodyAfterBytes` (headers then mid-body stall until abort) and test: `TimeoutError` within the 250 ms bound on a stalled body.
+2. **Availability retry restricted to idempotent tools** (`src/backend/adapter.ts`): `IDEMPOTENT_TOOLS` allowlist (read/write/delete/search×3/brief/changes/query_meta/forget); `kiwi_append` — non-idempotent per `mcp-contracts.md` — is never retried; a transport fault after a committed append surfaces as an error, never a silent duplicate. Tests: append fault → exactly one call attempt, no partial content; changes fault → exactly two attempts (one successful replay). Reviewer minor also applied: JSON-RPC protocol errors now map to non-retryable `ResponseFormatError` (previously retryable `AvailabilityError`).
+
+Remaining reviewer minors (searchHybrid `scope` forwarding, tombstone-cache doc/waste, loose `/not found/i` matching, brief section-boundary fragility, live-runner deadline-mid-suite test) recorded as follow-ups, not blockers.
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 78/78 (75 prior + 3 new).
+- `npm run pack:check` — **pass** (Package OK, packed extension loads in Pi RPC).
+- `devenv test` — **pass** (8.84s, "Tests passed :)").
+- Node compatibility unchanged: devenv Node v24.19.0 vs engines >=22.19.0; `ReadableStream` controller-error on abort is a stable API.

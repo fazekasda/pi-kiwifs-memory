@@ -39,6 +39,7 @@
     "dev": "pi -e ./src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts",
+    "test:live": "node src/backend/live/runner.ts",
     "test:watch": "node --test --watch test/*.test.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
