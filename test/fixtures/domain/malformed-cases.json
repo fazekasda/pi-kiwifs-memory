@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "name": "future-schema-version",
+      "markdown": "---\nschemaVersion: 2\nid: abcdef0123456789\ntype: observation\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: active\n---\ncontent from a future version",
+      "expect": "future-version"
+    },
+    {
+      "name": "missing-schema-version",
+      "markdown": "---\nid: abcdef0123456789\ntype: observation\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "zero-schema-version",
+      "markdown": "---\nschemaVersion: 0\nid: abcdef0123456789\ntype: observation\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "unknown-record-type",
+      "markdown": "---\nschemaVersion: 1\nid: abcdef0123456789\ntype: diary\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "unknown-lifecycle-status",
+      "markdown": "---\nschemaVersion: 1\nid: abcdef0123456789\ntype: observation\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: archived\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "path-escaping-id",
+      "markdown": "---\nschemaVersion: 1\nid: ../../etc/passwd\ntype: observation\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "cross-scope-frontmatter",
+      "markdown": "---\nschemaVersion: 1\nid: abcdef0123456789\ntype: observation\nscope: cross/other-project\ncreated: 2026-09-08T10:30:00Z\nsources: []\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "broken-sources-json",
+      "markdown": "---\nschemaVersion: 1\nid: abcdef0123456789\ntype: observation\nscope: personal\ncreated: 2026-09-08T10:30:00Z\nsources: not-json\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    },
+    {
+      "name": "invalid-created-timestamp",
+      "markdown": "---\nschemaVersion: 1\nid: abcdef0123456789\ntype: observation\nscope: personal\ncreated: not-a-date\nsources: []\nstatus: active\n---\nbody",
+      "expect": "malformed"
+    }
+  ]
+}

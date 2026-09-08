@@ -175,3 +175,34 @@ Remaining reviewer minors (searchHybrid `scope` forwarding, tombstone-cache doc/
 - `npm run pack:check` — **pass** (Package OK, packed extension loads in Pi RPC).
 - `devenv test` — **pass** (8.84s, "Tests passed :)").
 - Node compatibility unchanged: devenv Node v24.19.0 vs engines >=22.19.0; `ReadableStream` controller-error on abort is a stable API.
+
+## T05 — Versioned records, provenance, idempotency and namespace isolation
+
+Date: 2026-09-08 (session). Worker: implement_T05, model openrouter/z-ai/glm-5.3-flash per standing instruction. Dependencies T02 (docs), T03, T04: completed receipts verified before starting.
+
+### Work done
+
+1. `src/domain/records.ts` — versioned record schemas per architecture.md §2: `SCHEMA_VERSION = 1`; `RecordFrontmatter` (`schemaVersion`, `id`, `type observation|reflection|proposal|backup-chunk|board-message`, single-owner `scope` ∈ `project/{id}|personal`, `created` ISO-8601, `sources: SourceRef[]`, `model?`, `status active|superseded|pending-approval`); board-message routing fields (`to`/`from`/`channel`/`ttl`). `SourceRef {sessionId, branchId?, entryIds[]}` keeps the three distinct identity spaces (session / Pi branch / entry ids). Markdown wire format via `serializeStoredRecord`/`parseStoredRecord` (flat frontmatter, newline-bearing values rejected). Local artifacts (tombstone, processing cursor with `lastConsumedEntryId` coverage position, backup manifest with chunk checksums, redaction counts — never values — and omission list) parsed with the same fail-safe rule.
+2. `src/domain/paths.ts` — strict untrusted-id grammar `^[a-z0-9][a-z0-9-]{0,63}$` (`validateId` → `PathEscapeError`, a `validation` `BackendError`); `validateProjectId` for git identities (rejects `..`/empty segments, uppercase, whitespace, backslash, percent-encoding); deterministic path builders (`memoryRecordPath` with `yyyy/mm` dirs, `backupManifestPath`, `backupChunkPath` `{seq:06d}`, `boardMessagePath`); containment predicates for guard step 4 (`pathWithinMemoryNamespace`, `pathWithinBoardChannel`, `pathWithinBackupTree` — prefix-boundary safe, `..` segments rejected).
+3. `src/domain/idempotency.ts` — deterministic idempotency keys: SHA-256 (first 32 hex) over canonical JSON of `{kind, scope, channel?, sources}` (`canonicalJson` sorts object keys recursively, preserves array order — entry order is part of the work's identity). Forked sessions share entry history but mint a new sessionId → distinct keys; no content hash is ever used as identity (architecture.md §2). `deriveRecordId(kind, opId)` derives 16-hex record ids from persisted opIds, consistent with T04's `deriveMsgId` convention (test cross-checks both).
+4. Migration policy (architecture.md §9): forward-compatible reader only — `schemaVersion > 1` → `future-version`, read-only, visible; malformed → typed `malformed`; the serializer refuses to write any non-current version, so no destructive rewrite path exists. The explicit one-way upgrade command stays a later-minor-version item.
+5. Fixtures (synthetic data only): `test/fixtures/domain/records.json` (observation with branch provenance; board message), `malformed-cases.json` (9 fail-safe cases incl. future version, traversal id, cross-scope frontmatter), `local-artifacts.json` (valid tombstone/cursor/manifest + future-version cursor).
+6. Tests: `test/domain.test.ts` — 26 new tests (round-trip, provenance distinctions, per-case malformed fail-safe, local artifact parse/round-trip, idempotency key determinism/forking/scoping, record-id derivation, grammar/escape rejections, path builders, containment checks).
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 105/105 (78 prior + 26 new + 1 TZ-independence test added post-review).
+- `npm run pack:check` — **pass**: Package OK, 19 files (src only; domain fixtures test-only and correctly excluded), packed extension loads in Pi RPC.
+- `devenv test` — **pass** (8.86s, "Tests passed :)"): network `npm ci` (0 vulnerabilities), then check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0, engines >=22.19.0; only stable APIs (`node:crypto` `createHash`, `Date.parse`, JSON, `node:child_process` `execFile`) — no version-gated surface.
+- No TUI behavior introduced; no manual TUI check required or performed.
+
+### Post-review fixes applied
+
+- **UTC month bucketing** (review finding 1, fixed in this commit): `memoryRecordPath` previously used local-time `getFullYear()/getMonth()`, making the deterministic path depend on the process timezone and breaking read-before-write idempotency across TZs. Switched to `getUTCFullYear()/getUTCMonth()`; new test spawns node under `TZ=UTC` and `TZ=Asia/Tokyo` with a month-boundary date (2026-08-31T15:30Z) and asserts identical `2026/08` bucketing.
+- Review findings 3–5 accepted as-is: parsed frontmatter must never flow unvalidated into path construction (T15+ board repository obligation); duplicate-key last-line-wins and the loose 36-hex-shape UUID check are fail-safe in direction and remain unchanged.
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups: T06 supplies the real privacy gate (records here carry unredacted-at-rest content by design; redaction is enforced at outbound edges); T07 wires the durable outbox job shape (`{seq, schemaVersion, kind, scope, opId, idempotencyKey, payload, attempts, nextAttemptAt, createdAt}`) onto these schemas; backend record write paths (adapter writeImmutable callers) consume `memoryRecordPath`/`deriveRecordId` from T08 onward; explicit one-way schema-upgrade command deferred to a later minor version per architecture.md §9; T07 must either treat one-observation-per-source-set as an invariant or add a pass discriminator to the idempotency key (provenance-only keys collide across repeated extraction passes over the same entries — consistent with "no content hash as identity", arch §2).
+- `config/kiwifs-test.local.json` was never opened, printed or staged. No live-service contact (T05 is local schemas only); no REST fallback; no pushes, tags or deployments.

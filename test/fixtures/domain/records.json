@@ -1,0 +1,12 @@
+{
+  "records": [
+    {
+      "name": "observation-with-branch-provenance",
+      "markdown": "---\nschemaVersion: 1\nid: 3f9a2b1c8d4e5f60\ntype: observation\nscope: project/github.com/org/repo\ncreated: 2026-09-08T10:30:00Z\nsources: [{\"sessionId\":\"s-abc\",\"branchId\":\"b-main\",\"entryIds\":[\"e1\",\"e2\"]}]\nmodel: openrouter/z-ai/glm-5.3-flash\nstatus: active\n---\nUser prefers concise commit messages."
+    },
+    {
+      "name": "board-message",
+      "markdown": "---\nschemaVersion: 1\nid: 0123456789abcdef\ntype: board-message\nscope: project/github.com/org/repo\ncreated: 2026-09-08T11:00:00Z\nsources: [{\"sessionId\":\"s-abc\",\"entryIds\":[\"e9\"]}]\nstatus: active\nto: reviewer-agent\nfrom: implementer-agent\nchannel: project-updates\nttl: 30d\n---\nT05 landed; please review the domain schemas."
+    }
+  ]
+}

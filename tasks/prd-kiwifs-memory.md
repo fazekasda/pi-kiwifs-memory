@@ -208,11 +208,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Round-trip tests preserve supported metadata and content.
-- [ ] Malformed and unknown future versions fail safely without destructive rewrites.
-- [ ] Source references distinguish session, branch and entry IDs.
-- [ ] Idempotency key tests cover repeated events and forked/shared history.
-- [ ] Untrusted paths/IDs cannot escape their intended namespace.
+- [x] Round-trip tests preserve supported metadata and content. _T05: `test/domain.test.ts` round-trips every record in `test/fixtures/domain/records.json` (markdown → parse → serialize → parse; frontmatter and body deep-equal); board-message routing fields (`to`/`from`/`channel`/`ttl`) preserved; serialization refuses non-current schemaVersions._
+- [x] Malformed and unknown future versions fail safely without destructive rewrites. _T05: 9 malformed fixtures (`malformed-cases.json`) each fail with typed reason and `readOnly: true`; future `schemaVersion: 2` backend records and local artifacts fail as `future-version` read-only; nothing is ever rewritten (writer refuses schemaVersion ≠ 1)._
+- [x] Source references distinguish session, branch and entry IDs. _T05: `SourceRef {sessionId, branchId?, entryIds[]}` round-trips all three id spaces distinctly; a source without branchId gains no phantom value; fork with shared entries but new sessionId has a distinct idempotency key._
+- [x] Idempotency key tests cover repeated events and forked/shared history. _T05: same event → same key (key-order independent via canonical JSON); forked session/other branch/reordered entries/different scope → distinct keys; record ids derive from persisted opIds (`deriveRecordId`, 16-hex) and stay consistent with T04's `deriveMsgId` convention._
+- [x] Untrusted paths/IDs cannot escape their intended namespace. _T05: strict grammar `^[a-z0-9][a-z0-9-]{0,63}$` (`validateId`) rejects traversal/encoding/length/charset attacks; `validateProjectId` rejects `..` segments and separator abuse while accepting T03 git identities; path builders (`memoryRecordPath`, `backupManifestPath`, `backupChunkPath`, `boardMessagePath`) and containment checks (`pathWithinMemoryNamespace`, `pathWithinBoardChannel`, `pathWithinBackupTree`) tested against `../`, `%2e%2e`, prefix-boundary (`memory-evil/`) and cross-scope escapes. Post-review: `memoryRecordPath` month buckets switched to UTC (`getUTCFullYear`/`getUTCMonth`) so the deterministic path is timezone-independent; verified by a TZ=UTC vs TZ=Asia/Tokyo month-boundary test._
 
 ### T06 — Implement privacy gate and sanitized audit events
 

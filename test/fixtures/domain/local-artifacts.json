@@ -1,0 +1,40 @@
+{
+  "valid": {
+    "tombstone": {
+      "schemaVersion": 1,
+      "path": "project/github.com/org/repo/memory/observations/2026/09/abcdef0123456789.md",
+      "status": "superseded",
+      "supersededAt": "2026-09-08T12:00:00Z",
+      "reason": "merge: superseded by abcdeffffffffffff"
+    },
+    "cursor": {
+      "schemaVersion": 1,
+      "sessionId": "s-abc",
+      "lastConsumedEntryId": "e42",
+      "updatedAt": "2026-09-08T12:00:00Z"
+    },
+    "manifest": {
+      "schemaVersion": 1,
+      "projectId": "github.com/org/repo",
+      "sessionId": "s-abc",
+      "coveredRange": { "firstEntryId": "e1", "lastEntryId": "e42" },
+      "chunks": [
+        {
+          "seq": 0,
+          "path": "backup/github.com/org/repo/s-abc/000000.md",
+          "checksum": "sha256-0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "redactionSummary": { "apiKeyLike": 2, "email": 1 },
+      "omissions": [{ "entryId": "e7", "reason": "binary-omitted" }],
+      "createdAt": "2026-09-08T12:00:00Z"
+    }
+  },
+  "futureVersion": {
+    "schemaVersion": 2,
+    "sessionId": "s-abc",
+    "lastConsumedEntryId": "e42",
+    "updatedAt": "2026-09-08T12:00:00Z",
+    "newField": true
+  }
+}
