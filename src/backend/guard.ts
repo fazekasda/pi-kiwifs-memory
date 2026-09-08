@@ -7,12 +7,16 @@
  *   3. scope check — $.scope ∈ session's authorized scope set (the ONLY gate
  *      on hybrid/brief legs, which carry no scope parameter)
  *   4. path-prefix check — within the scope's memory/ namespace
- *   5. privacy redaction of the content (pluggable until T06)
+ *   5. privacy redaction of the content (T06 rules from src/privacy/redaction.ts
+ *      via `createRedactor()`; callers may override with `deps.redact`.
+ *      `identityRedactor` is an explicit test-only opt-out — never a
+ *      production default)
  *
  * The local tombstone cache (superseded paths) is ADVISORY pre-filtering
  * only: a cache miss never permits injection — the read-back is the gate.
  */
 
+import { createRedactor } from "../privacy/redaction.ts";
 import { parseFrontmatter } from "./parse.ts";
 import type { ScoredHit } from "./parse.ts";
 import type { KiwiFSAdapter } from "./adapter.ts";
@@ -21,7 +25,10 @@ export type Redactor = (
   content: string,
 ) => { ok: true; content: string } | { ok: false; reason: string };
 
-/** Identity redactor placeholder; T06 supplies the real privacy gate. */
+/**
+ * No-op redactor: TEST-ONLY opt-out for suites that explicitly disable the
+ * privacy gate. Production callers must never pass this as `deps.redact`.
+ */
 export const identityRedactor: Redactor = (content) => ({ ok: true, content });
 
 export type GuardResult =
@@ -146,7 +153,9 @@ export async function guardCandidate(
     };
   }
   // Step 5 — privacy redaction (fail closed on classification failure).
-  const redact = deps.redact ?? identityRedactor;
+  // Fail safe default: omitting `deps.redact` enables the real T06 redactor,
+  // so a caller forgetting the override cannot ship unredacted content.
+  const redact = deps.redact ?? createRedactor();
   const redacted = redact(read.body);
   if (!redacted.ok) {
     return { ok: false, step: "redaction", reason: redacted.reason };

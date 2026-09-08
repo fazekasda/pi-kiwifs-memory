@@ -32,6 +32,7 @@ export function resolvedStatusLines(config: MemoryConfig): string[] {
     `cross-project opt-in: ${optIn}`,
     `budgets: ragDeadlineMs=${config.budgets.ragDeadlineMs} evidenceTokenCap=${config.budgets.evidenceTokenCap}`,
     `effective features: observation=${features.observation} backup=${features.backup} board=${features.board}`,
+    `privacy exclusions: ${config.privacy.exclusions.length} rule(s)`,
     ...(config.projectIdentity
       ? [`project identity: ${config.projectIdentity} (explicit override)`]
       : []),

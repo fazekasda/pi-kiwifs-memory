@@ -14,6 +14,16 @@ export const CURRENT_SCHEMA_VERSION = 1;
 
 export const DEFAULT_MODEL_ROUTE = "openrouter/z-ai/glm-5.3-flash";
 
+/** Exclusion rule shape (T06, src/privacy/exclusions.ts). */
+export interface ExclusionRule {
+  /** Exclude content belonging to this project scope value. */
+  project?: string;
+  /** Exclude whole files under this backend path prefix. */
+  pathPrefix?: string;
+  /** Exclude content matching this regex source. */
+  pattern?: string;
+}
+
 /** Credential reference. The resolved secret value never lives in config. */
 export type AuthRef =
   { kind: "env"; ref: string } | { kind: "file"; ref: string };
@@ -46,6 +56,10 @@ export interface MemoryConfig {
     backup: boolean;
     board: boolean;
   };
+  /** Privacy exclusions (T06): content matched here is never captured. */
+  privacy: {
+    exclusions: ExclusionRule[];
+  };
   /**
    * Explicit project identity override (`host/repo`) for non-Git projects or
    * ambiguous remotes (architecture.md §2 [P], decisions.md #5).
@@ -75,6 +89,9 @@ export const DEFAULT_CONFIG: MemoryConfig = {
     observation: true,
     backup: true,
     board: true,
+  },
+  privacy: {
+    exclusions: [],
   },
 };
 
@@ -181,6 +198,7 @@ export function validateConfig(raw: unknown): ValidationResult {
     "scopes",
     "budgets",
     "features",
+    "privacy",
     "projectIdentity",
   ]);
   for (const key of Object.keys(raw)) {
@@ -378,6 +396,78 @@ export function validateConfig(raw: unknown): ValidationResult {
     }
   }
 
+  const privacy: MemoryConfig["privacy"] = { exclusions: [] };
+  const rawPrivacy = raw["privacy"];
+  if (rawPrivacy !== undefined) {
+    if (!isPlainObject(rawPrivacy)) {
+      issues.push({ path: "privacy", message: "privacy must be an object" });
+    } else {
+      for (const key of Object.keys(rawPrivacy)) {
+        if (key !== "exclusions") {
+          issues.push({
+            path: `privacy.${key}`,
+            message: "unknown privacy key",
+          });
+        }
+      }
+      const rawExclusions = rawPrivacy["exclusions"];
+      if (rawExclusions !== undefined) {
+        if (!Array.isArray(rawExclusions)) {
+          issues.push({
+            path: "privacy.exclusions",
+            message: "must be an array of rules",
+          });
+        } else {
+          const rules: ExclusionRule[] = [];
+          rawExclusions.forEach((item, i) => {
+            const path = `privacy.exclusions[${i}]`;
+            if (!isPlainObject(item)) {
+              issues.push({ path, message: "rule must be an object" });
+              return;
+            }
+            const rule: ExclusionRule = {};
+            for (const key of ["project", "pathPrefix", "pattern"] as const) {
+              if (item[key] !== undefined) {
+                if (typeof item[key] !== "string" || item[key] === "") {
+                  issues.push({
+                    path: `${path}.${key}`,
+                    message: "must be a non-empty string",
+                  });
+                } else {
+                  rule[key] = item[key] as string;
+                }
+              }
+            }
+            for (const key of Object.keys(item)) {
+              if (
+                key !== "project" &&
+                key !== "pathPrefix" &&
+                key !== "pattern"
+              ) {
+                issues.push({
+                  path: `${path}.${key}`,
+                  message: "unknown exclusion key",
+                });
+              }
+            }
+            if (
+              Object.keys(rule).length === 0 &&
+              issues.every((x) => !x.path.startsWith(path))
+            ) {
+              issues.push({
+                path,
+                message:
+                  "rule must set at least one of project/pathPrefix/pattern",
+              });
+            }
+            rules.push(rule);
+          });
+          privacy.exclusions = rules;
+        }
+      }
+    }
+  }
+
   let projectIdentity: string | undefined;
   if (raw["projectIdentity"] !== undefined) {
     const v = raw["projectIdentity"];
@@ -397,6 +487,7 @@ export function validateConfig(raw: unknown): ValidationResult {
   return {
     ok: true,
     config: {
+      privacy,
       schemaVersion: CURRENT_SCHEMA_VERSION,
       enabled: enabled as boolean,
       privateMode: privateMode as boolean,

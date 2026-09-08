@@ -206,3 +206,47 @@ Date: 2026-09-08 (session). Worker: implement_T05, model openrouter/z-ai/glm-5.3
 
 - No blockers. Follow-ups: T06 supplies the real privacy gate (records here carry unredacted-at-rest content by design; redaction is enforced at outbound edges); T07 wires the durable outbox job shape (`{seq, schemaVersion, kind, scope, opId, idempotencyKey, payload, attempts, nextAttemptAt, createdAt}`) onto these schemas; backend record write paths (adapter writeImmutable callers) consume `memoryRecordPath`/`deriveRecordId` from T08 onward; explicit one-way schema-upgrade command deferred to a later minor version per architecture.md §9; T07 must either treat one-observation-per-source-set as an invariant or add a pass discriminator to the idempotency key (provenance-only keys collide across repeated extraction passes over the same entries — consistent with "no content hash as identity", arch §2).
 - `config/kiwifs-test.local.json` was never opened, printed or staged. No live-service contact (T05 is local schemas only); no REST fallback; no pushes, tags or deployments.
+
+## T06 — Privacy gate and sanitized audit events
+
+Date: 2026-09-08 (session). Worker: implement_T06, model openrouter/z-ai/glm-5.3-flash per standing instruction. Dependencies T03, T05: completed receipts verified before starting (T03 → 92b1520, T05 → 3fc0b6d).
+
+### Work done
+
+1. `src/privacy/redaction.ts` — pattern-based secret redaction (architecture.md §5): default patterns for AWS access keys, `sk-` API keys, GitHub/Slack tokens, JWTs, bearer headers, PEM private-key blocks, credential-bearing URLs and `key = value` assignments; Shannon-entropy heuristic (default ≥ 4.0 bits/char, ≥ 20 chars) over uncovered token runs; structural replacement `[REDACTED:{type}:{length}]`; fail-closed holds for control-character content, non-string input and internal scanner faults (`ok:false, held:true` — callers must refuse to send). `createRedactor()` produces the guard-compatible `Redactor` (guard step 5; `identityRedactor` documented as a test-only no-op escape hatch, never a production default). `looksSecretBearing()` post-check helper.
+2. `src/privacy/exclusions.ts` — exclusion rules with `project` (scope value), `pathPrefix` (whole-file path prefix) and `pattern` (content regex) dimensions (ANDed within a rule, rules ORed). Invalid regex or empty rule fails closed at compile time, never silently at capture.
+3. `src/privacy/private-mode.ts` — `PrivateModeGate`: blocks all network reads/writes (`assertNetworkAllowed`) and new capture/backup/board jobs (`assertCaptureAllowed`) in all three feature domains; pending jobs held via `holdWhilePrivate`, never dropped (no drop-oldest); resume is explicit (`resume()`), releases exactly the held jobs to registered listeners (T07 outbox wiring point) and records visible transition events. Error messages carry only feature names/counts, never user content.
+4. `src/privacy/audit.ts` — `AuditSink`: metadata-only by default (`{ts, kind, feature, scope, targetId, byteCounts, decision, degraded}`); snippets only at user-enabled `snippets` verbosity and only after redaction (unclassifiable snippet withheld); unknown fields stripped; every serialized line post-checked with `looksSecretBearing` and downgraded to an `audit-suppressed` stub if it still looks secret-bearing.
+5. `src/config/schema.ts` — new `privacy.exclusions` config section (rules of `project`/`pathPrefix`/`pattern`, at least one required per rule, unknown keys rejected per T03 fail-closed rules); `src/config/status.ts` shows the exclusion count (non-secret).
+6. Fixtures (synthetic only): `test/fixtures/privacy/secret-samples.json` (10 fake secret formats + benign controls), `redaction-cases.json` (9 cases incl. multi-secret and benign), `exclusion-cases.json` (9 cases incl. invalid-pattern fail-closed).
+7. Tests: `test/privacy.test.ts` — 18 new tests: per-secret redaction, fixture cases, queue bytes free of secrets, audit metadata-only/snippet verbosity/unclassifiable withholding/suppression downgrade, private-mode suppression of all domains, explicit hold/resume release semantics, exclusion matrix, config validation + secret-free status, fail-closed NUL content through guard step 5, guard step 5 with the real redactor strips secrets from injected records, entropy threshold/min-length behavior, internal-fault hold.
+8. `docs/privacy.md` — scanner limitations (best-effort heuristics, false positives/negatives, no redaction of already-stored data), backup fidelity implications (irreversible redaction; no byte-identical recovery claim; manifest redaction counts), fail-closed semantics, private-mode contract for T07, node-compat note.
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 126/126 (105 prior + 21 new incl. review regressions).
+- `npm run pack:check` — **pass**: Package OK, 22 files (src only; privacy fixtures test-only and correctly excluded), packed extension loads in Pi RPC.
+- `devenv test` — **pass** (9.94s, "Tests passed :)"): network `npm ci`, then check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0, engines >=22.19.0; stable APIs only (`RegExp`, `JSON`, `Map`, `Date.prototype.toISOString`) — no version-gated surface.
+- No TUI behavior introduced; no manual TUI check required or performed. No live-service contact (T06 is a local gate); no REST fallback; no pushes, tags or deployments.
+
+### Acceptance coverage (PRD T06)
+
+- Synthetic secret fixtures never in outbound payloads/queue bytes/logs/errors: redaction tests + `assertSecretFree` over every fixture secret against redactor output, queue-byte JSON, audit lines and private-mode error messages.
+- Private mode suppresses network reads/writes and new capture/backup/board jobs: `PrivateModeGate` domain tests.
+- Enabling private mode prevents pending jobs from sending; resume matches approved policy (§13 row 21: held, explicit resume, no drop-oldest): hold/resume release tests + visible transition events.
+- Exclusion rules cover project, path and content patterns: exclusion fixture matrix + config validation tests.
+- Documentation states scanner limitations and backup fidelity implications: `docs/privacy.md`.
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups: T07 wires `PrivateModeGate` + `AuditSink` into the durable outbox worker (`assertNetworkAllowed` before every send; `holdWhilePrivate` for accepted work; resume releases held jobs); T09/T10 wire `createRedactor()` into observation capture edges; T14/T15 wire redaction + redaction-count manifests into backup chunks; exclusion-rule application at capture points lands with the owning capture features (T09/T14/T16), not in this gate module.
+- `config/kiwifs-test.local.json` was never opened, printed or staged. No secrets or real session/memory content entered context, logs or Git; all fixtures are synthetic.
+
+### Review fixes (T06 independent review, B1/B2 + follow-up comments)
+
+- **B1** (`src/backend/guard.ts`): `deps.redact` now defaults to `createRedactor()` (real T06 rules) instead of the fail-open `identityRedactor`; `identityRedactor` remains exported and documented as a test-only explicit opt-out. Regression test added: a `guardCandidate` call with no `deps.redact` strips a synthetic secret and emits `[REDACTED:...]`.
+- **B2** (`src/privacy/redaction.ts`): `looksSecretBearing` no longer flags bare 32+ char runs; long runs additionally require Shannon entropy ≥ 4.0, so UUID `targetId`s no longer trigger `audit-suppressed` false positives while opaque high-entropy tokens are still caught. Regression tests: an audit event with a UUID `targetId` records normally; a synthetic high-entropy token is still flagged.
+- Follow-up comment fix (F1): corrected the contradictory comments in `src/privacy/exclusions.ts` (dimensions are ANDed within a rule; a `continue` skips the entire rule, not just one dimension).
+- Follow-up doc (F2): `docs/privacy.md` now states the hard T07 requirement that a resume listener be registered before the private-mode gate is ever enabled, since `resume()` delivers held references only to registered listeners.
+- Re-run after fixes: `npm run check` pass (126/126), `npm run pack:check` pass, `devenv test` re-run — see below.

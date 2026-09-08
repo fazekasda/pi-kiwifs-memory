@@ -1,0 +1,97 @@
+{
+  "description": "T06 exclusion cases: rule sets and contexts with expected outcomes.",
+  "cases": [
+    {
+      "name": "project exclusion fires on matching scope",
+      "rules": [{ "project": "project/private-proj" }],
+      "context": {
+        "scope": "project/private-proj",
+        "path": "project/private-proj/memory/2026/09/a.md",
+        "content": "harmless text"
+      },
+      "expectExcluded": true
+    },
+    {
+      "name": "project exclusion does not fire on other scope",
+      "rules": [{ "project": "project/private-proj" }],
+      "context": {
+        "scope": "project/demo-proj",
+        "path": "project/demo-proj/memory/2026/09/a.md",
+        "content": "harmless text"
+      },
+      "expectExcluded": false
+    },
+    {
+      "name": "path prefix exclusion fires within prefix",
+      "rules": [{ "pathPrefix": "personal/memory/vendor-notes/" }],
+      "context": {
+        "scope": "personal",
+        "path": "personal/memory/vendor-notes/scratch.md",
+        "content": "harmless"
+      },
+      "expectExcluded": true
+    },
+    {
+      "name": "path prefix exclusion does not fire outside prefix",
+      "rules": [{ "pathPrefix": "personal/memory/vendor-notes/" }],
+      "context": {
+        "scope": "personal",
+        "path": "personal/memory/other/scratch.md",
+        "content": "harmless"
+      },
+      "expectExcluded": false
+    },
+    {
+      "name": "content pattern exclusion fires on match",
+      "rules": [{ "pattern": "\\bNDA[- ]?[0-9]{4}\\b" }],
+      "context": {
+        "scope": "project/demo-proj",
+        "path": "project/demo-proj/memory/2026/09/b.md",
+        "content": "refer to NDA-2214 clause 5"
+      },
+      "expectExcluded": true
+    },
+    {
+      "name": "combined dimensions are ANDed",
+      "rules": [
+        {
+          "pathPrefix": "project/demo-proj/memory/",
+          "pattern": "\\bNDA[- ]?[0-9]{4}\\b"
+        }
+      ],
+      "context": {
+        "scope": "project/demo-proj",
+        "path": "project/demo-proj/memory/2026/09/b.md",
+        "content": "refer to NDA-2214 clause 5"
+      },
+      "expectExcluded": true
+    },
+    {
+      "name": "combined dimensions: second dimension unmatched blocks the rule",
+      "rules": [
+        {
+          "pathPrefix": "project/demo-proj/memory/",
+          "pattern": "\\bNDA[- ]?[0-9]{4}\\b"
+        }
+      ],
+      "context": {
+        "scope": "project/demo-proj",
+        "path": "project/other-proj/memory/2026/09/b.md",
+        "content": "refer to NDA-2214 clause 5"
+      },
+      "expectExcluded": false
+    },
+    {
+      "name": "invalid pattern is a validation error (fail closed)",
+      "rules": [{ "pattern": "(unclosed" }],
+      "context": { "scope": "project/demo-proj", "content": "anything" },
+      "expectError": true
+    },
+    {
+      "name": "empty rule is a validation error",
+      "rules": [{}],
+      "context": { "scope": "project/demo-proj", "content": "anything" },
+      "expectError": true
+    }
+  ]
+}

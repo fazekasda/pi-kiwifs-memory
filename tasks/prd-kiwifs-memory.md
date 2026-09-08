@@ -224,11 +224,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Synthetic secret fixtures never appear in outbound payloads, queue bytes, logs or error messages.
-- [ ] Private mode suppresses network reads/writes and new capture/backup/board jobs.
-- [ ] Enabling private mode prevents pending jobs from sending; resume behavior matches approved policy.
-- [ ] Exclusion rules cover project, path and content patterns.
-- [ ] Documentation states scanner limitations and backup fidelity implications.
+- [x] Synthetic secret fixtures never appear in outbound payloads, queue bytes, logs or error messages.
+- [x] Private mode suppresses network reads/writes and new capture/backup/board jobs.
+- [x] Enabling private mode prevents pending jobs from sending; resume behavior matches approved policy.
+- [x] Exclusion rules cover project, path and content patterns.
+- [x] Documentation states scanner limitations and backup fidelity implications.
 
 ### T07 — Implement durable outbox and recovery
 
