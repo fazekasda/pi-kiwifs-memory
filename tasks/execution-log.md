@@ -80,3 +80,38 @@ Date: 2026-09-08 (session). Worker: implement_T02, model openrouter/z-ai/glm-5.3
 ### Blockers / follow-ups
 
 - No blockers. Remaining gates unchanged and carried to owning tasks: T13 feasibility fixture (queued-input matched injection) before T12/T13 land; B1 production-endpoint auth before enabling outside the test space; T04/T19 live runner unbuilt.
+
+## T03 — Implement validated configuration and scope identity
+
+Date: 2026-02-09 (session). Worker: implement_T03, model openrouter/z-ai/glm-5.3-flash per standing instruction.
+
+### Prior state verified
+
+- T01 receipt (commit `03ede0c`, gate-closure `c0e0f1a`) and T02 receipt (`68cb432`) present; T02 dependency satisfied. Relevant docs re-read: `docs/architecture.md` §2/§4/§5/§9/§10/§13, `docs/decisions.md` #5/#9/#10/#12, `docs/test-environment.md` safeguards.
+
+### Work done
+
+1. `src/config/schema.ts` — `MemoryConfig` schema + `validateConfig` (fail-closed): http(s)-only URL (credentials-in-URL rejected; `headers` keys rejected — credentials are by reference only: `auth: {kind: env|file, ref}`), model-route shape check (default `openrouter/z-ai/glm-5.3-flash`, decisions.md #9), scope flags, budgets (defaults 2000 ms / 3000 tokens, decisions.md #7), feature flags, explicit `projectIdentity` override. Unknown keys and unknown/older/newer `schemaVersion` are validation errors (newer refuses to run or rewrite, architecture.md §10). `effectiveFeatures`: private mode disables ALL three domains (decisions.md #10).
+2. `src/config/loader.ts` — documented precedence defaults < config file (`options.file` or `KIWIFS_MEMORY_CONFIG`) < explicit runtime overrides, cumulative deep merge; unreadable/invalid-JSON file is a fatal visible error; loader never resolves credential references to secret values.
+3. `src/config/status.ts` + `src/index.ts` wiring — `/kiwifs-status` shows resolved nonsecret settings only (endpoint, symbolic credential ref `env:NAME`/`file:/path`, model route, scopes, budgets, effective features, identity override); defensive `statusIsSecretFree` suppresses display if token-like material ever appears; config errors render as visible `config: INVALID — extension disabled`, never a crash.
+4. `src/scope/identity.ts` — `normalizeGitRemote` (host + owner/repo; strips scheme, credentials, port, `.git`; scp-like syntax; credentials redacted in errors), `resolveProjectIdentity` (single/equivalent remotes resolve; conflicting remotes and non-Git dirs fail closed demanding the explicit `projectIdentity` override; worktrees/branches are repo-level — identity never from content hashes or branch names, architecture.md §2), `authorizedScopeSet` (own project + optional `personal` + explicit `cross/` opt-in only; N≤4 fanout bound fails closed, §13 row 3), `scopeIsAuthorized` exact-membership gate (cross-project denied by default).
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: typecheck clean, prettier clean, node --test **44/44 pass** (18 config, 21 scope, 5 extension incl. updated status assertions).
+- `npm run pack:check` — **pass**: Package OK, 8 files (adds `src/config/*`, `src/scope/identity.ts`); packed extension loads in Pi RPC.
+- `devenv test` — **pass** (7.88s): network `npm ci`, full suite, "Tests passed :)".
+- Node compatibility: devenv toolchain Node v24.19.0; engines `>=22.19.0`; code uses only stable Node 22+ APIs (`node:fs`, `node:url` parsing via `URL`, no experimental flags). Typecheck and tests green on the devenv Node.
+- Secret scan: staged diff contains no secret values (only test fixtures with synthetic references like `KIWIFS_API_KEY`); `config/kiwifs-test.local.json` never read, opened, printed, or staged. No live service contact in this task (T03 is config/identity only).
+
+### Acceptance coverage
+
+- Invalid URLs / missing credentials / conflicting config / explicit overrides: `test/config.test.ts` (URL scheme + credentials-in-URL + headers rejection; enabled-without-auth; unknown keys; schemaVersion guards; override precedence).
+- Worktrees/branches/non-Git identity policy: `test/scope.test.ts` (worktree parity, repo-level identity, no-remotes fail-closed, override wins, conflicting-remote fail-closed).
+- Cross-project reads denied by default: authorized-scope-set default + exact-membership gate tests (prefix look-alikes rejected).
+- Status nonsecret-only: resolved-status assertions + `statusIsSecretFree` unit tests + extension-level status test.
+- Private mode disables all three domains: `effectiveFeatures` tests (all false under privateMode regardless of feature flags).
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups for later tasks: status output later extended per-feature as domains land (T08+); loader file location convention (project-local vs user-global discovery) is a T08/T18 UX decision; scope resolver consumes real `git remote -v` output starting T08 (module accepts remotes as input already).

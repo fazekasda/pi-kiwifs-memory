@@ -175,11 +175,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Tests cover invalid URLs, missing credentials, conflicting config and explicit overrides.
-- [ ] Worktrees/branches/non-Git directories follow the recorded identity policy.
-- [ ] Cross-project reads are denied by default.
-- [ ] Status output exposes resolved nonsecret settings only.
-- [ ] Private mode disables all three feature domains, not only observation extraction.
+- [x] Tests cover invalid URLs, missing credentials, conflicting config and explicit overrides.
+- [x] Worktrees/branches/non-Git directories follow the recorded identity policy.
+- [x] Cross-project reads are denied by default.
+- [x] Status output exposes resolved nonsecret settings only.
+- [x] Private mode disables all three feature domains, not only observation extraction.
 
 ### T04 — Implement backend adapter and contract tests
 

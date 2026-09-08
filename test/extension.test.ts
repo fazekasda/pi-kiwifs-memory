@@ -4,7 +4,10 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import kiwifsMemory, { STATUS_MESSAGE } from "../src/index.ts";
+import kiwifsMemory, {
+  STATUS_MESSAGE,
+  resolveStatusText,
+} from "../src/index.ts";
 
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 
@@ -39,7 +42,20 @@ test("reports scaffold status without claiming memory works", async () => {
     ui: { notify: (...args: unknown[]) => notifications.push(args) },
   } as unknown as ExtensionCommandContext;
   await loadCommand().handler("", ctx);
-  assert.deepEqual(notifications, [[STATUS_MESSAGE, "info"]]);
+  assert.equal(notifications.length, 1);
+  const [text, level] = notifications[0] as [string, string];
+  assert.equal(level, "info");
+  assert.ok(text.startsWith(STATUS_MESSAGE));
+  assert.match(text, /not implemented yet/);
+});
+
+test("status output resolves nonsecret config and stays secret-free", () => {
+  const text = resolveStatusText();
+  assert.ok(text.startsWith(STATUS_MESSAGE));
+  assert.match(text, /enabled: false/);
+  assert.match(text, /credentials: none/);
+  assert.match(text, /cross-project reads denied by default/);
+  assert.doesNotMatch(text, /Bearer\s+[A-Za-z0-9._-]{16,}/);
   assert.match(STATUS_MESSAGE, /not implemented yet/);
 });
 
