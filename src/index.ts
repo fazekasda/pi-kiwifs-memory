@@ -4,6 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config/loader.ts";
+import type { AuthRef } from "./config/schema.ts";
 import { resolvedStatusLines, statusIsSecretFree } from "./config/status.ts";
 import { effectiveFeatures, type MemoryConfig } from "./config/schema.ts";
 import { KiwiFSAdapter } from "./backend/adapter.ts";
@@ -13,6 +14,13 @@ import {
   resolveAuthSecret,
 } from "./observation/model.ts";
 import { createObservationSender } from "./observation/sender.ts";
+import {
+  DEFAULT_REFLECT_MIN_OBSERVATIONS,
+  type AcceptedRecord,
+  ReflectionEngine,
+  createModelReflector,
+} from "./observation/reflection.ts";
+import { ProposalLifecycle, ProposalOpLog } from "./observation/proposals.ts";
 import { SessionCoordinator, StateSchemaError } from "./pi/coordinator.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
@@ -156,6 +164,8 @@ function openConfiguredBackend(
 interface SessionRuntime {
   coordinator: SessionCoordinator;
   observer: ObserverScheduler | undefined;
+  reflection: ReflectionEngine | undefined;
+  lifecycle: ProposalLifecycle | undefined;
   observerError: string | undefined;
   store: DurableOutbox | undefined;
 }
@@ -209,6 +219,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     ...(store ? { onRetention: () => store.runRetention() } : {}),
   });
   let observer: ObserverScheduler | undefined;
+  let reflection: ReflectionEngine | undefined;
+  let lifecycle: ProposalLifecycle | undefined;
   if (store) {
     try {
       const features = config ? effectiveFeatures(config) : undefined;
@@ -231,6 +243,65 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       // No resolved scope → no observer at all: nothing can be extracted
       // into a deliverable record, so scheduling is held (T18 discovery).
       if (scope !== undefined) {
+        // T11: reflection engine over durably accepted observation records.
+        // Automatic summaries ride the observation feature (decisions.md
+        // #11); proposals/conflict flags are always approval-gated.
+        if (config && features?.observation && config.enabled) {
+          const reflect = config.model.auth
+            ? createModelReflector({
+                route: config.model.route,
+                auth: config.model.auth,
+              })
+            : undefined;
+          reflection = new ReflectionEngine({
+            stateDir,
+            scope,
+            outbox: store,
+            ...(reflect ? { reflect } : {}),
+          });
+          // Proposal lifecycle: own durable op log (opIds recorded BEFORE
+          // any side effect) and its own backend instance — the lifecycle
+          // mints interactive opIds the outbox ledger does not know.
+          if (config.mcp.url !== "" && config.mcp.auth) {
+            const opLog = new ProposalOpLog(stateDir);
+            const mcpAuth: AuthRef = config.mcp.auth;
+            const mcpUrl = config.mcp.url;
+            lifecycle = new ProposalLifecycle({
+              opLog,
+              openStore: (() => {
+                let cached: KiwiFSAdapter | undefined;
+                return async () => {
+                  if (!cached) {
+                    const secret = resolveAuthSecret(mcpAuth);
+                    if (secret === undefined) return undefined;
+                    cached = new KiwiFSAdapter({
+                      url: mcpUrl,
+                      headers: { Authorization: `Bearer ${secret}` },
+                      ledger: {
+                        record: (opId: string) => {
+                          if (!opLog.has(opId)) {
+                            throw new Error(
+                              "refusing to record opId that is not durably persisted",
+                            );
+                          }
+                        },
+                        assertPersisted: (opId: string) => {
+                          if (!opLog.has(opId)) {
+                            throw new Error(
+                              "opId was not durably persisted before mutation (refusing side effect)",
+                            );
+                          }
+                        },
+                      },
+                    });
+                    await cached.connect();
+                  }
+                  return cached;
+                };
+              })(),
+            });
+          }
+        }
         observer = new ObserverScheduler({
           stateDir,
           coordinator,
@@ -238,13 +309,57 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
           scope,
           sessionId: "pending",
           ...(extract ? { extract } : {}),
+          ...(reflection
+            ? {
+                onAcceptedObservations: (info) => {
+                  // Feed durably accepted observation records to the
+                  // reflection engine (record-granular dedupe inside).
+                  const record: AcceptedRecord = {
+                    recordId: info.recordId,
+                    recordPath: info.recordPath,
+                    createdAt: info.createdAt,
+                    statements: info.observations.map((o) => o.statement),
+                    uncertainty: info.observations.some(
+                      (o) => o.uncertainty === "high",
+                    )
+                      ? "high"
+                      : info.observations.some(
+                            (o) => o.uncertainty === "medium",
+                          )
+                        ? "medium"
+                        : "low",
+                    sourceEntryIds: info.sourceEntryIds,
+                    sessionId: info.sessionId,
+                    ...(info.branchId !== undefined
+                      ? { branchId: info.branchId }
+                      : {}),
+                  };
+                  reflection?.noteAccepted(record);
+                  // Automatic bounded reflection at the [P] threshold;
+                  // failures are contained and visible via pendingStatus.
+                  void reflection?.maybeReflect().then((r) => {
+                    if (!r.ran && r.skippedReason === "no-reflector") {
+                      observerError =
+                        "reflection: model.auth not configured — automatic summaries held (observations intact)";
+                    }
+                  });
+                },
+              }
+            : {}),
         });
       }
     } catch (err) {
       observerError = `observer init failed: ${(err as Error).name}`;
     }
   }
-  return { coordinator, observer, observerError, store };
+  return {
+    coordinator,
+    observer,
+    reflection,
+    lifecycle,
+    observerError,
+    store,
+  };
 }
 
 /**

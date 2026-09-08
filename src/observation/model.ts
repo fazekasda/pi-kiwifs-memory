@@ -380,61 +380,68 @@ export const DEFAULT_EXTRACTION_TIMEOUT_MS = 45_000;
  * retry for malformed output. Provider-level failures are terminal for the
  * attempt; the scheduler keeps the batch durably pending.
  */
+/**
+ * Default transport: OpenRouter chat-completions. Exported so other model
+ * callers (T11 reflection) share the identical wire behavior; tests inject
+ * deterministic fakes and never exercise this.
+ */
+export const openRouterModelTransport: ModelTransport = async (
+  req: ModelChatRequest,
+): Promise<ModelChatResponse> => {
+  const res = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${req.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: req.model,
+      messages: [
+        { role: "system", content: req.system },
+        { role: "user", content: req.user },
+      ],
+      max_tokens: req.maxTokens,
+    }),
+    ...(req.signal !== undefined ? { signal: req.signal } : {}),
+  });
+  const body = (await res.json()) as Record<string, unknown>;
+  const choices = Array.isArray(body["choices"])
+    ? (body["choices"] as Record<string, unknown>[])
+    : [];
+  const message = choices[0]?.["message"] as
+    Record<string, unknown> | undefined;
+  const usage = body["usage"] as Record<string, unknown> | undefined;
+  return {
+    ok: res.ok,
+    ...(res.status !== undefined ? { status: res.status } : {}),
+    ...(typeof message?.["content"] === "string"
+      ? { text: message["content"] as string }
+      : {}),
+    ...(typeof body["model"] === "string"
+      ? { reportedModel: body["model"] as string }
+      : {}),
+    ...(usage
+      ? {
+          usage: {
+            ...(typeof usage["prompt_tokens"] === "number"
+              ? { promptTokens: usage["prompt_tokens"] as number }
+              : {}),
+            ...(typeof usage["completion_tokens"] === "number"
+              ? { completionTokens: usage["completion_tokens"] as number }
+              : {}),
+            ...(typeof usage["cost"] === "number"
+              ? { costUsd: usage["cost"] as number }
+              : {}),
+          },
+        }
+      : {}),
+  };
+};
+
 export function createModelExtractor(
   options: ModelExtractorOptions,
 ): (batch: ExtractionBatch) => Promise<ExtractionResult> {
-  const transport =
-    options.transport ??
-    (async (req: ModelChatRequest): Promise<ModelChatResponse> => {
-      const res = await fetch(OPENROUTER_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${req.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: req.model,
-          messages: [
-            { role: "system", content: req.system },
-            { role: "user", content: req.user },
-          ],
-          max_tokens: req.maxTokens,
-        }),
-        ...(req.signal !== undefined ? { signal: req.signal } : {}),
-      });
-      const body = (await res.json()) as Record<string, unknown>;
-      const choices = Array.isArray(body["choices"])
-        ? (body["choices"] as Record<string, unknown>[])
-        : [];
-      const message = choices[0]?.["message"] as
-        Record<string, unknown> | undefined;
-      const usage = body["usage"] as Record<string, unknown> | undefined;
-      return {
-        ok: res.ok,
-        ...(res.status !== undefined ? { status: res.status } : {}),
-        ...(typeof message?.["content"] === "string"
-          ? { text: message["content"] as string }
-          : {}),
-        ...(typeof body["model"] === "string"
-          ? { reportedModel: body["model"] as string }
-          : {}),
-        ...(usage
-          ? {
-              usage: {
-                ...(typeof usage["prompt_tokens"] === "number"
-                  ? { promptTokens: usage["prompt_tokens"] as number }
-                  : {}),
-                ...(typeof usage["completion_tokens"] === "number"
-                  ? { completionTokens: usage["completion_tokens"] as number }
-                  : {}),
-                ...(typeof usage["cost"] === "number"
-                  ? { costUsd: usage["cost"] as number }
-                  : {}),
-              },
-            }
-          : {}),
-      };
-    });
+  const transport = options.transport ?? openRouterModelTransport;
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXTRACTION_TIMEOUT_MS;
   const maxValidationRetries = options.maxValidationRetries ?? 1;
   const inputBudget = options.inputBudgetTokens ?? DEFAULT_INPUT_BUDGET_TOKENS;

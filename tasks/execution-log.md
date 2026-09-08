@@ -441,3 +441,73 @@ The independent T10 review found three real defects in the send/record path that
 - `devenv test` — **pass** (9.9 s, "Tests passed :)").
 - Node v24.19.0 (devenv) vs engines >=22.19.0; stable APIs only.
 - Secret scan of the incremental diff: clean (synthetic fixtures only); `config/kiwifs-test.local.json` never opened; no live-service contact, no REST fallback, no pushes/tags/deployments.
+
+## T11 — Reflections, conflicts and merge proposals (2026-09-08)
+
+Implemented on the T10 pipeline. Design and [P] defaults recorded in `docs/memory-lifecycle.md` (new).
+
+### What landed
+
+1. `src/observation/reflection.ts` (new) — the reflection engine + payload/sender layer:
+   - Bounded reflection over durably accepted observation records (record-granular: proposals supersede whole records, never statements inside a record's immutable data block).
+   - Duplicate/contradiction detection via the configured model (`createModelReflector`: same wire conventions as the T10 extractor — configured route verbatim, anchored `reportedModelMatches`, budget checks, untrusted-data framing, deterministic-fake tests only). One corrective strategy differs by design: no validation retry inside the call — the engine's durable cooldown governs re-derivation under the same setHash/startedAt.
+   - Duplicate suppression (AC 1): reflection identity = SHA-256 over the sorted record-id set; proposal identity = SHA-256 over the sorted target-record-id set. Deterministic paths make re-delivery a `writeImmutable` replay no-op; the durable processed-set registry + seen-record dedupe bound re-runs. FIFO-pruned registries are bounded, not magical (wording corrected per review): proposals replay as no-ops; a fully re-notified set whose hash is still in the processed registry is dropped without re-summarizing; a re-notified SUBSET re-derived under a fresh startedAt can duplicate a reflection summary record — bounded, additive only, never data loss.
+   - Replay determinism: the run's `startedAt` persists in engine state BEFORE the model call and flows into record `created`/path (T10-B2 pattern).
+   - Failure containment (AC 5): full pre-validation of the model result BEFORE any enqueue (hallucinated duplicate groups can never produce partial acceptance); any failure leaves the outbox and observation records untouched; per-set attempt cap parks sets VISIBLY (`skippedSets` + `pendingStatus`), never silently; oversized sets split in half and retry (progress guarantee, nothing dropped).
+   - Payload hygiene: queued reflection/proposal payloads carry metadata only (recordId + persisted createdAt; paths computed at delivery). Long path strings in payloads would trip the outbox `looksSecretBearing` post-check (correctly — they are opaque high-entropy runs); redacted statements stay in the private engine state file (0700), mirroring the T09 pending-batch precedent.
+2. `src/observation/proposals.ts` (new) — approve/reject/undo lifecycle:
+   - Verified transitions: fresh pre-state read (status + "superseded by THIS proposal" provenance check) → write → post-write read-back verification; divergence surfaces as typed `StaleProposalError` and the concurrent actor's decision survives. B2-conformant: verify-then-act + detection, NO CAS claim (no If-Match on the MCP surface). Local ops serialized on an internal chain (single-flight).
+   - Stale approvals fail visibly with the observed status named; crash-interrupted approvals complete idempotently on re-run; duplicate reject/undo replay as no-ops.
+   - Undo restores logical visibility (targets back to `active`) and appends provenance; nothing deleted. Every transition appends `kiwifs-provenance:` lines (actor/time/opId/reason).
+   - Durable opIds: append-only fsynced `proposal-oplog.jsonl` records each op BEFORE the side effect; doubles as the T04 ledger for interactive writes; fails closed on corruption.
+3. `src/observation/scheduler.ts` — `onAcceptedObservations` hook fired only AFTER durable outbox acceptance (hook failures contained to a visible status note; the batch is already accepted/consumed). Emits recordId + deterministic recordPath + the job's persisted `createdAt`.
+4. `src/observation/sender.ts` — sender dispatches by job kind (observation/reflection/proposal); unresolved scope holds ALL record kinds (no partial delivery with divergent lifecycle state).
+5. `src/index.ts` — engine + lifecycle built at session runtime (scope resolved + observation feature); `createModelReflector` wired with the configured route/auth; lifecycle gets its own lazily-connected adapter instance and op-log-backed ledger (interactive opIds are unknown to the outbox ledger).
+6. `src/domain/idempotency.ts` — optional `tokens` in `IdempotencyInput` (reflection: [setHash]; proposal: [setHash, ...sortedTargets]) — one logical job per token set.
+7. `src/observation/model.ts` — the inline OpenRouter transport extracted as exported `openRouterModelTransport` (shared by extractor and reflector; behavior unchanged, still never exercised by tests).
+
+### Tests (deterministic fakes only; no paid calls)
+
+- `test/reflection.test.ts` (15): AC 1 duplicate-batch bounding (same set → one summary; same duplicate pair across sets → one proposal identity); AC 2 conflict labels with record ids + bounded labels in the reflection record's inert data block; AC 5 failure containment (model fault → zero jobs + byte-identical outbox; hallucinated ids → nothing enqueued; input-budget splitting never drops records); cooldown re-derivation under the SAME setHash/startedAt; engine state restart; `validateReflectionResult` bounds (output-budget, reserved markers, label length); untrusted-data framing; anchored model-identity + credentials fail-closed (transport provably not called); sender payload validation + deterministic writeImmutable delivery (replay = identical bytes at the same path).
+- `test/proposal.test.ts` (14): approve happy path with provenance + read-back verification; decided-proposal stale approval fails visibly naming the status; concurrent write race detected with the other actor's decision surviving; corrupted-write detection; crash-interrupted approval idempotent replay; partial-approval visible failure (1/2 superseded); reject untouched targets + duplicate-reject replay; undo restores visibility + full provenance history (supersession AND restore lines coexist, proposal never deleted); undo refuses foreign supersessions and non-approved proposals; duplicate undo replay; op log durability (reloaded ledger); single-flight serialization; `readProposalTargets` shape validation.
+
+### Checks (actual outcomes)
+
+- `npm run check` — **pass**: tsc clean, prettier clean, node --test 233/233 (204 prior + 15 reflection + 14 proposal).
+- `npm run pack:check` — **pass**: Package OK (32 files), packed extension loads in Pi RPC.
+- `devenv test` — **pass** (11.0 s, "Tests passed :)"): npm ci + check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0 vs engines >=22.19.0; stable APIs only (adds nothing exotic: `node:fs` appendFileSync/openSync/fsyncSync, `node:crypto` sha256/randomUUID).
+- Secret scan of the changed files: synthetic fixtures only (e.g. `KIWIFS_TEST_REFLECT_KEY=test-key-not-real`); `config/kiwifs-test.local.json` never opened, printed or staged. No live-service contact (all tests local fakes), no REST fallback, no deployments/pushes/tags.
+- Design note: the outbox `looksSecretBearing` post-check caught a real hazard during development — record paths in queued payloads are opaque ≥32-char high-entropy runs. Resolution: metadata-only payloads (recordId + createdAt), paths computed at delivery. The check worked as designed.
+
+### Acceptance coverage (PRD T11)
+
+All five criteria trace to named tests (traceability notes inline in the PRD checkboxes).
+
+### Post-review fixes (T11 review round, same commit)
+
+Independent review found no blockers; two hygiene items + two claim overstatements fixed before commit:
+
+1. Removed a leftover `console.error("ENQ-DBG", …)` debug line from `ReflectionEngine.acceptResult`'s catch (the surrounding code already surfaces `lastError`).
+2. `src/domain/idempotency.ts` `tokens` doc comment no longer claims outbox-level dedupe — `DurableOutbox.enqueue` never deduped by key (it format-checks only); the one-logical-job guarantee lives in the engine's processed-set registry + seen-record dedupe and the deterministic-path `writeImmutable` replay.
+3. New `already-processed` guard in `runOnce`: when the seen-id FIFO has pruned a record and a crash-replayed hook re-notifies it so the SAME set re-derives, the set hash is matched against the durable processed registry and the copies are dropped (no second model call, no second summary record). Tested: "a re-notified copy of an already-processed set is dropped without re-summarizing" (maxSeenRecords=1 engine, hook replay → `already-processed`, call count and job count unchanged).
+4. Below-threshold auto runs now report `skippedReason: "below-threshold"` instead of the mislabeled `"cooldown"` (cosmetic per review; honest status). Tested.
+5. PRD AC-1 trace + `docs/memory-lifecycle.md` pruning claims reworded honestly (residual subset re-derivation can duplicate a reflection summary record — bounded, never data loss).
+
+Review items intentionally deferred (non-blocking, logged as follow-ups): provenance replay detection still substring-based over the full record body (low impact — mislabeled replay-vs-stale classification in narrow recovery paths; scope to `kiwifs-provenance:`-prefixed lines later), and the fire-and-forget `.then` in `src/index.ts` that writes `observerError` can race other status writes (cosmetic).
+
+### Checks after review fixes (actual outcomes)
+
+- `npm run check` — **pass**: tsc clean, prettier clean, node --test 235/235 (233 prior + 2 new: already-processed replay drop, below-threshold status).
+- `npm run pack:check` — **pass**: Package OK (32 files), packed extension loads in Pi RPC.
+- `devenv test` — **pass** (10.5 s, "Tests passed :)").
+- Secret scan of the incremental diff: clean; `config/kiwifs-test.local.json` never opened; no live-service contact, no REST fallback, no pushes/tags.
+
+### Blockers / follow-ups (final, post-review)
+
+- No blockers. Follow-ups:
+  - T12/T13: retrieval renders conflict labels and reflection summaries (records are the source of truth); conflict-flag labels exist as of T11.
+  - T18: command wiring for approve/reject/undo (lifecycle is a per-session API today), `reflectNow` manual command, and the git-remote scope discovery that also gates reflection (engine is built only when the scope resolves).
+  - T19: live-runner validation of reflection/proposal delivery against the dedicated test space once the opt-in runner lands (fake-backend tests structurally cannot catch response-shape drift on the real `_meta`/ETag carrier).
+  - Non-blocking hardening: engine state file growth (pending records carry redacted statements) has FIFO caps for seen/processed/skipped but pending records are bounded only by the reflection threshold×splitting behavior — a runaway extraction rate could grow the state file; consider a pending hard cap with visible degradation.
+  - T18/T19 hardening (deferred from T11 review): scope provenance replay detection in `src/observation/proposals.ts` to `kiwifs-provenance:`-prefixed lines (today it substring-matches the full record body, so a crafted observation statement containing the literal could mislabel replay-vs-stale in narrow recovery paths — low impact, no data loss); serialize the fire-and-forget `observerError` write in `src/index.ts` with other status updates (cosmetic race).

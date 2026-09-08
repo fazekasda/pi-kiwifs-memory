@@ -36,6 +36,7 @@ import {
   serializeStoredRecord,
 } from "../domain/records.ts";
 import { DATA_FENCE_END } from "./model.ts";
+import { sendProposalJob, sendReflectionJob } from "./reflection.ts";
 
 /**
  * Retryable availability gap: the observation delivery backend is not
@@ -227,6 +228,11 @@ export interface BackendSenderDeps {
  * Builds the outbox worker's JobSender. When no backend is available
  * (e.g. the extension is not enabled / MCP unconfigured), the sender throws
  * the retryable SenderNotWiredError so jobs remain pending with backoff.
+ *
+ * T11: dispatches by job kind — observation records, reflection summaries
+ * and merge proposals share the same scope/backend discipline and the same
+ * deterministic-path writeImmutable delivery. Unresolved scope holds ALL
+ * record kinds (never a partial delivery with divergent lifecycle state).
  */
 export function createObservationSender(
   deps: BackendSenderDeps,
@@ -235,14 +241,22 @@ export function createObservationSender(
     const scope = deps.scope;
     if (scope === undefined) {
       throw new SenderNotWiredError(
-        "record scope not yet resolved (project identity pending, T18) — observation delivery held",
+        "record scope not yet resolved (project identity pending, T18) — record delivery held",
       );
     }
     const backend = await deps.openBackend();
     if (!backend) {
       throw new SenderNotWiredError(
-        "backend not configured — observation delivery pending",
+        "backend not configured — record delivery pending",
       );
+    }
+    if (job.kind === "reflection") {
+      await sendReflectionJob(job, scope, backend);
+      return;
+    }
+    if (job.kind === "proposal") {
+      await sendProposalJob(job, scope, backend);
+      return;
     }
     await sendObservationJob(job, scope, backend);
   };

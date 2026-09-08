@@ -35,6 +35,17 @@ export interface IdempotencyInput {
   sources: SourceRef[];
   /** Board messages: channel is part of the routing identity. */
   channel?: string;
+  /**
+   * Additional identity tokens (T11): reflections are keyed by the hash of
+   * the observation set they summarize; merge proposals by the reflection
+   * set plus the sorted target record ids. The key is a stable fingerprint:
+   * duplicate batches yield the SAME key, so a re-derived job replays at the
+   * same deterministic path. The outbox itself does NOT dedupe by key — the
+   * one-logical-job guarantee is enforced upstream (reflection engine's
+   * durable processed-set registry + seen-record dedupe) and at delivery
+   * (deterministic-path `writeImmutable` replay no-op).
+   */
+  tokens?: string[];
 }
 
 /** Stable JSON: object keys sorted recursively, arrays preserved. */
@@ -63,6 +74,7 @@ export function idempotencyKey(input: IdempotencyInput): string {
     kind: input.kind,
     scope: input.scope,
     ...(input.channel !== undefined ? { channel: input.channel } : {}),
+    ...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
     sources: input.sources,
   };
   return createHash("sha256")

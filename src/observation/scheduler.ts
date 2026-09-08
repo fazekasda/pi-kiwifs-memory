@@ -46,6 +46,8 @@ import { join } from "node:path";
 import type { SessionCoordinator } from "../pi/coordinator.ts";
 import type { DurableOutbox } from "../outbox/store.ts";
 import { idempotencyKey } from "../domain/idempotency.ts";
+import { deriveRecordId } from "../domain/idempotency.ts";
+import { memoryRecordPath } from "../domain/paths.ts";
 import type { ExclusionRule } from "../privacy/exclusions.ts";
 import { createRedactor } from "../privacy/redaction.ts";
 
@@ -98,6 +100,27 @@ export interface ExtractionBatch {
 
 export type ExtractFn = (batch: ExtractionBatch) => unknown | Promise<unknown>;
 
+/** T11: emitted after a batch's observation job is durably accepted. */
+export interface AcceptedBatchInfo {
+  opId: string;
+  /** Deterministic observation record id (T05 deriveRecordId). */
+  recordId: string;
+  /** Deterministic backend path of the observation record. */
+  recordPath: string;
+  /** The job's durably persisted enqueue time (record `created` basis). */
+  createdAt: number;
+  sessionId: string;
+  branchId?: string;
+  sourceEntryIds: string[];
+  observations: {
+    sourceEntryIds: string[];
+    statement: string;
+    uncertainty: string;
+  }[];
+}
+
+export type AcceptedObservationsHook = (info: AcceptedBatchInfo) => void;
+
 export interface PendingBatchRecord {
   opId: string;
   trigger: BatchTrigger;
@@ -126,6 +149,12 @@ export interface ObserverSchedulerOptions {
   branchId?: string;
   /** Optional extraction callback (T10 wires the real model call). */
   extract?: ExtractFn;
+  /**
+   * T11: called after a batch's observation job is DURABLY accepted into the
+   * outbox (never on acceptance failure). Hook errors never fail acceptance —
+   * they surface as a visible status note only.
+   */
+  onAcceptedObservations?: AcceptedObservationsHook;
   /** Compiled exclusion rules; matching entries are never captured. */
   exclusions?: { rule: ExclusionRule; regex?: RegExp }[];
   /** Redactor for the model-call edge (arch §5). Defaults to createRedactor(). */
@@ -236,6 +265,7 @@ export class ObserverScheduler {
   sessionId: string;
   private branchId: string | undefined;
   private readonly extract: ExtractFn | undefined;
+  private readonly onAcceptedObservations: AcceptedObservationsHook | undefined;
   private readonly exclusions: { rule: ExclusionRule; regex?: RegExp }[];
   private readonly redact: (
     content: string,
@@ -270,6 +300,7 @@ export class ObserverScheduler {
     this.sessionId = options.sessionId;
     this.branchId = options.branchId;
     this.extract = options.extract;
+    this.onAcceptedObservations = options.onAcceptedObservations;
     this.exclusions = options.exclusions ?? [];
     // T06 hard default: the real redactor guards the model-call edge.
     this.redact = options.redact ?? createRedactor();
@@ -512,8 +543,9 @@ export class ObserverScheduler {
         },
       ],
     });
+    let enqueuedJob: { createdAt: number } | undefined;
     try {
-      this.outbox.enqueue({
+      enqueuedJob = this.outbox.enqueue({
         kind: "observation",
         scope: this.scope,
         idempotencyKey: key,
@@ -543,6 +575,44 @@ export class ObserverScheduler {
       (b) => b.opId !== batch.opId,
     );
     this.persist();
+    // T11: notify the reflection engine — only AFTER durable acceptance, so
+    // a hook can never observe an observation that is not durably queued.
+    // Hook failures are contained (visible status note; never re-thrown: the
+    // batch is already accepted and consumed).
+    if (this.onAcceptedObservations) {
+      try {
+        const recordId = deriveRecordId("observation", batch.opId);
+        const createdAt = enqueuedJob?.createdAt ?? Date.now();
+        const validated = result as {
+          observations?: {
+            sourceEntryIds: string[];
+            statement: string;
+            uncertainty: string;
+          }[];
+        };
+        const observations = Array.isArray(validated?.observations)
+          ? validated.observations
+          : [];
+        const info: AcceptedBatchInfo = {
+          opId: batch.opId,
+          recordId,
+          recordPath: memoryRecordPath(
+            this.scope,
+            "observation",
+            recordId,
+            new Date(createdAt),
+          ),
+          createdAt,
+          sessionId: this.sessionId,
+          ...(this.branchId !== undefined ? { branchId: this.branchId } : {}),
+          sourceEntryIds: [...batch.entryIds],
+          observations,
+        };
+        this.onAcceptedObservations(info);
+      } catch (err) {
+        this.lastError = `reflection-hook (${(err as Error).name})`;
+      }
+    }
     return true;
   }
 
