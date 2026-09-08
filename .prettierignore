@@ -1,0 +1,8 @@
+node_modules/
+.devenv*
+.direnv/
+.pi/
+coverage/
+dist/
+package-lock.json
+devenv.lock

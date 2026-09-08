@@ -1,0 +1,64 @@
+{
+  "name": "@fazekasda/pi-kiwifs-memory",
+  "version": "0.1.0",
+  "description": "Development scaffold for a KiwiFS memory extension for Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "author": "David Fazekas",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fazekasda/pi-kiwifs-memory.git"
+  },
+  "homepage": "https://github.com/fazekasda/pi-kiwifs-memory#readme",
+  "bugs": {
+    "url": "https://github.com/fazekasda/pi-kiwifs-memory/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "kiwifs",
+    "memory"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "pi -e ./src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "test:watch": "node --test --watch test/*.test.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run typecheck && npm run format:check && npm test",
+    "pack:check": "node scripts/check-package.mjs && node scripts/smoke-package.mjs",
+    "prepublishOnly": "npm run check && npm run pack:check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
+    "@types/node": "24.13.3",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3"
+  }
+}
