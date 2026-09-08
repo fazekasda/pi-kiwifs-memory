@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "mcp": {
+    "url": "",
+    "transport": "streamable-http",
+    "headers": {}
+  },
+  "space": {
+    "name": "pi-kiwifs-memory-test",
+    "provisioned": false,
+    "isolationVerified": false
+  },
+  "safety": {
+    "allowTestSpaceWrites": true,
+    "allowOutsideTestSpaceWrites": false,
+    "allowServerAdministration": false,
+    "requireVerifiedSpaceIsolation": true,
+    "recordPrefix": "integration-tests/",
+    "cleanup": "current-run-only"
+  },
+  "timeouts": {
+    "requestMs": 10000,
+    "runMs": 60000
+  }
+}

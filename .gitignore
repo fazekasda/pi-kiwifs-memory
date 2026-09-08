@@ -19,4 +19,5 @@ dist/
 .env.*
 !.env.example
 .npmrc
+config/kiwifs-test.local.json
 .DS_Store

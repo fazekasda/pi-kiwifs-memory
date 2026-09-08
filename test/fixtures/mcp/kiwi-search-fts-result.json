@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 20,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "1. project/demo-proj/memory/observations/2026/02/obs-0001.md (3.42)\n   Synthetic snippet line one for the FTS result shape.\n2. project/demo-proj/memory/observations/2026/01/obs-0009.md (2.87)\n   Second synthetic hit with the same numbered path (score) shape.\n\nUse offset=2 to see more results."
+      }
+    ]
+  }
+}

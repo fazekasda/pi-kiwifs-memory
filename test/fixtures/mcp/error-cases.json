@@ -1,0 +1,53 @@
+{
+  "description": "Error-normalization fixtures. All domain failures arrive as JSON-RPC successes with isError=true; only transport faults are JSON-RPC errors. The adapter maps each to a typed, credential-free error class.",
+  "cases": [
+    {
+      "name": "domain-iserror",
+      "wire": {
+        "jsonrpc": "2.0",
+        "id": 12,
+        "result": {
+          "isError": true,
+          "content": [{ "type": "text", "text": "query is required" }]
+        }
+      },
+      "expect": "typed validation error; never retried as transient",
+      "citation": "mcp-contracts.md §3 error behavior; §9 fixture 9"
+    },
+    {
+      "name": "auth-401",
+      "wire": { "http": { "status": 401 } },
+      "expect": "hard setup error (authorization failures are never retried); constant-time compare path on 3333 /mcp",
+      "citation": "mcp-contracts.md §2 B1; §9 fixture 10; PRD T04"
+    },
+    {
+      "name": "oversized-response",
+      "wire": {
+        "http": {
+          "note": "response body exceeds the adapter's configured response bound"
+        }
+      },
+      "expect": "typed safe failure; payload is never parsed into memory beyond the bound",
+      "citation": "PRD T04: invalid/oversized backend responses produce typed safe failures"
+    },
+    {
+      "name": "redirect-credential-leak",
+      "wire": {
+        "http": {
+          "status": 302,
+          "location": "https://unrelated.example.invalid/mcp"
+        }
+      },
+      "expect": "reject before following; credentials must never be forwarded to a redirected host",
+      "citation": "PRD T04; test-environment.md runner safeguards"
+    },
+    {
+      "name": "timeout-and-cancel",
+      "wire": {
+        "note": "client aborts the request context; mcp-go propagates cancellation into backend REST calls"
+      },
+      "expect": "pending request terminates within the configured bound; typed timeout error",
+      "citation": "mcp-contracts.md §2 cancellation; PRD T04"
+    }
+  ]
+}

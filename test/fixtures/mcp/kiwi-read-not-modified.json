@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Not modified (ETag: etag-9f2c). Use if_not_etag to skip re-reading unchanged content."
+      }
+    ],
+    "_meta": { "kiwi.etag": "etag-9f2c", "kiwi.not_modified": true }
+  }
+}

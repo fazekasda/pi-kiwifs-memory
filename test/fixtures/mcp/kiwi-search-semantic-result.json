@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "1. project/demo-proj/memory/observations/2026/02/obs-0001.md (0.812)\n2. project/demo-proj/memory/observations/2026/01/obs-0009.md (0.745)\n\nSemantic scores are post-candidate-filtered server-side (candidates capped at 200; widened fetch capped at 4096). Under-recall is possible and must be reported, never hidden."
+      }
+    ]
+  }
+}

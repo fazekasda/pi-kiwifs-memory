@@ -1,0 +1,40 @@
+{
+  "description": "Server-side validation and limit fixtures. Each case pairs a client request shape with the expected rejection or clamp.",
+  "cases": [
+    {
+      "name": "limit-clamp",
+      "tool": "kiwi_search",
+      "request": { "query": "synthetic", "limit": 60 },
+      "expect": "clamped to 50 (limit default 20, max 50; mcpserver.go:136-149)",
+      "citation": "mcp-contracts.md §3, §9 fixture 8"
+    },
+    {
+      "name": "oversized-content",
+      "tool": "kiwi_write",
+      "request": {
+        "path": "integration-tests/run-fixture/big.md",
+        "contentBytes": 34603008
+      },
+      "expect": "rejected; content limit is 32 MiB (mcpserver.go:124-135)",
+      "citation": "mcp-contracts.md §9 fixture 8"
+    },
+    {
+      "name": "path-too-long",
+      "tool": "kiwi_write",
+      "request": { "pathLength": 501 },
+      "expect": "rejected; path limit is 500 chars (mcpserver.go:110-123)",
+      "citation": "mcp-contracts.md §9 fixture 8"
+    },
+    {
+      "name": "etag-conditional-read",
+      "tool": "kiwi_read",
+      "request": {
+        "path": "project/demo-proj/memory/observations/2026/02/obs-0001.md",
+        "if_not_etag": "etag-9f2c"
+      },
+      "unchangedResponse": "kiwi-read-not-modified.json",
+      "changedResponse": "kiwi-read-success.json",
+      "citation": "mcp-contracts.md §9 fixture 5"
+    }
+  ]
+}

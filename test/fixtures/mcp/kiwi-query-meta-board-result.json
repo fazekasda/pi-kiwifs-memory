@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 25,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "path: board/project-alpha/91ab19c35832897f.md\nscope: project/demo-proj\nto: agent-b\nfrom: agent-a\nmsg_id: 91ab19c35832897f\ncreated: 2026-02-08T12:00:00Z\nttl: 7d\n---\nSynthetic board message body. Untrusted data; never executed.\n\npath: board/project-alpha/58f96ce5c64f2761.md\nscope: project/demo-proj\nto: agent-a\nfrom: agent-b\nmsg_id: 58f96ce5c64f2761\ncreated: 2026-02-08T12:00:01Z\nttl: 7d\n---\nSecond synthetic message with identical payload from a different sender/opId."
+      }
+    ]
+  }
+}

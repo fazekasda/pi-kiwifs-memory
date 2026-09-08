@@ -6,3 +6,4 @@ coverage/
 dist/
 package-lock.json
 devenv.lock
+config/kiwifs-test.local.json

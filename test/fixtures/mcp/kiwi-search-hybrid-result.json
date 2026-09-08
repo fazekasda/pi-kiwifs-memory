@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "1. project/demo-proj/memory/observations/2026/02/obs-0001.md (both, #1)\n2. project/demo-proj/memory/observations/2026/01/obs-0009.md (keyword only, #2)\n3. project/demo-proj/memory/observations/2026/03/obs-0004.md (semantic only, #3)\n\nEngine attribution is per-result. 'keyword only' means degraded lexical evidence, never semantic."
+      }
+    ]
+  }
+}

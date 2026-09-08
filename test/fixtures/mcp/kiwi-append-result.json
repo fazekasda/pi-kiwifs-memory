@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 14,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Appended to integration-tests/run-fixture/demo/log.md (ETag: etag-31de)"
+      }
+    ]
+  }
+}

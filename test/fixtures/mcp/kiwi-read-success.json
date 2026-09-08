@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "---\nscope: project/demo-proj\nmemory_status: active\ncreated: 2026-02-08T10:00:00Z\n---\nSynthetic observation body for fixture use only. No real user data."
+      }
+    ],
+    "_meta": { "kiwi.etag": "etag-9f2c" }
+  }
+}
