@@ -54,3 +54,29 @@ Prior worker had skipped `devenv test` citing network npm ci/Nix eval; this run 
 
 - No T01 defects found; no code changes. Required gate `devenv test` now recorded as completed for T01, not skipped.
 - T01 acceptance criteria remain satisfied; follow-ups unchanged (T04 cursor replay/ETag integration, T16 msg_id framing live confirmation).
+
+## T02 — Resolve decisions and approve architecture
+
+Date: 2026-09-08 (session). Worker: implement_T02, model openrouter/z-ai/glm-5.3-flash per standing instruction.
+
+### Prior state verified
+
+- T01 receipt present: original commit `03ede0cd…`, completed, follow-up commit `c0e0f1a` closing the devenv test gate. T01 acceptance items 5–7 evidenced in the log. Dependency satisfied.
+- `docs/decisions.md` (D2–D6 choices, #1–#12 confirmed), `docs/architecture.md` (§1–§13 incl. decision/default table), `docs/architecture-review.md` (F1–F10, R1–R5, B-1…M-3 all resolved) read in full; `docs/test-environment.md` re-read for live-runner constraints.
+
+### Work done
+
+1. **Architecture approval recorded** (T02 final acceptance item): the user approved the architecture set by instructing execution of the approved task plan; approval is the execute-plan instruction. Recorded in PRD T02 checkbox with the coordinator's applied corrections: pending outbox jobs never drop-oldest (capture backpressure with visible coverage gaps); model-compatible tokenizer including framing required for the enforced 3,000-token cap, with visible skip of automatic injection if unavailable; queued-input matching must distinguish newly consumed occurrences, repeated identical text, transformations and followUp lifecycle (history membership alone insufficient). Rows #18–#20 dispositioned: #19 excluded by confirmed privacy policy; #18/#20 deferred, not blocking v1. **No changes to decisions.md.**
+2. **Consistency fix found and applied**: `docs/architecture.md` §2 local-outbox record still said "oldest-jobs-dropped with visible status on overflow", contradicting §13 row 8 and the coordinator correction. Rewritten to state high-water limits, capture pause with visible coverage gaps, pending jobs preserved, 14-day retention applies only to acknowledged jobs. No other doc inconsistencies found: §3.1 token accounting already requires a model-compatible tokenizer (§13 row 5), §3.1 queued-input matching already covers the followUp lifecycle and fail-closed ambiguity handling, and the architecture-review "Remaining gates" list matches the PRD state.
+3. No code, test-fixture, or config changes; no live service contact; `config/kiwifs-test.local.json` never read or staged.
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: typecheck clean, prettier clean, node --test 3/3 (scaffold tests unchanged).
+- `npm run pack:check` — **pass**: Package OK, 4 files; packed extension loads in Pi RPC.
+- `devenv test` — **pass** (7.47s): full suite incl. network `npm ci`; "Tests passed :)".
+- Node compatibility: task changes Markdown/docs only, no runtime surface; engines `>=22.19.0`, devenv toolchain Node v24.19.0, all checks green there.
+
+### Blockers / follow-ups
+
+- No blockers. Remaining gates unchanged and carried to owning tasks: T13 feasibility fixture (queued-input matched injection) before T12/T13 land; B1 production-endpoint auth before enabling outside the test space; T04/T19 live runner unbuilt.
