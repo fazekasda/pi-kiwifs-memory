@@ -291,11 +291,13 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Tests use deterministic fake model responses, not paid live calls.
-- [ ] Malformed output, hallucinated source IDs, timeout and provider rejection produce safe visible failures.
-- [ ] Stored observations refer only to supplied source entries.
-- [ ] Model identity and usage/cost data, when available, are visible without payload logging.
-- [ ] Observation content cannot be interpreted as instructions to execute tools.
+- [x] Tests use deterministic fake model responses, not paid live calls. _T10: `test/observation-model.test.ts` uses injected fake `ModelTransport`s exclusively (deterministic canned responses, controllable timeouts/rejections); the default OpenRouter transport is never invoked in tests; the unresolvable-credential tests prove no transport call occurs._
+- [x] Malformed output, hallucinated source IDs, timeout and provider rejection produce safe visible failures. _T10: typed `ExtractionModelError` reasons `malformed-output` / `hallucinated-source` / `timeout` / `provider`; scheduler tests show the batch stays durably pending with zero outbox jobs and a payload-free `last=ExtractionModelError` status line; the sender re-validates payloads and raises permanent `ValidationError`s for malformed jobs (quarantine)._
+- [x] Stored observations refer only to supplied source entries. _T10: `validateExtraction` rejects any `sourceEntryIds` not present in the batch (hallucinated-source); `parseObservationPayload` re-checks against the job's own `sourceEntryIds` before any backend write; record frontmatter provenance carries the job's source set._
+- [x] Model identity and usage/cost data, when available, are visible without payload logging. _T10: `ExtractionResult.model {route, reported?, usage?}` is recorded metadata-only and rendered by `pendingStatus()` (route, reported identity, prompt/completion tokens, cost); test asserts the status contains no source/statement content. A different reported model identity is a hard `model-mismatch` failure — never silently substituted (decisions.md #9); the match is ANCHORED (`reportedModelMatches`: exact, or wire id + one separator + bounded alphanumeric suffix) — a different vendor string that merely contains the wire id is rejected (review follow-up)._
+- [x] Observation content cannot be interpreted as instructions to execute tools. _T10: statements are stored inside an explicit inert-data fence (`kiwifs:observation-data-begin/end`); the fence-escape marker is rejected by both extractor validation and sender re-validation; the system prompt frames sources as untrusted data; downstream consumers treat the body as data only. Sender re-validation also rejects tampered `uncertainty` labels (review follow-up)._
+
+**Review-hardening (T10, post-review):** (1) `mcp.auth` is resolved to a bearer `Authorization` header at adapter construction (`openConfiguredBackend`), matching the live runner — an unresolvable credential is a retryable hold, not an unauthenticated send (B1). (2) Record `created` derives from the job's durably persisted outbox `createdAt`, so crash-replay of the same opId reproduces byte-identical content and the same path (deterministic paths, T07 B2) — covered by a dedicated replay-determinism test (B2). (3) An unresolved record scope (no `projectIdentity`) is a retryable availability hold (`SenderNotWiredError`) and observation/extraction is held entirely with a visible status note — the previous provisional `local` scope could only be permanently quarantined at send time (B3).
 
 ### T11 — Implement reflections, conflicts and merge proposals
 

@@ -106,6 +106,10 @@ export interface PendingBatchRecord {
   createdAt: number;
   inputBudgetTokens: number;
   outputBudgetTokens: number;
+  /** Extraction attempts so far (bounded cooldown — T10). */
+  attempts?: number;
+  /** Earliest wall-clock ms at which a retry may re-run the model call. */
+  nextAttemptAt?: number;
 }
 
 interface ObserverState {
@@ -135,7 +139,20 @@ export interface ObserverSchedulerOptions {
   outputBudgetTokens?: number;
   maxPendingBatches?: number;
   compactFlushTimeoutMs?: number;
+  retryBaseMs?: number;
+  retryCapMs?: number;
   now?: () => number;
+}
+
+/** Model identity + usage metadata rendered to status (payload-free, T10). */
+export interface ModelResultMeta {
+  route: string;
+  reported?: string;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    costUsd?: number;
+  };
 }
 
 export interface SettleSummary {
@@ -217,7 +234,7 @@ export class ObserverScheduler {
   readonly scope: string;
   /** Updated at session_start (session identity is known only there). */
   sessionId: string;
-  private readonly branchId: string | undefined;
+  private branchId: string | undefined;
   private readonly extract: ExtractFn | undefined;
   private readonly exclusions: { rule: ExclusionRule; regex?: RegExp }[];
   private readonly redact: (
@@ -231,6 +248,9 @@ export class ObserverScheduler {
   private readonly maxPendingBatches: number;
   private readonly compactFlushTimeoutMs: number;
   private readonly nowFn: () => number;
+  /** Per-batch retry cooldown bounds (T10): backoff between model attempts. */
+  private readonly retryBaseMs: number;
+  private readonly retryCapMs: number;
 
   private state: ObserverState;
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -238,6 +258,8 @@ export class ObserverScheduler {
   private chain: Promise<unknown> = Promise.resolve();
   /** Last error (name only) for visible status. */
   lastError: string | undefined;
+  /** Last successful extraction's model identity/usage metadata (T10). */
+  lastModelInfo: ModelResultMeta | undefined;
 
   constructor(options: ObserverSchedulerOptions) {
     this.stateDir = options.stateDir;
@@ -263,6 +285,8 @@ export class ObserverScheduler {
     this.compactFlushTimeoutMs =
       options.compactFlushTimeoutMs ?? DEFAULT_COMPACT_FLUSH_TIMEOUT_MS;
     this.nowFn = options.now ?? (() => Date.now());
+    this.retryBaseMs = options.retryBaseMs ?? 30_000;
+    this.retryCapMs = options.retryCapMs ?? 10 * 60_000;
     this.state = this.loadState();
   }
 
@@ -363,6 +387,16 @@ export class ObserverScheduler {
     this.provider = provider;
   }
 
+  /**
+   * Refreshes session/branch identity (T09 follow-up closed in T10): called
+   * after `session_tree`/`session_before_fork` re-mint the generation so the
+   * idempotency key reflects the branch the batch actually ran on.
+   */
+  refreshIdentity(sessionId: string, branchId?: string): void {
+    this.sessionId = sessionId;
+    this.branchId = branchId;
+  }
+
   private providerEntries(): SourceEntryView[] {
     return this.provider?.entries() ?? [];
   }
@@ -448,7 +482,16 @@ export class ObserverScheduler {
       });
     } catch (err) {
       this.lastError = (err as Error).name;
+      this.noteExtractionFailure(batch);
       return false;
+    }
+    // T10: model identity + usage/cost metadata (visible, payload-free).
+    if (
+      typeof result === "object" &&
+      result !== null &&
+      typeof (result as { model?: unknown }).model === "object"
+    ) {
+      this.lastModelInfo = (result as { model?: ModelResultMeta }).model;
     }
     // Stale generation: discard the result — the batch stays pending for
     // re-derivation on the new branch/generation.
@@ -477,6 +520,8 @@ export class ObserverScheduler {
         payload: {
           opId: batch.opId,
           trigger: batch.trigger,
+          sessionId: this.sessionId,
+          ...(this.branchId !== undefined ? { branchId: this.branchId } : {}),
           inputBudgetTokens: batch.inputBudgetTokens,
           outputBudgetTokens: batch.outputBudgetTokens,
           sourceEntryIds: batch.entryIds,
@@ -485,8 +530,14 @@ export class ObserverScheduler {
       });
     } catch (err) {
       this.lastError = (err as Error).name;
+      // Local acceptance failures (outbox persist) do NOT arm the retry
+      // cooldown: recovery should re-derive as soon as the local fault
+      // clears. The cooldown protects the model provider only.
       return false; // batch stays pending; entries unconsumed
     }
+    // Success: reset the retry bookkeeping on the (now consumed) record.
+    batch.attempts = 0;
+    delete batch.nextAttemptAt;
     this.coordinator.markConsumed(batch.entryIds);
     this.state.pendingBatches = this.state.pendingBatches.filter(
       (b) => b.opId !== batch.opId,
@@ -505,9 +556,25 @@ export class ObserverScheduler {
     return run;
   }
 
-  /** Re-derives pending batches under their ORIGINAL opIds (crash recovery). */
+  /** Records a failed extraction attempt and arms the retry cooldown (T10). */
+  private noteExtractionFailure(batch: PendingBatchRecord): void {
+    batch.attempts = (batch.attempts ?? 0) + 1;
+    const backoff = Math.min(
+      this.retryCapMs,
+      this.retryBaseMs * 2 ** Math.min(batch.attempts - 1, 16),
+    );
+    batch.nextAttemptAt = this.nowFn() + backoff;
+    this.persist();
+  }
+
+  /** Re-derives pending batches under their ORIGINAL opIds (crash recovery).
+   * Batches inside their retry cooldown are skipped (they stay pending and
+   * are retried on a later settle/trigger — never dropped). */
   retryPending(): Promise<number> {
-    const batches = [...this.state.pendingBatches];
+    const now = this.nowFn();
+    const batches = this.state.pendingBatches.filter(
+      (b) => b.nextAttemptAt === undefined || b.nextAttemptAt <= now,
+    );
     for (const b of batches) this.enqueueRun(b);
     return Promise.resolve(batches.length);
   }
@@ -560,8 +627,12 @@ export class ObserverScheduler {
    */
   onAgentSettled(): SettleSummary {
     this.clearIdleTimer();
-    // Crash recovery first: pending batches re-run under their original opIds.
-    const retried = this.state.pendingBatches.length;
+    // Crash recovery first: due pending batches re-run under their original
+    // opIds; batches inside their retry cooldown stay pending (T10).
+    const now = this.nowFn();
+    const retried = this.state.pendingBatches.filter(
+      (b) => b.nextAttemptAt === undefined || b.nextAttemptAt <= now,
+    ).length;
     void this.retryPending();
     if (!this.extract) {
       return {
@@ -689,6 +760,19 @@ export class ObserverScheduler {
     if (this.outbox.capturePaused) {
       lines.push(
         "observer: outbox high-water reached — capture paused, pending work preserved (visible coverage gap)",
+      );
+    }
+    if (this.lastModelInfo) {
+      const u = this.lastModelInfo.usage;
+      lines.push(
+        `observer: last extraction via ${this.lastModelInfo.route}` +
+          (this.lastModelInfo.reported
+            ? ` (reported: ${this.lastModelInfo.reported})`
+            : "") +
+          (u
+            ? ` usage: prompt=${u.promptTokens ?? "?"} completion=${u.completionTokens ?? "?"}` +
+              (u.costUsd !== undefined ? ` cost=${u.costUsd}` : "")
+            : ""),
       );
     }
     return lines;

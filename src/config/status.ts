@@ -28,6 +28,13 @@ export function resolvedStatusLines(config: MemoryConfig): string[] {
     `endpoint: ${config.mcp.url === "" ? "(unset)" : config.mcp.url}`,
     `credentials: ${renderAuthRef(config)} (by reference; value never shown)`,
     `model route: ${config.model.route}`,
+    `model credentials: ${
+      config.model.auth
+        ? config.model.auth.kind === "env"
+          ? `env:${config.model.auth.ref}`
+          : `file:${config.model.auth.ref}`
+        : "not configured — extraction fails closed"
+    } (by reference; value never shown)`,
     `personal-global scope: ${config.scopes.allowPersonalGlobal ? "allowed" : "denied"}`,
     `cross-project opt-in: ${optIn}`,
     `budgets: ragDeadlineMs=${config.budgets.ragDeadlineMs} evidenceTokenCap=${config.budgets.evidenceTokenCap}`,

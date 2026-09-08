@@ -115,6 +115,65 @@ test("env and file credential references are accepted; bare values are not", () 
   assert.equal(relFile.ok, false);
 });
 
+// ---------- validation: model credential reference (T10) ----------
+
+test("model.auth by reference is accepted; unknown model keys are rejected", () => {
+  const ok = validateConfig(
+    base({
+      model: {
+        route: "openrouter/z-ai/glm-5.3-flash",
+        auth: { kind: "env", ref: "KIWIFS_MODEL_KEY" },
+      },
+    }),
+  );
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.deepEqual(ok.config.model.auth, {
+      kind: "env",
+      ref: "KIWIFS_MODEL_KEY",
+    });
+  }
+  const badVar = validateConfig(
+    base({ model: { auth: { kind: "env", ref: "not a var!" } } }),
+  );
+  assert.equal(badVar.ok, false);
+  const unknownKey = validateConfig(
+    base({ model: { headers: { Authorization: "Bearer x" } } }),
+  );
+  assert.equal(unknownKey.ok, false);
+  if (!unknownKey.ok)
+    assert.ok(unknownKey.issues.some((i) => i.path.startsWith("model.")));
+});
+
+test("status renders model credential by reference and fail-closed note without it", () => {
+  const withAuth = validateConfig(
+    base({
+      model: {
+        route: "openrouter/z-ai/glm-5.3-flash",
+        auth: { kind: "file", ref: "/run/secrets/kiwifs-model-key" },
+      },
+    }),
+  );
+  assert.equal(withAuth.ok, true);
+  if (withAuth.ok) {
+    const text = resolvedStatusLines(withAuth.config).join("\n");
+    assert.match(
+      text,
+      /model credentials: file:\/run\/secrets\/kiwifs-model-key/,
+    );
+    assert.ok(statusIsSecretFree(resolvedStatusLines(withAuth.config)));
+  }
+  const withoutAuth = validateConfig(base({}));
+  assert.equal(withoutAuth.ok, true);
+  if (withoutAuth.ok) {
+    const text = resolvedStatusLines(withoutAuth.config).join("\n");
+    assert.match(
+      text,
+      /model credentials: not configured — extraction fails closed/,
+    );
+  }
+});
+
 test("disabled config may omit url and auth entirely (defaults)", () => {
   const result = validateConfig(base({}));
   assert.equal(result.ok, true);

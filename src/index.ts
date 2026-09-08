@@ -5,11 +5,23 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config/loader.ts";
 import { resolvedStatusLines, statusIsSecretFree } from "./config/status.ts";
+import { effectiveFeatures, type MemoryConfig } from "./config/schema.ts";
+import { KiwiFSAdapter } from "./backend/adapter.ts";
+import type { OpIdLedger } from "./backend/opid.ts";
+import {
+  createModelExtractor,
+  resolveAuthSecret,
+} from "./observation/model.ts";
+import { createObservationSender } from "./observation/sender.ts";
 import { SessionCoordinator, StateSchemaError } from "./pi/coordinator.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
-import { ObserverScheduler, toSourceViews } from "./observation/scheduler.ts";
-import { BackendError } from "./backend/errors.ts";
+import {
+  DEFAULT_INPUT_BUDGET_TOKENS,
+  DEFAULT_OUTPUT_BUDGET_TOKENS,
+  ObserverScheduler,
+  toSourceViews,
+} from "./observation/scheduler.ts";
 
 export const STATUS_MESSAGE =
   "KiwiFS memory extension loaded. Memory storage is not implemented yet.";
@@ -59,6 +71,26 @@ export function resolveStatusText(): string {
   if (coordErr) text += `\nsession coordinator: DISABLED — ${coordErr}`;
   const obsErr = lastObserverError?.();
   if (obsErr) text += `\nobserver: DISABLED — ${obsErr}`;
+  if (result.ok && result.config.enabled) {
+    const features = effectiveFeatures(result.config);
+    if (features.observation && !result.config.model.auth) {
+      text +=
+        "\nobserver: extraction fails closed — model.auth is not configured (no model calls)";
+    }
+    if (features.observation && result.config.projectIdentity === undefined) {
+      text +=
+        "\nobserver: DISABLED — record scope not yet resolved (projectIdentity unset; git-remote discovery lands in T18)";
+    }
+    if (
+      result.config.enabled &&
+      result.config.mcp.url !== "" &&
+      result.config.mcp.auth &&
+      !resolveAuthSecret(result.config.mcp.auth)
+    ) {
+      text +=
+        "\nbackend: credential reference does not resolve — observation delivery pending (retryable hold)";
+    }
+  }
   return text;
 }
 
@@ -75,15 +107,49 @@ export function resolveStateDir(cwd: string): string {
 }
 
 /**
- * Sender stub until T10 wires the real model-observation sender: throws a
- * retryable availability error so queued jobs stay pending with backoff —
- * never quarantined, never dropped.
+ * Record scope for observation storage (T10). Uses the explicit
+ * `projectIdentity` override when configured; otherwise the scope is not
+ * yet resolved — real `git remote -v` discovery is the documented T18
+ * convention. An unresolved scope is NOT a writable owner scope: rather
+ * than extracting observations into jobs that can only be permanently
+ * quarantined at send time (guaranteed data loss), observation is held
+ * entirely until the scope resolves, and any queued job is held as a
+ * retryable availability gap by the sender.
  */
-export class SenderNotWiredError extends BackendError {
-  constructor() {
-    super("availability", "observation sender not wired yet (T10)");
-    this.name = "SenderNotWiredError";
+function resolveRecordScope(config: MemoryConfig): string | undefined {
+  if (config.projectIdentity)
+    return `project/${config.projectIdentity.toLowerCase()}`;
+  return undefined;
+}
+
+/**
+ * Builds the observation-delivery backend from the validated config.
+ * Returns undefined when MCP is not configured or the credential reference
+ * does not resolve — the sender then reports a retryable availability gap
+ * and jobs stay pending (never dropped, never quarantined).
+ *
+ * The MCP transport authenticates exclusively via `AdapterOptions.headers`
+ * (src/backend/transport.ts), so the `mcp.auth` reference is resolved to a
+ * bearer Authorization header here — same wiring as the live runner. The
+ * secret value is resolved per delivery attempt by reference and is never
+ * logged, echoed or stored.
+ */
+function openConfiguredBackend(
+  config: MemoryConfig,
+  ledger: OpIdLedger,
+): KiwiFSAdapter | undefined {
+  if (!config.enabled || config.mcp.url === "" || !config.mcp.auth) {
+    return undefined;
   }
+  const secret = resolveAuthSecret(config.mcp.auth);
+  if (secret === undefined) {
+    return undefined; // fail closed: unresolvable credential → retryable hold
+  }
+  return new KiwiFSAdapter({
+    url: config.mcp.url,
+    headers: { Authorization: `Bearer ${secret}` },
+    ledger,
+  });
 }
 
 /** Per-session runtime built lazily at session_start. */
@@ -102,6 +168,8 @@ interface SessionRuntime {
  */
 export function buildSessionRuntime(cwd: string): SessionRuntime {
   const stateDir = resolveStateDir(cwd);
+  const configResult = loadConfig();
+  const config = configResult.ok ? configResult.config : undefined;
   let store: DurableOutbox | undefined;
   let observerError: string | undefined;
   try {
@@ -112,14 +180,26 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
         ? err.message
         : `outbox init failed: ${(err as Error).name}`;
   }
+  // T10: real observation sender. When MCP is unconfigured, the credential
+  // does not resolve, or the record scope is not yet resolved, the sender
+  // throws the retryable SenderNotWiredError (jobs stay pending with
+  // backoff — never dropped, never quarantined).
+  const scope = config ? resolveRecordScope(config) : undefined;
   const worker = store
     ? new OutboxWorker({
         store,
-        send: async () => {
-          throw new SenderNotWiredError();
-        },
-        // Sender is an availability gap, not a permanent failure: retry
-        // without an attempt cap until T10 wires the real sender.
+        send: createObservationSender({
+          scope,
+          openBackend: async () => {
+            if (!config) return undefined;
+            const backend = openConfiguredBackend(config, store.ledger());
+            if (backend) await backend.connect();
+            return backend;
+          },
+        }),
+        // Availability gaps (backend unconfigured/outage) retry without an
+        // attempt cap; permanent failures (validation/conflict) quarantine
+        // per the worker's own rules.
         maxAttempts: Number.MAX_SAFE_INTEGER,
       })
     : undefined;
@@ -131,15 +211,35 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   let observer: ObserverScheduler | undefined;
   if (store) {
     try {
-      observer = new ObserverScheduler({
-        stateDir,
-        coordinator,
-        outbox: store,
-        // Scope/model/exclusion wiring arrives with T10 (config plumbing);
-        // defaults here keep scheduling honest and visible.
-        scope: "local",
-        sessionId: "pending",
-      });
+      const features = config ? effectiveFeatures(config) : undefined;
+      // No resolved scope yet → hold observation entirely (T18 discovery):
+      // extraction would only mint jobs the sender can never deliver.
+      const extract =
+        config !== undefined &&
+        features !== undefined &&
+        features.observation &&
+        config.enabled &&
+        config.model.auth &&
+        scope !== undefined
+          ? createModelExtractor({
+              route: config.model.route,
+              auth: config.model.auth,
+              inputBudgetTokens: DEFAULT_INPUT_BUDGET_TOKENS,
+              outputBudgetTokens: DEFAULT_OUTPUT_BUDGET_TOKENS,
+            })
+          : undefined;
+      // No resolved scope → no observer at all: nothing can be extracted
+      // into a deliverable record, so scheduling is held (T18 discovery).
+      if (scope !== undefined) {
+        observer = new ObserverScheduler({
+          stateDir,
+          coordinator,
+          outbox: store,
+          scope,
+          sessionId: "pending",
+          ...(extract ? { extract } : {}),
+        });
+      }
     } catch (err) {
       observerError = `observer init failed: ${(err as Error).name}`;
     }
@@ -187,6 +287,10 @@ export function registerSessionHandlers(
     rt?.coordinator.onSessionStart(ctx, event);
     if (rt?.observer) {
       rt.observer.sessionId = rt.coordinator.sessionId ?? "pending";
+      rt.observer.refreshIdentity(
+        rt.coordinator.sessionId ?? "pending",
+        rt.coordinator.branchId ?? undefined,
+      );
       rt.observer.setProvider({
         entries: () => toSourceViews(ctx.sessionManager.getEntries()),
       });
@@ -213,6 +317,14 @@ export function registerSessionHandlers(
   });
   pi.on("session_tree", async (event, ctx) => {
     runtime?.coordinator.onTree(ctx, event.oldLeafId, event.newLeafId);
+    // T09 follow-up (closed in T10): branchId feeds the idempotency key, so
+    // it must track the post-navigation branch, not the start-time branch.
+    if (runtime?.observer) {
+      runtime.observer.refreshIdentity(
+        runtime.coordinator.sessionId ?? "pending",
+        runtime.coordinator.branchId ?? undefined,
+      );
+    }
   });
   pi.on("session_shutdown", async () => {
     runtime?.observer?.dispose();

@@ -38,6 +38,13 @@ export interface MemoryConfig {
   };
   model: {
     route: string;
+    /**
+     * Model-provider credential reference (T10). Required in practice for
+     * extraction; without it the extractor fails closed at call time with a
+     * visible availability error (config stays valid so the status command
+     * can still render). The resolved value never lives in config or logs.
+     */
+    auth?: AuthRef;
   };
   scopes: {
     /** Include the `personal` scope in the authorized scope set. */
@@ -297,6 +304,7 @@ export function validateConfig(raw: unknown): ValidationResult {
   }
 
   let route = DEFAULT_CONFIG.model.route;
+  let modelAuth_: AuthRef | undefined;
   const model = raw["model"];
   if (model !== undefined) {
     if (!isPlainObject(model)) {
@@ -316,6 +324,21 @@ export function validateConfig(raw: unknown): ValidationResult {
         });
       } else {
         route = rawRoute;
+      }
+      let modelAuth: AuthRef | undefined;
+      if (model["auth"] !== undefined && model["auth"] !== null) {
+        modelAuth = validateAuthRef("model.auth", model["auth"], issues);
+      }
+      for (const key of Object.keys(model)) {
+        if (key !== "route" && key !== "auth") {
+          issues.push({
+            path: `model.${key}`,
+            message: "unknown model key (allowed: route, auth)",
+          });
+        }
+      }
+      if (issues.every((i) => !i.path.startsWith("model."))) {
+        if (modelAuth !== undefined) modelAuth_ = modelAuth;
       }
     }
   }
@@ -492,7 +515,7 @@ export function validateConfig(raw: unknown): ValidationResult {
       enabled: enabled as boolean,
       privateMode: privateMode as boolean,
       mcp: { url, ...(auth ? { auth } : {}) },
-      model: { route },
+      model: { route, ...(modelAuth_ ? { auth: modelAuth_ } : {}) },
       scopes,
       budgets,
       features,

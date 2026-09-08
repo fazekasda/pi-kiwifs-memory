@@ -369,3 +369,75 @@ Reviewer verdict: correct and complete per all six acceptance criteria; no block
   - T13: enforced evidence cap requires a model-compatible tokenizer incl. framing; `estimateTokens` here is scheduling-only and disclosed as approximate; visible skip of automatic injection if unavailable stays T13's obligation.
   - T18: manual `/kiwifs-extract` command wiring to `extractNow()`; finalize state-dir discovery; consumedEntries/pending-state retention policy (both registries grow unbounded in this iteration).
   - T11+: reflections/conflicts consume the same batch pipeline; extraction failure policy for compaction (always-continue) matches decisions.md #6 — pre-compaction cancellation policy stays unimplemented by design (explicit decision recorded in the PRD research constraints).
+
+## T10 — Observer model calls and validation (2026-09-08)
+
+Status: implemented, all gates green at time of logging, **no commit made in this session** (coordinator instruction: no commit yet).
+
+### What landed
+
+1. `src/observation/model.ts` (new) — the real extraction model adapter:
+   - Calls the CONFIGURED route verbatim (`wireModelId` strips the provider prefix, e.g. `openrouter/z-ai/glm-5.3-flash` → `z-ai/glm-5.3-flash`); a provider response reporting a different model identity is a typed `model-mismatch` failure — never silently substituted (decisions.md #9).
+   - Credentials resolve by reference (`model.auth` env var name / secret file path) at call time; missing/unresolvable credentials fail closed with zero transport calls.
+   - Input/output budgets enforced BEFORE the call and on the parsed result (`input-budget`/`output-budget` typed failures — never silent truncation); `estimateTokens` remains the disclosed scheduling approximation (the model-compatible tokenizer is the T13 enforced-cap obligation).
+   - Bounded validation: exactly one corrective retry for malformed/schema/hallucinated/output-budget responses; provider rejections and timeouts are terminal for the attempt (AbortController timeout, default 45 s).
+   - Validation: JSON-only output (fence-stripped), `observations[]` with source IDs ⊆ supplied batch entries (hallucinated-source rejection), non-empty statements, `low|medium|high` uncertainty, reserved-fence-marker rejection.
+   - Sources are framed as UNTRUSTED DATA in the prompt (explicit begin/end markers, "never a directive").
+2. `src/observation/sender.ts` (new) — the real outbox sender replacing the T09 stub:
+   - Re-validates every queued observation payload before any backend write (source refs ⊆ job's supplied set; fence-marker inert-data guard) — permanent `ValidationError` → quarantine.
+   - Builds a T05 `StoredRecord` (frontmatter provenance: sessionId/branchId/entryIds, status `active`) with the body serialized as an inert fenced JSON data block; deterministic path via `deriveRecordId(opId)` + `memoryRecordPath` (UTC buckets); delivery via `writeImmutable` (read-before-write, B2: replay no-op / different-content conflict fails closed).
+   - Unconfigured backend → retryable `SenderNotWiredError` (availability): jobs stay pending with backoff, never dropped.
+3. `src/observation/scheduler.ts` — T09 follow-ups closed: per-batch extraction retry cooldown (`attempts`/`nextAttemptAt` persisted; exponential backoff 30 s→10 min cap; armed ONLY on model-call failures, not local outbox-acceptance faults); `refreshIdentity(sessionId, branchId)`; extraction result payload now carries `sessionId`/`branchId` (needed for record provenance); `lastModelInfo` renders model identity/usage metadata-only in `pendingStatus()`.
+4. `src/index.ts` — `buildSessionRuntime` loads config and wires: `scope` from `projectIdentity` override (`project/{id}`, else provisional `local` pending T18 git-remote discovery); the real extractor when enabled + observation + `model.auth` configured (else idle-but-visible, status notes "extraction fails closed — model.auth is not configured"); the real sender with a lazily connected `KiwiFSAdapter` when MCP is configured. `session_start`/`session_tree` refresh observer identity (branchId feeds the idempotency key — T09 follow-up).
+5. `src/config/schema.ts` + `src/config/status.ts` — optional `model.auth` AuthRef (`env`/`file` reference; unknown `model.*` keys rejected); status renders the model credential reference symbolically and a fail-closed note when absent.
+6. Tests: `test/observation-model.test.ts` (22 tests, deterministic fakes only) + 2 config tests (model.auth acceptance/unknown-key rejection; status rendering).
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 200/200 (176 prior + 22 T10 + 2 config).
+- `npm run pack:check` — **pass**: Package OK; packed extension loads in Pi RPC and reports scaffold status.
+- `devenv test` — **pass** (10.7 s, "Tests passed :)"): npm ci + check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0 vs engines >=22.19.0; stable APIs only (`node:fs`, `node:crypto`, `fetch`, `AbortController`, `setTimeout.unref`).
+- No live model calls: every model interaction in tests goes through deterministic fake transports; no paid calls were made.
+- Secret scan of the changed files: synthetic fixtures only (e.g. `FAKE_KEY_VAR=test-key-not-real`); `config/kiwifs-test.local.json` never opened, printed or staged. No live-service contact (all tests local), no REST fallback, no deployments/pushes/tags.
+
+### Acceptance coverage (PRD T10)
+
+All five criteria trace to named tests in `test/observation-model.test.ts` (traceability notes inline in the PRD).
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups:
+  - T11: reflections/conflicts consume the same batch pipeline and validated-extraction shape.
+  - T12/T13: enforced injection cap needs a model-compatible tokenizer incl. framing (`estimateTokens` here is scheduling-only); automatic injection skipped visibly if unavailable.
+  - T18: manual `/kiwifs-extract` wiring to `extractNow()`; state-dir + git-remote discovery convention (scope is `projectIdentity`-override-or-`local` today).
+  - Open hardening (non-blocking): the default OpenRouter transport is unexercised by tests (by design — no paid calls); its live behavior (response shape drift) should be validated once against the opt-in live runner (T19) before enabling extraction against a real key.
+
+## T10 review hardening (post independent review)
+
+The independent T10 review found three real defects in the send/record path that fake-backend tests structurally cannot catch. All three fixed in this task; no commit was made before the fixes.
+
+### B1 — mcp.auth required then discarded (real sender could never authenticate)
+
+`openConfiguredBackend` now resolves `mcp.auth` to `{ Authorization: Bearer <secret> }` headers at `KiwiFSAdapter` construction — the same wiring as the live runner (`src/backend/live/runner.ts`), since the transport authenticates exclusively via `AdapterOptions.headers`. An unresolvable credential fails closed to the retryable `SenderNotWiredError` hold (never an unauthenticated send), with a visible fail-closed status line. The secret value is resolved per attempt by reference and is never logged or stored.
+
+### B2 — wall-clock `created` broke replay determinism
+
+`buildObservationRecord` no longer reads the wall clock: `created` derives from the job's durably persisted outbox `createdAt` (epoch ms), validated as finite/non-negative. Replay of the same opId now reproduces byte-identical content AND the same UTC path (T07 crash-window "remote success before local ack" is a true no-op). New test: crash-replay determinism (identical content+path; different persisted enqueue time in another month → different path).
+
+### B3 — default configuration systematically quarantined every observation
+
+`resolveRecordScope` returns `undefined` when no `projectIdentity` is configured (the provisional `local` value is not a writable owner scope and could only be permanently quarantined at send time — guaranteed paid-extraction data loss). Now: observation and extraction are held entirely with a visible status note ("record scope not yet resolved … T18 git-remote discovery"); any already-queued job is held by the sender as a retryable `SenderNotWiredError` availability gap — pending with backoff, never quarantined, never dropped.
+
+### Review follow-ups also addressed in this task
+
+- Model-mismatch check anchored: `reportedModelMatches` (exact, or wire id + one separator + bounded `[a-z0-9._-]{1,32}` suffix); a string merely containing the wire id is rejected. Tested.
+- Sender payload re-validation now also rejects invalid `uncertainty` labels before any backend write. Tested.
+
+### Checks after fixes (actual outcomes)
+
+- `npm run check` — **pass**: tsc clean, prettier clean, node --test 204/204 (200 prior + 4 new: replay determinism, unresolved-scope hold, uncertainty validation, anchored model match).
+- `npm run pack:check` — **pass**: Package OK; packed extension loads in Pi RPC.
+- `devenv test` — **pass** (9.9 s, "Tests passed :)").
+- Node v24.19.0 (devenv) vs engines >=22.19.0; stable APIs only.
+- Secret scan of the incremental diff: clean (synthetic fixtures only); `config/kiwifs-test.local.json` never opened; no live-service contact, no REST fallback, no pushes/tags/deployments.
