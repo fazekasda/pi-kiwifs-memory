@@ -240,13 +240,13 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Crash tests cover before persistence, after persistence, and remote success before local acknowledgment.
-- [ ] Replayed jobs do not duplicate logical observations, archive chunks or board messages (deterministic-path idempotency, B2).
-- [ ] Offline startup processes pending jobs and advances pipelines using only local cursors; backend cursor drift is detected at reconnect and reconciled, never trusted blindly.
-- [ ] Transient failures retry; permanent failures become inspectable without an infinite loop.
-- [ ] Queue high-water limits pause new capture with visible coverage gaps and preserve pending jobs. Age-based cleanup applies only to acknowledged work. Disk-full/crash fixtures prove pending jobs and cursors survive without false backup-completeness claims.
-- [ ] Queue permissions and multi-process tests prevent accidental exposure/corruption.
-- [ ] Failed jobs never block ordinary Pi model interaction.
+- [x] Crash tests cover before persistence, after persistence, and remote success before local acknowledgment.
+- [x] Replayed jobs do not duplicate logical observations, archive chunks or board messages (deterministic-path idempotency, B2).
+- [x] Offline startup processes pending jobs and advances pipelines using only local cursors; backend cursor drift is detected at reconnect and reconciled, never trusted blindly.
+- [x] Transient failures retry; permanent failures become inspectable without an infinite loop.
+- [x] Queue high-water limits pause new capture with visible coverage gaps and preserve pending jobs. Age-based cleanup applies only to acknowledged work. Disk-full/crash fixtures prove pending jobs and cursors survive without false backup-completeness claims.
+- [x] Queue permissions and multi-process tests prevent accidental exposure/corruption.
+- [x] Failed jobs never block ordinary Pi model interaction.
 
 ### T08 — Implement Pi session coordinator
 

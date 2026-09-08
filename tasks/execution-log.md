@@ -24,6 +24,13 @@ Date: 2026-02-08 (session). Worker: implement_T01, model openrouter/z-ai/glm-5.3
 5. Updated PRD T01 checkboxes to reflect the three completed items; fixtures catalog cross-referenced from `mcp-contracts.md` §9.
 6. No live service contact, no mutation, no production access, no credentials read or printed.
 
+### Review fixes (T07 review, pre-commit)
+
+- Persisting retry/quarantine state in `OutboxWorker.deliver` is now inside the tick-never-throws invariant: a persist fault (ENOSPC) while recording a failure leaves the job pending instead of escaping `tick`. New tests cover both the retry and the quarantine persist-fault paths.
+- `reconcile()` now detects feed GAPS (`first > lastSeq + 1` when a prior advisory cursor exists), not just regressions — a skipped range is flagged as drift, never adopted via `setBackend`. New test asserts the advisory cursor stays untouched across a gap.
+- `store.persist()` and `CursorFile.save()` fsync the parent directory after `renameSync`, so the §2 "opId persisted before any side effect" durability claim holds across power loss on the rename itself.
+- `CursorFile` newer-`schemaVersion` fail-safe retains the parsed authoritative `localSeq` (read-only retention) instead of silently resetting it to 0.
+
 ### Tests run (actual evidence)
 
 - `npm run check` — typecheck (`tsc --noEmit`), `prettier --check .`, `node --test test/*.test.ts`: **pass** (scaffold tests unchanged; fixtures are JSON/MD data, not compiled or executed).
@@ -250,3 +257,36 @@ Date: 2026-09-08 (session). Worker: implement_T06, model openrouter/z-ai/glm-5.3
 - Follow-up comment fix (F1): corrected the contradictory comments in `src/privacy/exclusions.ts` (dimensions are ANDed within a rule; a `continue` skips the entire rule, not just one dimension).
 - Follow-up doc (F2): `docs/privacy.md` now states the hard T07 requirement that a resume listener be registered before the private-mode gate is ever enabled, since `resume()` delivers held references only to registered listeners.
 - Re-run after fixes: `npm run check` pass (126/126), `npm run pack:check` pass, `devenv test` re-run — see below.
+
+## T07 — Durable outbox and recovery
+
+Date: 2026-09-08 (session). Worker: implement_T07, model openrouter/z-ai/glm-5.3-flash per standing instruction. Dependencies T04, T05, T06: completed receipts verified before starting (T04 → 2a43811, T05 → 3fc0b6d, T06 → c4c187d).
+
+### What landed
+
+1. `src/outbox/store.ts` — `DurableOutbox`: JSONL journal (one job per line, shape `{seq, schemaVersion, kind, scope, opId, idempotencyKey, payload, attempts, nextAttemptAt, createdAt, status}` per architecture.md §2) with lock file (stale-holder breakage after 30 s), 0700 dir / 0600 files enforced fail-closed on open, atomic persist (temp → fsync → rename) so enqueue returns only after durability — the minted opId is on disk BEFORE any side effect (§2; the store itself provides the durable `OpIdLedger`). Overflow: 5,000 jobs / 50 MiB high-water limits pause new capture with a visible `capturePaused` flag; pending jobs are never dropped (no drop-oldest, §13 row 8); 14-day retention applies only to acked jobs. Payloads screened with `looksSecretBearing` before touching queue bytes (T06 defense in depth). Unknown newer `schemaVersion` → read-only fail-safe mode with a visible reason, journal never rewritten (§9). Test hook `persistFault` simulates disk-full.
+2. `src/outbox/worker.ts` — `OutboxWorker`: strict per-scope ordered delivery (lowest-seq pending job is the scope head; a later job never overtakes a head in backoff), capped exponential backoff with jitter (min(cap, base·2^n)·(1+jitter)), permanent failures (non-retryable codes or exhausted attempts) quarantined with name:code-only error fingerprints (never messages — no user content in queue bytes); quarantined jobs inspectable via `store.quarantined()`, removed only by explicit `discardQuarantined`. Private mode wired per docs/privacy.md: the gate's release listener is registered at construction (BEFORE any enable), `isPrivate` holds sends and `assertNetworkAllowed` is re-checked before every send; held jobs preserved. `tick()` never throws — failed jobs never block Pi interaction. Crash-window handling: remote success before local ack leaves the job pending (never quarantined, never a false completeness claim); replay no-ops against the backend.
+3. `src/outbox/cursor.ts` — `CursorFile` (durable `{localSeq, backendLastSeq?, lastCommitHash?, reconcileNeeded?}`, atomic persist incl. directory fsync, newer-version fail-safe that RETAINS the parsed authoritative cursor instead of resetting `localSeq` to 0) and `reconcile()`: bounded pass ≤20 pages / 10,000 changes (§13 row 14); local state authoritative, advisory backend cursor adopted only on continuous feed, regression AND gap drift flagged via `reconcileNeeded` and never adopted blindly; bound reached → visible paused state that resumes next cycle.
+4. `test/outbox.test.ts` — 24 tests covering the full T07 crash matrix and acceptance list (details below).
+
+### Tests run (actual evidence)
+
+- `npm run check` — **pass**: `tsc --noEmit` clean, prettier clean, `node --test` 150/150 (126 prior + 24 new).
+- `npm run pack:check` — **pass**: Package OK, packed extension loads in Pi RPC and reports scaffold status.
+- `devenv test` — **pass** (10.8s, "Tests passed :)"): npm ci + check + pack:check green in the Nix sandbox.
+- Node compatibility: devenv Node v24.19.0, engines >=22.19.0; stable APIs only (`node:fs` sync primitives, `node:crypto`, `node:path`) — no version-gated surface. No TUI behavior introduced; no manual TUI check required or performed.
+
+### Acceptance coverage (PRD T07)
+
+- Crash tests (before persistence / after persistence / remote success before local ack): three dedicated tests — enqueue persist fault leaves nothing durable (torn tmp ignored on reload); reopen sees and delivers the persisted pending job; forced ack-persist failure after remote success replays with zero backend duplicates.
+- Replays do not duplicate (B2 deterministic-path idempotency): identical replay no-ops; same-path different-content conflict fails closed, quarantines, never overwrites.
+- Offline startup from local cursors only: reopen + local `CursorFile.localSeq` delivers pending work with no backend contact; reconciliation adopts the advisory cursor only on continuity, flags regression and gap drift, never trusts it blindly; bound → visible pause.
+- Transient retry / permanent quarantine: availability → backoff 100 ms → 200 ms, deterministic jitter bounds, attempts exhausted → quarantine; quarantined jobs never re-sent; validation fault quarantines immediately.
+- Overflow/disk-full: maxJobs limit pauses capture with visible gap, pending preserved (no drop-oldest); retention frees capacity only after the acked window; disk-full during enqueue/ack leaves pending jobs and cursors intact, no false completeness.
+- Permissions/multi-process: 0644 journal fails closed; second opener blocked by lock; lock released on close.
+- Failed jobs never block Pi: `tick()` never throws, including non-Error sender faults AND persist faults while recording retry/quarantine state.
+
+### Blockers / follow-ups
+
+- No blockers. Follow-ups: T08+ feature code (observation/backup/board) must enqueue through this outbox with redacted payloads and a deterministic idempotency key — the T05 review's pass-discriminator note still applies to provenance-only keys across repeated extraction passes; `kiwi_changes` reconciliation is wired against a fake page provider here — T19 extends it to the live feed; T09 extraction jobs persist opId/source entries here before the model call; a timer/interval driving periodic `tick()` and post-resume delivery lands with T08 hook wiring (the worker currently ticks on demand and on gate resume) and must also schedule `runRetention()`, which is pull-only — capacity is freed only when it is called. A permission check for a pre-existing over-permissive `cursors.json` / outbox directory (currently only the journal file is checked) remains open.
+- `config/kiwifs-test.local.json` was never opened, printed or staged. No live-service contact, no REST fallback, no pushes, tags or deployments.
