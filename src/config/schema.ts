@@ -84,8 +84,23 @@ export interface MemoryConfig {
    * session); delivery is HELD visibly when unset. `recipient` is an optional
    * client-side routing filter: messages whose `to` differs are skipped as
    * unauthorized (labels, not confidentiality — architecture.md §8).
+   *
+   * T18: delivery cadence/bounds are user-configurable (pollMs, backoffMs,
+   * backlogPauseAt). Each is bounded — out-of-bound values are validation
+   * errors (fail closed), never silently clamped. Pending work is NEVER
+   * dropped regardless of the bounds: a high backlogPauseAt only widens the
+   * visible pause threshold; the backlog itself always survives.
    */
-  board?: { consumerId: string; recipient?: string };
+  board?: {
+    consumerId: string;
+    recipient?: string;
+    /** Active poll interval in ms. Bound: 5_000..3_600_000. */
+    pollMs?: number;
+    /** Backoff base in ms (doubles per empty poll, capped at 15 min). */
+    backoffMs?: number;
+    /** Unread backlog at which polling visibly pauses (nothing is dropped). */
+    backlogPauseAt?: number;
+  };
 }
 
 export const DEFAULT_CONFIG: MemoryConfig = {
@@ -553,12 +568,61 @@ export function validateConfig(raw: unknown): ValidationResult {
     if (!isPlainObject(rawBoard)) {
       issues.push({ path: "board", message: "board must be an object" });
     } else {
+      const BOARD_KEYS = [
+        "consumerId",
+        "recipient",
+        "pollMs",
+        "backoffMs",
+        "backlogPauseAt",
+      ];
       for (const key of Object.keys(rawBoard)) {
-        if (key !== "consumerId" && key !== "recipient") {
+        if (!BOARD_KEYS.includes(key)) {
           issues.push({
             path: `board.${key}`,
             message: "unknown board key",
           });
+        }
+      }
+      // T18: bounded delivery cadence knobs. Bounded means a value outside
+      // the range is a validation ERROR (fail closed), never a silent clamp.
+      const boundInt = (
+        key: "pollMs" | "backoffMs",
+        min: number,
+        max: number,
+      ): number | undefined => {
+        const v = rawBoard[key];
+        if (v === undefined) return undefined;
+        if (
+          typeof v !== "number" ||
+          !Number.isInteger(v) ||
+          v < min ||
+          v > max
+        ) {
+          issues.push({
+            path: `board.${key}`,
+            message: `must be an integer between ${min} and ${max} ms`,
+          });
+          return undefined;
+        }
+        return v;
+      };
+      const pollMs = boundInt("pollMs", 5_000, 3_600_000);
+      const backoffMs = boundInt("backoffMs", 5_000, 3_600_000);
+      const rawBacklog = rawBoard["backlogPauseAt"];
+      let backlogPauseAt: number | undefined;
+      if (rawBacklog !== undefined) {
+        if (
+          typeof rawBacklog !== "number" ||
+          !Number.isInteger(rawBacklog) ||
+          rawBacklog < 1 ||
+          rawBacklog > 10_000
+        ) {
+          issues.push({
+            path: "board.backlogPauseAt",
+            message: "must be an integer between 1 and 10000",
+          });
+        } else {
+          backlogPauseAt = rawBacklog;
         }
       }
       const consumerId = rawBoard["consumerId"];
@@ -593,6 +657,9 @@ export function validateConfig(raw: unknown): ValidationResult {
           ...(typeof recipient === "string" && recipient !== ""
             ? { recipient }
             : {}),
+          ...(pollMs !== undefined ? { pollMs } : {}),
+          ...(backoffMs !== undefined ? { backoffMs } : {}),
+          ...(backlogPauseAt !== undefined ? { backlogPauseAt } : {}),
         };
       }
     }

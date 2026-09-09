@@ -128,6 +128,11 @@ export class DeliveryStateFile {
     return this.state;
   }
 
+  /** Directory holding this state file (consumer lock lives here too). */
+  get dir(): string {
+    return dirname(this.file);
+  }
+
   get lastSeq(): string | undefined {
     return this.state.lastSeq;
   }
@@ -173,6 +178,29 @@ export class DeliveryStateFile {
     e.ackedAt = now;
     this.save();
     return true;
+  }
+
+  /**
+   * Explicit LOCAL-ONLY GC (T18, /kiwifs-board-gc): prunes acknowledged AND
+   * skipped entries past the ack retention window. Undelivered entries are
+   * NEVER touched (they are the backlog). No backend reference exists on
+   * this class — the no-remote-mutation property is structural.
+   * Returns the number of removed entries.
+   */
+  gc(): number {
+    const now = Date.now();
+    const entries = this.state.entries;
+    let removed = 0;
+    for (const [id, e] of Object.entries(entries)) {
+      const settledAt = e.ackedAt ?? e.skippedAt;
+      if (settledAt === undefined) continue; // undelivered — never touched
+      if (now - settledAt > ACK_RETENTION_MS) {
+        delete entries[id];
+        removed++;
+      }
+    }
+    if (removed > 0) this.save();
+    return removed;
   }
 
   /**

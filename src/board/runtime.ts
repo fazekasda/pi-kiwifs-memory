@@ -22,14 +22,20 @@
  * - Ack is LOCAL STATE ONLY (the state file holds no backend reference);
  *   `kiwifs_board_ack` is the explicit user/agent acknowledgment surface.
  *
- * Single-instance assumption (documented): one state file is written by one
- * process at a time. Concurrent sessions sharing the SAME `consumerId` would
- * last-write-wins over each other's durable entries (distinct consumer ids
- * are fully independent and are what T17 requires). Run one session per
- * consumer id; a lock-file guard is a possible later hardening.
+ * Shared-consumer safety (T18, closing the T17 follow-up): a pid lock file
+ * (`delivery-<consumerId>.lock`) is acquired before any poller starts. A
+ * second live session reusing the SAME consumerId is REFUSED VISIBLY
+ * (`holdReason` names the holder pid) — it never silently shares or
+ * overwrites durable cursor state. Distinct consumer ids remain fully
+ * independent.
  */
 
 import type { BoardRepository } from "./repository.ts";
+import {
+  acquireConsumerLock,
+  ConsumerLockError,
+  type ConsumerLock,
+} from "./lock.ts";
 import {
   BoardDelivery,
   DeliveryStateFile,
@@ -57,6 +63,8 @@ export interface BoardDeliveryRuntimeOptions {
   pollMs?: number;
   /** Backoff base override (tests); default 60 s. */
   backoffMs?: number;
+  /** Unread backlog pause threshold override; default 500. */
+  backlogPauseAt?: number;
 }
 
 export interface InboxEntry {
@@ -82,9 +90,13 @@ export class BoardDeliveryRuntime {
   private readonly nowFn: () => number;
   private readonly pollMs: number | undefined;
   private readonly backoffMs: number | undefined;
+  private readonly backlogPauseAt: number | undefined;
   private delivery: BoardDelivery | undefined;
   private readonly buffer: InboxEntry[] = [];
   private lastError: string | undefined;
+  /** Held visibly when the consumer lock is refused (shared consumerId). */
+  private lockHoldReason: string | undefined;
+  private lock: ConsumerLock | undefined;
 
   constructor(opts: BoardDeliveryRuntimeOptions) {
     this.state = new DeliveryStateFile(opts.stateDir, opts.consumerId);
@@ -95,6 +107,12 @@ export class BoardDeliveryRuntime {
     this.nowFn = opts.now ?? (() => Date.now());
     this.pollMs = opts.pollMs;
     this.backoffMs = opts.backoffMs;
+    this.backlogPauseAt = opts.backlogPauseAt;
+  }
+
+  /** Visible hold reason (shared consumerId refusal, lock trouble), if any. */
+  get holdReason(): string | undefined {
+    return this.lockHoldReason;
   }
 
   /** Consumer id this runtime delivers as (status/inbox disclosure). */
@@ -124,6 +142,26 @@ export class BoardDeliveryRuntime {
   /** Start (or restart after stop) the bounded poller. */
   start(): void {
     this.stop();
+    // T18 shared-consumer guard: acquire the exclusive consumer lock BEFORE
+    // any read happens. A second live session on the same consumerId is
+    // refused visibly — durable cursor state is never co-written.
+    if (this.lock === undefined) {
+      try {
+        this.lock = acquireConsumerLock(
+          this.state.dir,
+          this.consumerId,
+          this.nowFn(),
+        );
+        this.lockHoldReason = undefined;
+      } catch (err) {
+        if (err instanceof ConsumerLockError) {
+          this.lockHoldReason = err.message;
+          this.lastError = err.name;
+          return; // HELD — never share the consumer
+        }
+        throw err;
+      }
+    }
     // Live gate: BoardDelivery reads `.isPrivate` per cycle, so the getter
     // re-evaluates the config each time (fail closed → private → zero reads).
     const runtime = this;
@@ -144,6 +182,9 @@ export class BoardDeliveryRuntime {
       ...(this.backoffMs !== undefined
         ? { backoffBaseMs: this.backoffMs }
         : {}),
+      ...(this.backlogPauseAt !== undefined
+        ? { backlogPauseAt: this.backlogPauseAt }
+        : {}),
     });
     this.delivery.start();
   }
@@ -157,6 +198,10 @@ export class BoardDeliveryRuntime {
   stop(): void {
     this.delivery?.stop();
     this.delivery = undefined;
+    // Release the consumer lock so another session can take over only after
+    // THIS runtime is fully torn down (never while it could still write).
+    this.lock?.release();
+    this.lock = undefined;
   }
 
   /** Explicit LOCAL-ONLY acknowledgment (no remote mutation, ever). */
@@ -224,7 +269,10 @@ export class BoardDeliveryRuntime {
    * ids/counters/error fingerprints only — never message content, never
    * credentials.
    */
-  statusSnapshot(): DeliveryStatus & { consumerId: string } {
+  statusSnapshot(): DeliveryStatus & {
+    consumerId: string;
+    holdReason?: string;
+  } {
     if (this.delivery)
       return { ...this.delivery.statusSnapshot(), consumerId: this.consumerId };
     return {
@@ -232,6 +280,9 @@ export class BoardDeliveryRuntime {
       runState: "idle",
       unread: this.state.unreadCount(),
       consecutiveEmptyPolls: 0,
+      ...(this.lockHoldReason !== undefined
+        ? { holdReason: this.lockHoldReason }
+        : {}),
       ...(this.lastError !== undefined ? { lastError: this.lastError } : {}),
     };
   }

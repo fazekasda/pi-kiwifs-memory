@@ -83,7 +83,10 @@ try {
             send({ id: "status", type: "prompt", message: "/kiwifs-status" });
           }
           if (msg.type === "extension_ui_request" && msg.method === "notify") {
-            assert.match(msg.message, /not implemented yet/);
+            assert.match(
+              msg.message,
+              /state: (disabled|private|degraded|healthy)/,
+            );
             assert.equal(msg.notifyType, "info");
             notified = true;
           }

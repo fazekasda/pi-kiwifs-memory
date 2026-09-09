@@ -426,11 +426,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Status distinguishes healthy, degraded, disabled and private states plus queue/model/search capability state (including hybrid degradation attribution and vector-index availability; keyword-only hits are never reported as healthy semantic retrieval).
-- [ ] Forget immediately removes eligible records from subsequent retrieval (FTS exclusion + B3 guard pipeline) and cached evidence; the tombstone cache refresh (on forget, reconnect, bounded TTL) and its advisory-only role match `docs/architecture.md` §13 row 7.
-- [ ] Undo follows recorded tombstone/history policy (`kiwi_forget` is reversible; body preserved per `memory_tools.go:108–153`).
-- [ ] Permanent-erasure UX discloses all known retained copies and never claims unsupported purge guarantees (B6).
-- [ ] TUI checks pass; RPC/headless commands do not crash or emit terminal-only UI.
+- [x] Status distinguishes healthy, degraded, disabled and private states plus queue/model/search capability state (including hybrid degradation attribution and vector-index availability; keyword-only hits are never reported as healthy semantic retrieval). _T18: `computeOverallState` precedence disabled > private > degraded > healthy; retrieval/tokenizer degradation notes are structured probes (no keyword matching), capture-paused (coverage gap) degrades; scope-hold notes degrade only when a consuming feature is enabled; `/kiwifs-status` carries the sanitized queue summary._
+- [x] Forget immediately removes eligible records from subsequent retrieval (FTS exclusion + B3 guard pipeline) and cached evidence; the tombstone cache refresh (on forget, reconnect, bounded TTL) and its advisory-only role match `docs/architecture.md` §13 row 7. _T18: `/kiwifs-forget` refreshes the tombstone cache and drops pending evidence packs; the read-back remains the gate (advisory cache)._
+- [x] Undo follows recorded tombstone/history policy (`kiwi_forget` is reversible; body preserved per `memory_tools.go:108–153`). _T18: `/kiwifs-forget-undo` is a verified read→write status flip with byte-identical read-back verification; strict pre-state (`superseded`); opId fsync-persisted before the side effect._
+- [x] Permanent-erasure UX discloses all known retained copies and never claims unsupported purge guarantees (B6). _T18: `/kiwifs-erasure-report` is disclosure-only (zero I/O), lists all retention sites, claims no purge._
+- [x] TUI checks pass; RPC/headless commands do not crash or emit terminal-only UI. _T18: synthetic ctx-level confirm true/false paths for every command; headless no-UI access verified per command; record-mutating headless commands require explicit `--yes`. Limit: interactive TUI confirm-dialog rendering not exercised live (no display in the environment) — reported, not fabricated._
 
 ### T19 — Run integrated fault, privacy and quality evaluation
 

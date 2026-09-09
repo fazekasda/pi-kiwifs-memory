@@ -36,8 +36,21 @@ function loadCommand(): { status: Command; verify: Command } {
   // Registration must be synchronous and side-effect free; session handlers
   // (T08) are registered by event name only.
   kiwifsMemory(api as unknown as ExtensionAPI);
+  // T18 chunk 2: full command surface.
   assert.deepEqual(
-    ["kiwifs-backup-verify", "kiwifs-status"],
+    [
+      "kiwifs-backup-verify",
+      "kiwifs-board-gc",
+      "kiwifs-erasure-report",
+      "kiwifs-extract-now",
+      "kiwifs-forget",
+      "kiwifs-forget-undo",
+      "kiwifs-private-mode",
+      "kiwifs-proposal",
+      "kiwifs-queue",
+      "kiwifs-reflect-now",
+      "kiwifs-status",
+    ],
     [...commands.keys()].sort(),
   );
   // T13/T16/T17: recall tools, board tools, delivery inbox + local ack.
@@ -170,7 +183,8 @@ test("reports scaffold status without claiming memory works", async () => {
   const [text, level] = notifications[0] as [string, string];
   assert.equal(level, "info");
   assert.ok(text.startsWith(STATUS_MESSAGE));
-  assert.match(text, /not implemented yet/);
+  assert.match(text, /enabled: false/);
+  assert.match(text, /state: disabled/);
 });
 
 test("status output resolves nonsecret config and stays secret-free", () => {
@@ -180,7 +194,6 @@ test("status output resolves nonsecret config and stays secret-free", () => {
   assert.match(text, /credentials: none/);
   assert.match(text, /cross-project reads denied by default/);
   assert.doesNotMatch(text, /Bearer\s+[A-Za-z0-9._-]{16,}/);
-  assert.match(STATUS_MESSAGE, /not implemented yet/);
 });
 
 test("does not access UI in headless mode", async () => {

@@ -1527,3 +1527,158 @@ but the no-op guarantee requires persisting `created`).
   `lastError` fingerprint can drop from the runtime status snapshot; ack
   state thresholds are still the chunk-1 defaults until T18 owns user
   controls; server-side sort remains live-unverified.
+
+## T18 chunk 1 — runtime/config/identity + shared-consumer safety
+
+Scope (per task label): runtime/config/identity changes, shared-consumer
+safety, command-facing interfaces. No command/UI wiring (chunk 2), no commit.
+
+1. `src/scope/discovery.ts` — runtime project-identity discovery: bounded
+   `git remote -v` (5 s timeout, test seam `run`), fetch-URL parsing, reuse of
+   the T03 normalization/fail-closed policy. Zero remotes / conflicting
+   identities / unparseable URLs / git-unavailable all fail CLOSED with a
+   sanitized detail (raw URLs never leave the module; userinfo redacted in
+   error paths). Closes the long-standing "git-remote discovery lands in T18"
+   follow-up.
+2. `src/index.ts` — `resolveRecordScope(config, cwd)` now: explicit
+   `projectIdentity` override wins; else discovery (`project/host/owner/repo`).
+   Unresolved scope still holds observation/backup entirely with a visible
+   reason (`observerError`). Backup-verify command uses the same resolution.
+   Status text updated (no longer promises future discovery).
+3. LIVE private-mode gates (user controls actually reconfigure the runtime):
+   retrieval coordinator and backup capture previously read a STALE config
+   snapshot for `privateMode` — a user flip would not have stopped them.
+   Both now re-read config per boundary, fail closed (invalid config →
+   private → zero reads/writes). Board delivery already did (T17 chunk 2).
+4. `src/board/lock.ts` + `runtime.ts` — SHARED-CONSUMER SAFETY (T17
+   follow-up, now enforced not documented): `delivery-<consumerId>.lock`
+   pid-file acquired with O_EXCL before any poller starts. A second live
+   acquirer (including a second runtime in the SAME process — pid==self is
+   NOT stale, fail closed) is refused with a visible reason naming the
+   holder pid and the fix (distinct consumerId). Stale locks (dead pid /
+   unreadable / >12 h) are reclaimed via unlink+retry; the O_EXCL create is
+   the single serialization point. Release on `stop()`; crash leftovers are
+   reclaimed by liveness check. `BoardDeliveryRuntime.start()` now holds
+   visibly (`holdReason`, surfaced via `statusSnapshot().holdReason` and
+   `/kiwifs-status` board note) and never shares durable cursor state.
+5. `src/config/schema.ts` — configurable delivery bounds (T18): `board.pollMs`
+   (5_000–3_600_000), `board.backoffMs` (5_000–3_600_000),
+   `board.backlogPauseAt` (1–10_000). Out-of-range/unknown keys are
+   validation ERRORS (fail closed, never clamped). Plumbing:
+   `BoardDeliveryRuntime` → `BoardDelivery` (activePollMs/backoffBaseMs/
+   backlogPauseAt). Backlog pause still never drops pending work.
+6. `src/runtime/controls.ts` + `buildRuntimeControlSurface` (index.ts) —
+   command-facing interfaces for chunk 2: `setPrivateMode(value)` persists a
+   validated, atomic (temp+rename, 0o600) config edit preserving all other
+   keys verbatim (secrets stay by reference; edited file validated BEFORE
+   rename; failures leave the original untouched and say "NOT changed"), and
+   takes effect live via the per-boundary gates above (no restart).
+   `cancelPendingRetrieval()` bumps the retrieval generation so in-flight
+   evidence packs are dropped at settle — stale results cannot cross a mode
+   flip. Chunk 2 wires Pi commands to this surface.
+
+Tests: `test/discovery.test.ts` (6), `test/board-lock.test.ts` (5),
+`test/runtime-controls.test.ts` (6) — synthetic only (fixtures for
+`git remote -v`; no live services, no MCP, no model calls).
+
+Gates after final changes: `npm run check` (typecheck + format + 404 tests)
+PASS; `npm run pack:check` PASS (packed extension loads in Pi RPC);
+`devenv test` PASS.
+
+No commit (per instructions). Files changed: `src/scope/discovery.ts` (new),
+`src/board/lock.ts` (new), `src/runtime/controls.ts` (new),
+`src/board/runtime.ts`, `src/board/delivery.ts`, `src/config/schema.ts`,
+`src/index.ts`; tests `test/discovery.test.ts`, `test/board-lock.test.ts`,
+`test/runtime-controls.test.ts` (new).
+
+Limits / remaining for chunk 2 + reviewer:
+
+- Command/UI wiring (/kiwifs-status extension, private-mode toggle, manual
+  extract/reflect/approve/reject/undo, /kiwifs-board-gc with explicit
+  confirmation) is chunk 2; the control surface exists but no command calls
+  it yet.
+- TUI acceptance for T18's status/commands not yet exercised (chunk 2);
+  nothing fabricated here.
+- Forget/tombstone UX and permanent-erasure disclosure (B6) are chunk 2;
+  retrieval-side tombstone pipeline (B3) exists from T12/T13.
+- Lock stale-reclaim uses pid liveness + a 12 h age bound; an NFS-shared
+  state dir where pid namespaces differ could misjudge liveness (fail closed
+  direction: refusal, not co-writing). State dir is project-local today.
+- Model route default remains exactly openrouter/z-ai/glm-5.3-flash, no
+  fallback anywhere (unchanged).
+
+## T18 chunk 2 — command/inspection/forget wiring (this entry)
+
+Implemented (synthetic tests only, no live services, no model calls, no
+network; nothing committed):
+
+- Commands registered (all headless/RPC safe — UI access only under
+  `ctx.hasUI`): `/kiwifs-private-mode on|off|status` (wired to the chunk-1
+  control surface: persist-first, then cancelPendingRetrieval generation
+  bump; no config file in effect fails closed), `/kiwifs-extract-now`,
+  `/kiwifs-reflect-now`, `/kiwifs-proposal <approve|reject|undo> <path>
+[reason…]`, `/kiwifs-forget <path> [reason…]` (UI confirm; reversible
+  logical forget; tombstone cache refresh + cached evidence-pack drop),
+  `/kiwifs-forget-undo <path>` (verified read→write restore, byte-identical
+  read-back verification), `/kiwifs-board-gc` (explicit confirm or `--yes`
+  in headless; LOCAL-ONLY; undelivered entries never touched),
+  `/kiwifs-queue` (stats + quarantined fingerprints: seq/kind/attempts/
+  name:code only), `/kiwifs-erasure-report` (B6 disclosure-only, zero I/O).
+- `/kiwifs-status` extended: overall `state:` line (disabled > private >
+  degraded > healthy; keyword-only retrieval degradation keeps the state
+  degraded — never healthy semantic) + sanitized outbox queue summary.
+- Shared runtime box: `registerSessionHandlers` now returns the runtime box
+  so command handlers share the same lazily-built runtime as event handlers
+  (no duplicate outbox/state owners).
+- New module `src/commands/manual-ops.ts`: durable manual op log
+  (`manual-oplog.jsonl`, fsync-before-side-effect, corrupt history fails
+  closed), forget/forget-undo flows, manual backend factory (opId ledger
+  fail-closed), B6 erasure disclosure lines.
+- `DeliveryStateFile.gc()`: prunes acked/skipped past the 14 d retention;
+  undelivered entries are structurally untouched (no backend reference).
+
+Evidence: `npm run check` PASS (typecheck + format + 426 tests, including 22
+new in `test/t18-commands.test.ts`); `npm run pack:check` PASS; `devenv test`
+PASS. Missing gates: interactive TUI flows (confirm dialog rendering) not
+exercised here — synthetic ctx-level tests cover confirm=true/false paths;
+RPC/headless no-UI-access is covered for every command. No commit (staged
+only, per instructions).
+
+## T18 final — review fixes, gates and commit (this entry)
+
+Independent review of chunk 1+2 approved with four minor fixes; all four
+implemented here before commit:
+
+1. Headless `/kiwifs-forget` now requires the explicit `--yes` token (parity
+   with `/kiwifs-board-gc`); without it the command refuses before any record
+   mutation (test: oplog file is never created without `--yes`).
+2. Capture-paused (coverage gap) now feeds `computeOverallState` via a
+   structured probe — the overall state can no longer read `healthy` while
+   capture is paused.
+3. Tokenizer degradation attribution is a structured boolean flag on the
+   runtime (not a keyword match on the note wording); wording drift cannot
+   silently flip the overall state.
+4. Unresolved record scope uses a feature-neutral `records: DISABLED — …`
+   status label and only degrades the overall state when observation or
+   backup is enabled (misattribution fix; the reason stays visible even when
+   both features are off).
+
+Tests added in `test/t18-commands.test.ts` (429 total, up from 426): headless
+`--yes` refusal, structured-probe degradation, feature-gated scope note.
+
+Gates after the final edits: `npm run check` PASS (typecheck + format +
+429 tests), `npm run pack:check` PASS, `devenv test` PASS.
+
+Gate limit (honest): interactive TUI confirm-dialog rendering was not
+exercised live (no display in the build environment); confirm true/false
+paths are covered synthetically and headless no-UI access per command is
+tested. This is reported as a limitation, not passed off as a live TUI run.
+
+Staged files (explicit list, secret-scanned — matches are synthetic fixture
+tokens/comments only): `docs/memory-lifecycle.md`, `scripts/smoke-package.mjs`,
+`src/board/delivery.ts`, `src/board/lock.ts`, `src/board/runtime.ts`,
+`src/commands/manual-ops.ts`, `src/config/schema.ts`, `src/index.ts`,
+`src/runtime/controls.ts`, `src/scope/discovery.ts`,
+`test/discovery.test.ts`, `test/board-lock.test.ts`,
+`test/runtime-controls.test.ts`, `test/t18-commands.test.ts`,
+`tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`.

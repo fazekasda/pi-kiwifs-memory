@@ -106,3 +106,39 @@ scheduler's `onAcceptedObservations` hook (after durable outbox acceptance
 only). The proposal lifecycle is available per-session with its own backend
 instance and op log; command wiring (approve/reject/undo surfaces) lands in
 T18.
+
+## Forgetting and erasure (PRD T18, B6)
+
+**Forget is reversible by design.** `/kiwifs-forget <path> [reason…]` marks a
+record superseded (`memory_status: superseded`, body PRESERVED) through the
+backend's `kiwi_forget`. It deletes nothing. After a successful forget the
+extension refreshes the advisory tombstone cache and drops cached pending
+evidence packs so forgotten content is not re-served from memory; the B3
+read-back guard remains the hard gate regardless. The forget opId is durably
+recorded in the local manual op log (`manual-oplog.jsonl`, fsync) BEFORE the
+side effect.
+
+`/kiwifs-forget-undo <path>` restores a forgotten record to
+`memory_status: active` (verified read → status flip with a provenance line →
+write → byte-identical read-back verification). A mismatch fails visibly.
+
+**Permanent erasure is not supported by this extension (B6, disclosure
+only).** No remote-delete capability exists anywhere in the codebase.
+`/kiwifs-erasure-report` lists where record content is retained (backend
+record bodies incl. superseded records, transcript backups, merge-proposal
+records, the backend's vector/search index, git history if the storage is
+git-backed or mirrored, and LOCAL durable state: already-redacted outbox
+payloads, board delivery state files, op logs) and states that a true
+erasure requires an operator procedure against the backend storage directly.
+The report performs no I/O and deletes nothing.
+
+**Board delivery GC** (`/kiwifs-board-gc`, explicit confirm required — UI
+dialog or literal `--yes` in headless/RPC) prunes acknowledged and skipped
+entries older than 14 days from the LOCAL per-consumer delivery state file.
+Undelivered entries are never touched. The class holds no backend reference,
+so the no-remote-mutation property is structural.
+
+**Private mode** (`/kiwifs-private-mode on|off|status`) persists a validated,
+atomic config edit FIRST, then cancels pending retrieval (generation bump) so
+no in-flight evidence pack survives the flip; live gates re-read the config at
+every cycle boundary — no restart needed.

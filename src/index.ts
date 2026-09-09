@@ -1,6 +1,7 @@
 import { join, dirname } from "node:path";
 import type {
   ExtensionAPI,
+  ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config/loader.ts";
@@ -44,6 +45,11 @@ import {
   type BoardToolsDeps,
 } from "./board/tools.ts";
 import { BoardDeliveryRuntime } from "./board/runtime.ts";
+import { discoverProjectIdentity } from "./scope/discovery.ts";
+import {
+  setPrivateModeInFile,
+  type RuntimeControlSurface,
+} from "./runtime/controls.ts";
 import { createRedactor } from "./privacy/redaction.ts";
 import { QueryMetaTombstoneCache } from "./backend/guard.ts";
 import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
@@ -56,9 +62,17 @@ import {
   ObserverScheduler,
   toSourceViews,
 } from "./observation/scheduler.ts";
+import { StaleProposalError } from "./observation/proposals.ts";
+import {
+  ManualOpLog,
+  createManualOps,
+  erasureReportLines,
+  errorName,
+  forgetMemoryPath,
+  unforgetMemoryPath,
+} from "./commands/manual-ops.ts";
 
-export const STATUS_MESSAGE =
-  "KiwiFS memory extension loaded. Memory storage is not implemented yet.";
+export const STATUS_MESSAGE = "KiwiFS memory extension loaded.";
 
 /** Last coordinator/observer init error, surfaced via status (fail-visible). */
 let lastCoordinatorError: (() => string | undefined) | undefined;
@@ -67,10 +81,18 @@ let lastObserverError: (() => string | undefined) | undefined;
 let lastRetrievalNote: (() => string | undefined) | undefined;
 /** Last tokenizer load/attach note, surfaced via status (fail-visible, T13). */
 let lastTokenizerNote: (() => string | undefined) | undefined;
+/** Structured tokenizer degradation flag (T18 review fix: no keyword match). */
+let lastTokenizerDegraded: (() => boolean) | undefined;
+/** Structured outbox capture-paused flag (T18 review fix: coverage gap = degraded). */
+let lastCapturePaused: (() => boolean) | undefined;
 /** Last backup capture error/note, surfaced via status (fail-visible, T14). */
 let lastBackupNote: (() => string | undefined) | undefined;
 /** Last board delivery note/status, surfaced via status (fail-visible, T17). */
 let lastBoardNote: (() => string | undefined) | undefined;
+/** Outbox queue summary, surfaced via status (fail-visible, T18). */
+let lastQueueNote: (() => string | undefined) | undefined;
+/** Quarantined-job count probe for the overall state line (T18). */
+let lastQueueQuarantined: (() => number) | undefined;
 
 /** Test/inspection hook for the coordinator error probe. */
 export function setCoordinatorErrorProbe(
@@ -100,6 +122,20 @@ export function setTokenizerNoteProbe(
   lastTokenizerNote = probe;
 }
 
+/** Test/inspection hook for the structured tokenizer degradation flag (T18). */
+export function setTokenizerDegradedProbe(
+  probe: (() => boolean) | undefined,
+): void {
+  lastTokenizerDegraded = probe;
+}
+
+/** Test/inspection hook for the structured capture-paused flag (T18). */
+export function setCapturePausedProbe(
+  probe: (() => boolean) | undefined,
+): void {
+  lastCapturePaused = probe;
+}
+
 /** Test/inspection hook for the backup note probe (T14). */
 export function setBackupNoteProbe(
   probe: (() => string | undefined) | undefined,
@@ -112,6 +148,49 @@ export function setBoardNoteProbe(
   probe: (() => string | undefined) | undefined,
 ): void {
   lastBoardNote = probe;
+}
+
+/** Test/inspection hook for the queue summary probe (T18). */
+export function setQueueNoteProbe(
+  probe: (() => string | undefined) | undefined,
+): void {
+  lastQueueNote = probe;
+}
+
+/** Test/inspection hook for the quarantined-count probe (T18). */
+export function setQueueQuarantinedProbe(
+  probe: (() => number) | undefined,
+): void {
+  lastQueueQuarantined = probe;
+}
+
+function queueQuarantinedCount(): number {
+  return lastQueueQuarantined?.() ?? 0;
+}
+
+/**
+ * T18: overall extension state derived from config + sanitized degradation
+ * notes. Precedence: disabled > private > degraded > healthy. Keyword-only
+ * retrieval degradation is a degraded note — keyword-only hits are NEVER
+ * reported as healthy semantic retrieval.
+ */
+export function computeOverallState(deps: {
+  configOk: boolean;
+  enabled: boolean;
+  privateMode: boolean;
+  /** Sanitized hold/degradation notes (coordinator/observer/retrieval/…). */
+  degradedNotes: string[];
+  quarantined: number;
+}): "disabled" | "private" | "degraded" | "healthy" {
+  if (!deps.configOk || !deps.enabled) return "disabled";
+  if (deps.privateMode) return "private";
+  if (
+    deps.quarantined > 0 ||
+    deps.degradedNotes.some((n) => n !== undefined && n !== "")
+  ) {
+    return "degraded";
+  }
+  return "healthy";
 }
 
 /**
@@ -140,7 +219,10 @@ export function resolveStatusText(): string {
   const coordErr = lastCoordinatorError?.();
   if (coordErr) text += `\nsession coordinator: DISABLED — ${coordErr}`;
   const obsErr = lastObserverError?.();
-  if (obsErr) text += `\nobserver: DISABLED — ${obsErr}`;
+  // T18 review fix: feature-neutral label — the same unresolved-scope reason
+  // may hold observation, backup, or both, and it is shown even when both
+  // features are off (visibility), but only degrades when a consumer runs.
+  if (obsErr) text += `\nrecords: DISABLED — ${obsErr}`;
   const retrievalNote = lastRetrievalNote?.();
   if (retrievalNote) text += `\nretrieval: degraded — ${retrievalNote}`;
   const tokenizerNote = lastTokenizerNote?.();
@@ -149,15 +231,44 @@ export function resolveStatusText(): string {
   if (backupNote) text += `\nbackup: ${backupNote}`;
   const boardNote = lastBoardNote?.();
   if (boardNote) text += `\nboard delivery: ${boardNote}`;
+  const queueNote = lastQueueNote?.();
+  if (queueNote) text += `\n${queueNote}`;
+  // T18: overall state line — healthy / degraded / disabled / private.
+  const features = effectiveFeatures(result.config);
+  // Search-capability attribution: any retrieval degradation note (e.g. a
+  // hybrid run that fell back to keyword-only) keeps the state DEGRADED;
+  // keyword-only results are never presented as healthy semantic search.
+  const state = computeOverallState({
+    configOk: true,
+    enabled: result.config.enabled,
+    privateMode: result.config.privateMode,
+    degradedNotes: [
+      coordErr,
+      // T18 review fix: scope/hold errors only degrade when a consuming
+      // feature is enabled (misattribution fix — the reason may be real for
+      // backup alone; the label is feature-neutral).
+      ...(features.observation || features.backup ? [obsErr] : []),
+      retrievalNote,
+      // T18 review fix: structured flag, never a keyword match on the note.
+      lastTokenizerDegraded?.() === true ? tokenizerNote : undefined,
+      backupNote,
+      boardNote?.startsWith("HELD") ? boardNote : undefined,
+      // T18 review fix: a paused capture (coverage gap) is degraded.
+      lastCapturePaused?.() === true
+        ? "capture paused (coverage gap)"
+        : undefined,
+    ].filter((n): n is string => n !== undefined),
+    quarantined: result.config.enabled ? queueQuarantinedCount() : 0,
+  });
+  text = `${text}\nstate: ${state}`;
   if (result.ok && result.config.enabled) {
-    const features = effectiveFeatures(result.config);
     if (features.observation && !result.config.model.auth) {
       text +=
         "\nobserver: extraction fails closed — model.auth is not configured (no model calls)";
     }
     if (features.observation && result.config.projectIdentity === undefined) {
       text +=
-        "\nobserver: DISABLED — record scope not yet resolved (projectIdentity unset; git-remote discovery lands in T18)";
+        "\nobserver: record scope resolves via git-remote discovery (explicit projectIdentity unset)";
     }
     if (
       result.config.enabled &&
@@ -185,19 +296,39 @@ export function resolveStateDir(cwd: string): string {
 }
 
 /**
- * Record scope for observation storage (T10). Uses the explicit
- * `projectIdentity` override when configured; otherwise the scope is not
- * yet resolved — real `git remote -v` discovery is the documented T18
- * convention. An unresolved scope is NOT a writable owner scope: rather
- * than extracting observations into jobs that can only be permanently
- * quarantined at send time (guaranteed data loss), observation is held
- * entirely until the scope resolves, and any queued job is held as a
- * retryable availability gap by the sender.
+ * Record scope for observation storage (T10, discovery closed in T18).
+ * Precedence: explicit `projectIdentity` override wins; otherwise the
+ * project identity is discovered at runtime from `git remote -v` in `cwd`
+ * (host[/owner]/repo, fail closed on zero/conflicting/unparseable remotes —
+ * exactly the T03 policy, now actually consumed). An unresolved scope is
+ * NOT a writable owner scope: observation/backup stay held with a visible
+ * reason rather than minting jobs that could only be quarantined.
  */
-function resolveRecordScope(config: MemoryConfig): string | undefined {
-  if (config.projectIdentity)
-    return `project/${config.projectIdentity.toLowerCase()}`;
-  return undefined;
+function resolveRecordScope(
+  config: MemoryConfig,
+  cwd: string,
+):
+  | { ok: true; scope: string; source: "override" | "git-remote" }
+  | { ok: false; reason: string } {
+  if (config.projectIdentity) {
+    return {
+      ok: true,
+      scope: `project/${config.projectIdentity.toLowerCase()}`,
+      source: "override",
+    };
+  }
+  const discovered = discoverProjectIdentity({ cwd });
+  if (!discovered.ok) {
+    return {
+      ok: false,
+      reason: `record scope not resolved: ${discovered.detail}`,
+    };
+  }
+  return {
+    ok: true,
+    scope: `project/${discovered.projectId}`,
+    source: discovered.source,
+  };
 }
 
 /**
@@ -244,6 +375,8 @@ interface SessionRuntime {
   tombstoneCache: QueryMetaTombstoneCache | undefined;
   /** T13: tokenizer attach/load note (sanitized, status-only). */
   tokenizerNote: string | undefined;
+  /** Structured degradation flag for the tokenizer note (T18 review fix). */
+  tokenizerDegraded: boolean;
   /** T14: incremental transcript backup capture (may be undefined). */
   backup: BackupCapture | undefined;
   backupHeldReason: string | undefined;
@@ -272,11 +405,15 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
         ? err.message
         : `outbox init failed: ${(err as Error).name}`;
   }
-  // T10: real observation sender. When MCP is unconfigured, the credential
-  // does not resolve, or the record scope is not yet resolved, the sender
-  // throws the retryable SenderNotWiredError (jobs stay pending with
-  // backoff — never dropped, never quarantined).
-  const scope = config ? resolveRecordScope(config) : undefined;
+  // T10 + T18: real observation sender. When MCP is unconfigured, the
+  // credential does not resolve, or the record scope is not resolved
+  // (no override and git-remote discovery failed closed), the sender throws
+  // the retryable SenderNotWiredError (jobs stay pending with backoff —
+  // never dropped, never quarantined).
+  const scopeResolution = config ? resolveRecordScope(config, cwd) : undefined;
+  const scope = scopeResolution?.ok ? scopeResolution.scope : undefined;
+  if (scopeResolution && !scopeResolution.ok)
+    observerError = scopeResolution.reason;
   const worker = store
     ? new OutboxWorker({
         store,
@@ -483,7 +620,13 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
         deadlineMs: config.budgets.ragDeadlineMs,
         tokenCap: config.budgets.evidenceTokenCap,
         generation: coordinator.generation,
-        privateMode: () => config.privateMode,
+        // Live gate: re-read per cycle; an INVALID config fails closed to
+        // private (zero reads). A stale snapshot would let a user's
+        // private-mode flip leave retrieval running (T18 requirement).
+        privateMode: () => {
+          const r = loadConfig();
+          return !r.ok || r.config.privateMode;
+        },
       });
       // T13: advisory tombstone cache for the recall tools (§13 row 7 —
       // TTL 5 min inside the cache; a stale/missing cache never permits a
@@ -500,6 +643,7 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   // load never becomes a character-estimate fallback: injection stays
   // skipped and the reason is visible.
   let tokenizerNote: string | undefined;
+  let tokenizerDegraded = false;
   if (retrieval && config?.budgets.tokenizer) {
     const spec = config.budgets.tokenizer;
     const baseDir =
@@ -508,8 +652,10 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       if (result.ok) {
         retrieval?.setTokenizer(result.tokenizer);
         tokenizerNote = `model-compatible tokenizer attached (${result.tokenizer.id})`;
+        tokenizerDegraded = false;
       } else {
         tokenizerNote = `automatic injection stays skipped — ${result.reason}`;
+        tokenizerDegraded = true; // structured flag, not keyword matching
       }
       lastTokenizerNote = () => tokenizerNote;
     });
@@ -532,7 +678,12 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
           projectId: scope.slice("project/".length),
           sessionId: coordinator.sessionId ?? "pending",
           ...(coordinator.branchId ? { branchId: coordinator.branchId } : {}),
-          privateMode: () => config.privateMode,
+          // Live gate (same rationale as retrieval above): re-read per
+          // capture; invalid config fails closed (no new backup jobs).
+          privateMode: () => {
+            const r = loadConfig();
+            return !r.ok || r.config.privateMode;
+          },
           exclusions: config.privacy.exclusions,
         });
       } catch (err) {
@@ -595,6 +746,18 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             ...(config.board.recipient !== undefined
               ? { recipient: config.board.recipient }
               : {}),
+            // T18: user-configurable delivery cadence/bounds (validated,
+            // bounded in the schema — out-of-range values fail validation,
+            // never clamp).
+            ...(config.board.pollMs !== undefined
+              ? { pollMs: config.board.pollMs }
+              : {}),
+            ...(config.board.backoffMs !== undefined
+              ? { backoffMs: config.board.backoffMs }
+              : {}),
+            ...(config.board.backlogPauseAt !== undefined
+              ? { backlogPauseAt: config.board.backlogPauseAt }
+              : {}),
             repo: boardRepo,
             isPrivate: liveGate,
           });
@@ -615,6 +778,7 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     store,
     tombstoneCache,
     tokenizerNote,
+    tokenizerDegraded,
     backup,
     backupHeldReason,
     delivery,
@@ -649,17 +813,66 @@ export function crossOptInToScopes(values: readonly string[]): {
 }
 
 /**
+ * T18 chunk 1: command-facing runtime control surface. Chunk 2 wires Pi
+ * commands to this; the guarantees live in src/runtime/controls.ts. The
+ * private-mode flip persists a validated, atomic config edit AND relies on
+ * the live gates (retrieval/backup/delivery re-read config per boundary)
+ * so an active runtime actually reconfigures — no restart, no stale result:
+ * cancelPendingRetrieval additionally bumps the retrieval generation so any
+ * evidence pack in flight is dropped at settle instead of surfacing later.
+ */
+export function buildRuntimeControlSurface(deps: {
+  /** Resolved config file path (KIWIFS_MEMORY_CONFIG or explicit); undefined = no writable file. */
+  configFile: string | undefined;
+  getRetrieval: () => RetrievalCoordinator | undefined;
+  getGeneration: () => number;
+}): RuntimeControlSurface {
+  return {
+    setPrivateMode: (value) => {
+      if (!deps.configFile) {
+        return {
+          ok: false,
+          reason:
+            "no config file is in effect (KIWIFS_MEMORY_CONFIG unset) — private mode cannot be persisted; set it in the config source you use",
+        };
+      }
+      return setPrivateModeInFile(deps.configFile, value);
+    },
+    cancelPendingRetrieval: () => {
+      const r = deps.getRetrieval();
+      if (!r) return { ok: false, reason: "retrieval not active" };
+      r.setGeneration(deps.getGeneration() + 1);
+      return {
+        ok: true,
+        detail: "in-flight retrieval invalidated (generation bumped)",
+      };
+    },
+  };
+}
+
+export interface RuntimeBox {
+  /** Lazily-built per-session runtime (undefined until the first session event or explicit build). */
+  getRuntime: (cwd: string) => SessionRuntime | undefined;
+  /** Sanitized init-failure reason, when runtime construction failed. */
+  getRuntimeError: () => string | undefined;
+}
+
+/**
  * T08 + T09: session lifecycle and observation hook wiring. Registers Pi
  * lifecycle handlers at the boundaries verified in docs/research/
  * mcp-contracts.md §6 plus the `agent_settled` and `session_before_compact`
  * observation triggers. Handlers are reentrant and never require TUI-only
  * APIs (headless/RPC safe). Runtime construction failures disable features
  * visibly instead of breaking extension startup.
+ *
+ * T18 chunk 2: returns the runtime box so command handlers share the SAME
+ * lazily-built runtime as the event handlers (no duplicate state files, no
+ * second outbox owner).
  */
 export function registerSessionHandlers(
   pi: ExtensionAPI,
   createRuntime: (cwd: string) => SessionRuntime,
-): void {
+): RuntimeBox {
   let runtime: SessionRuntime | undefined;
   let runtimeError: string | undefined;
   /** Sanitized note for packs dropped unmatched at run settle (T12). */
@@ -676,6 +889,7 @@ export function registerSessionHandlers(
     return runtime?.retrieval?.lastDegradedNote;
   };
   lastTokenizerNote = () => runtime?.tokenizerNote;
+  lastTokenizerDegraded = () => runtime?.tokenizerDegraded ?? false;
   lastBackupNote = () => {
     if (runtime?.backupHeldReason) return runtime.backupHeldReason;
     const lines = runtime?.backup?.pendingStatus() ?? [];
@@ -687,16 +901,28 @@ export function registerSessionHandlers(
     if (!d) return undefined;
     const s = d.statusSnapshot();
     const err = d.lastErrorFingerprint();
+    if (s.holdReason) return `HELD — ${s.holdReason}`;
     return `state=${s.runState} unread=${s.unread} consumer=${s.consumerId}${
       err ? ` lastError=${err}` : ""
     }`;
   };
+  // T18: sanitized queue summary for status + overall-state attribution.
+  lastQueueNote = () => {
+    const s = runtime?.store?.stats;
+    if (!s) return undefined;
+    return `outbox: pending=${s.pending} quarantined=${s.quarantined}${
+      s.paused ? " capture=PAUSED (coverage gap)" : ""
+    }`;
+  };
+  lastQueueQuarantined = () => runtime?.store?.stats.quarantined ?? 0;
+  // T18 review fix: capture paused (coverage gap) is a degraded condition.
+  lastCapturePaused = () => runtime?.store?.stats.paused ?? false;
 
-  const get = (ctx: ExtensionContext): SessionRuntime | undefined => {
+  const get = (cwd: string): SessionRuntime | undefined => {
     if (runtime) return runtime;
     if (runtimeError) return undefined;
     try {
-      runtime = createRuntime(ctx.cwd);
+      runtime = createRuntime(cwd);
     } catch (err) {
       runtimeError =
         err instanceof StateSchemaError
@@ -777,7 +1003,7 @@ export function registerSessionHandlers(
 
   // No-UI access: handlers only read ctx.sessionManager / ctx.cwd.
   pi.on("session_start", async (event, ctx) => {
-    const rt = get(ctx);
+    const rt = get(ctx.cwd);
     rt?.coordinator.onSessionStart(ctx, event);
     if (rt?.observer) {
       rt.observer.sessionId = rt.coordinator.sessionId ?? "pending";
@@ -806,7 +1032,7 @@ export function registerSessionHandlers(
   // repeat a cycle. Injection of the pack is the T13 context injector; this
   // handler only guarantees one logical retrieval cycle per eligible input.
   pi.on("input", async (event, ctx) => {
-    const rt = get(ctx);
+    const rt = get(ctx.cwd);
     if (!rt?.retrieval) return;
     rt.retrieval.setGeneration(rt.coordinator.generation);
     await rt.retrieval.retrieve(
@@ -822,7 +1048,7 @@ export function registerSessionHandlers(
   // exactly once per pack. No matching fresh pack → undefined (fail closed:
   // no injection, pack fails closed at settle if it exists at all).
   pi.on("before_agent_start", (event, ctx) => {
-    const rt = get(ctx);
+    const rt = get(ctx.cwd);
     if (!rt?.retrieval) return undefined;
     const injector = new EvidenceInjector(rt.retrieval.registry);
     return injector.onBeforeAgentStart(event.prompt) ?? undefined;
@@ -833,7 +1059,7 @@ export function registerSessionHandlers(
   // barrier) and dedupes by inputId, so tool-loop replays never re-inject
   // and the returned replacement is transient (no persistent duplicates).
   pi.on("context", (event, ctx) => {
-    const rt = get(ctx);
+    const rt = get(ctx.cwd);
     if (!rt?.retrieval) return undefined;
     const injector = new EvidenceInjector(rt.retrieval.registry);
     return injector.onContext(event.messages) ?? undefined;
@@ -919,9 +1145,44 @@ export function registerSessionHandlers(
     // replay-safe with no repeated logical notifications).
     runtime?.delivery?.stop();
   });
+
+  return { getRuntime: get, getRuntimeError: () => runtimeError };
 }
 
 export default function kiwifsMemory(pi: ExtensionAPI): void {
+  // T18 chunk 2: build the runtime box FIRST so command handlers share the
+  // same lazily-built runtime as the event handlers (runtime is constructed
+  // at the first session event, or at the first command that needs it).
+  const runtimeBox = registerSessionHandlers(pi, (cwd) =>
+    buildSessionRuntime(cwd),
+  );
+
+  /** Command-side gates: config must be valid, enabled and not private. */
+  const configGate = ():
+    | { ok: false; notice: string }
+    | { ok: true; config: MemoryConfig; configFile: string | undefined } => {
+    const result = loadConfig();
+    if (!result.ok) return { ok: false, notice: "config: INVALID" };
+    if (!result.config.enabled)
+      return { ok: false, notice: "extension disabled" };
+    if (result.config.privateMode)
+      return {
+        ok: false,
+        notice:
+          "private mode active — all domains hold (zero reads/writes); use /kiwifs-private-mode off to resume",
+      };
+    return { ok: true, config: result.config, configFile: result.file };
+  };
+
+  /** T18: control surface for the command's session (lazy runtime). */
+  const controlSurface = (cwd: string): RuntimeControlSurface =>
+    buildRuntimeControlSurface({
+      configFile: loadConfig().file,
+      getRetrieval: () => runtimeBox.getRuntime(cwd)?.retrieval,
+      getGeneration: () =>
+        runtimeBox.getRuntime(cwd)?.coordinator.generation ?? 0,
+    });
+
   pi.registerCommand("kiwifs-status", {
     description: "Show KiwiFS memory extension status",
     handler: async (_args, ctx) => {
@@ -966,11 +1227,13 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
           );
         return;
       }
-      const scope = resolveRecordScope(config);
-      if (!scope || !scope.startsWith("project/")) {
+      const scope = resolveRecordScope(config, ctx.cwd);
+      if (!scope.ok || !scope.scope.startsWith("project/")) {
         if (ctx.hasUI)
           ctx.ui.notify(
-            "backup verify requires a resolved project scope (projectIdentity unset; git-remote discovery lands in T18)",
+            scope.ok
+              ? "backup verify requires a resolved project scope"
+              : scope.reason,
             "error",
           );
         return;
@@ -986,7 +1249,9 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
       try {
         // Path-safety gate inside the guarded block (PathEscapeError →
         // visible failure, never an unhandled crash).
-        const projectId = validateProjectId(scope.slice("project/".length));
+        const projectId = validateProjectId(
+          scope.scope.slice("project/".length),
+        );
         // Read-only backend (no ledger: reads mint no opIds).
         const adapter = openConfiguredBackend(config, {
           record: () => {},
@@ -1002,7 +1267,7 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
         }
         await adapter.connect();
         const result = await verifyRemoteBackup(adapter, projectId, sessionId, {
-          expectedScope: scope,
+          expectedScope: scope.scope,
         });
         if (result.state === "missing") {
           if (ctx.hasUI) ctx.ui.notify(`backup: ${result.detail}`, "info");
@@ -1058,5 +1323,389 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
     },
   });
 
-  registerSessionHandlers(pi, (cwd) => buildSessionRuntime(cwd));
+  // ---- T18 chunk 2: command wiring (all headless/RPC safe) --------------
+
+  // Private-mode toggle wired to the chunk-1 control surface: the config
+  // edit persists FIRST (atomic, validated); enabling then cancels pending
+  // retrieval (generation bump) so no in-flight evidence pack survives the
+  // flip. Live gates re-read config per boundary — no restart needed.
+  pi.registerCommand("kiwifs-private-mode", {
+    description:
+      "Show or toggle KiwiFS private mode (on|off|status) — private mode holds ALL reads/writes in every domain",
+    handler: async (args, ctx) => {
+      const mode = (args ?? "").trim().toLowerCase() || "status";
+      if (mode !== "on" && mode !== "off" && mode !== "status") {
+        if (ctx.hasUI)
+          ctx.ui.notify("usage: /kiwifs-private-mode on|off|status", "info");
+        return;
+      }
+      const result = loadConfig();
+      if (mode === "status") {
+        if (ctx.hasUI) {
+          if (!result.ok) ctx.ui.notify("config: INVALID", "error");
+          else
+            ctx.ui.notify(
+              `private mode: ${result.config.privateMode ? "ON" : "OFF"}${
+                result.config.privateMode
+                  ? " — all domains hold (zero reads/writes)"
+                  : ""
+              }`,
+              "info",
+            );
+        }
+        return;
+      }
+      const cwd = ctx.cwd;
+      const surface = controlSurface(cwd);
+      const setResult =
+        mode === "on"
+          ? surface.setPrivateMode(true)
+          : surface.setPrivateMode(false);
+      let text = setResult.ok
+        ? setResult.detail
+        : `NOT changed — ${setResult.reason}`;
+      if (setResult.ok && mode === "on") {
+        // Enable order (T18): persist file first (done), then invalidate
+        // in-flight retrieval so stale evidence cannot surface afterwards.
+        const cancel = surface.cancelPendingRetrieval();
+        text +=
+          cancel.ok && cancel.detail
+            ? `; ${cancel.detail}`
+            : "; no pending retrieval to cancel";
+      }
+      if (ctx.hasUI) ctx.ui.notify(text, setResult.ok ? "info" : "error");
+    },
+  });
+
+  // Manual extraction trigger (same pipeline as the automatic settle path).
+  pi.registerCommand("kiwifs-extract-now", {
+    description:
+      "Trigger one KiwiFS observation extraction cycle now (bounded; sanitized summary)",
+    handler: async (_args, ctx) => {
+      const gate = configGate();
+      if (!gate.ok) {
+        if (ctx.hasUI) ctx.ui.notify(gate.notice, "info");
+        return;
+      }
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      const err = runtimeBox.getRuntimeError();
+      const observer = rt?.observer;
+      if (!observer || err) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `observer not active${err ? ` — ${err}` : " (held: scope/feature/model unavailable)"}`,
+            "info",
+          );
+        return;
+      }
+      const s = observer.extractNow();
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          `manual extraction: scheduled=${s.scheduled} deferred=${s.deferred} retried=${s.retried}${s.skippedReason ? ` skipped=${s.skippedReason}` : ""}`,
+          "info",
+        );
+    },
+  });
+
+  // Manual reflection trigger (bypasses the [P] threshold, NOT the gates).
+  pi.registerCommand("kiwifs-reflect-now", {
+    description:
+      "Trigger a KiwiFS reflection run now (bounded; sanitized summary; approval still gated)",
+    handler: async (_args, ctx) => {
+      const gate = configGate();
+      if (!gate.ok) {
+        if (ctx.hasUI) ctx.ui.notify(gate.notice, "info");
+        return;
+      }
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      const reflection = rt?.reflection;
+      if (!reflection) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "reflection not active (observation feature off or init failed)",
+            "info",
+          );
+        return;
+      }
+      try {
+        const r = await reflection.reflectNow();
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            r.ran
+              ? "reflection run complete (record set updated; proposals remain approval-gated)"
+              : `reflection skipped: ${r.skippedReason ?? "unknown"}`,
+            "info",
+          );
+      } catch (err) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `reflection failed: ${errorName(err)} (no content disclosed)`,
+            "error",
+          );
+      }
+    },
+  });
+
+  // Proposal lifecycle commands: approve / reject / undo — verified
+  // transitions via the T11 lifecycle (fresh reads, read-back verification,
+  // serialized locally). Stale states fail visibly, never silently.
+  pi.registerCommand("kiwifs-proposal", {
+    description:
+      "Approve, reject or undo a KiwiFS merge proposal: /kiwifs-proposal <approve|reject|undo> <proposal-path> [reason…]",
+    handler: async (args, ctx) => {
+      const parts = (args ?? "").trim().split(/\s+/);
+      const action = parts.shift();
+      const proposalPath = parts.shift();
+      const reason = parts.join(" ") || undefined;
+      if (
+        (action !== "approve" && action !== "reject" && action !== "undo") ||
+        !proposalPath
+      ) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "usage: /kiwifs-proposal <approve|reject|undo> <proposal-path> [reason…]",
+            "info",
+          );
+        return;
+      }
+      const gate = configGate();
+      if (!gate.ok) {
+        if (ctx.hasUI) ctx.ui.notify(gate.notice, "info");
+        return;
+      }
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      const lifecycle = rt?.lifecycle;
+      if (!lifecycle) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "proposal lifecycle unavailable (backend or credential unconfigured)",
+            "error",
+          );
+        return;
+      }
+      try {
+        const opts = {
+          actor: "user-command",
+          ...(reason !== undefined ? { reason } : {}),
+        };
+        const r =
+          action === "approve"
+            ? await lifecycle.approve(proposalPath, opts)
+            : action === "reject"
+              ? await lifecycle.reject(proposalPath, opts)
+              : await lifecycle.undo(proposalPath, opts);
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `proposal ${action} ${r.applied}: targets=${r.targets.length} (${r.proposalPath})`,
+            "info",
+          );
+      } catch (err) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            err instanceof StaleProposalError
+              ? (err as Error).message
+              : `proposal ${action} failed: ${errorName(err)}`,
+            "error",
+          );
+      }
+    },
+  });
+
+  // Manual forget gates shared by forget/forget-undo handlers.
+  const manualOpsGate = (
+    ctx: ExtensionCommandContext,
+  ):
+    | {
+        config: MemoryConfig;
+        opLog: ManualOpLog;
+        manual: ReturnType<typeof createManualOps>;
+      }
+    | undefined => {
+    const gate = configGate();
+    if (!gate.ok) {
+      if (ctx.hasUI) ctx.ui.notify(gate.notice, "info");
+      return undefined;
+    }
+    if (!gate.config.mcp.url || !gate.config.mcp.auth) {
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          "backend not configured (mcp.url/mcp.auth) — manual ops unavailable",
+          "error",
+        );
+      return undefined;
+    }
+    const opLog = new ManualOpLog(resolveStateDir(ctx.cwd));
+    return {
+      config: gate.config,
+      opLog,
+      manual: createManualOps(
+        { url: gate.config.mcp.url, auth: gate.config.mcp.auth },
+        opLog,
+      ),
+    };
+  };
+
+  // Reversible logical forget (B6: nothing is deleted; body preserved).
+  // UI sessions require an explicit confirm; headless/RPC runs act on the
+  // explicit args (documented). Tombstone cache refresh + cached evidence
+  // pack drop follow every successful forget.
+  pi.registerCommand("kiwifs-forget", {
+    description:
+      "Forget a KiwiFS memory record (REVERSIBLE: marks superseded, body preserved): /kiwifs-forget <path> [reason…]",
+    handler: async (args, ctx) => {
+      const parts = (args ?? "").trim().split(/\s+/);
+      // Headless/RPC requires the explicit --yes token (review fix: record-
+      // mutating commands must not execute without confirmation anywhere).
+      const headlessYes = parts.includes("--yes");
+      const path = parts.filter((p) => p !== "--yes").shift();
+      const reason =
+        parts
+          .filter((p) => p !== "--yes")
+          .slice(1)
+          .join(" ") || undefined;
+      if (!path) {
+        if (ctx.hasUI)
+          ctx.ui.notify("usage: /kiwifs-forget <path> [reason…]", "info");
+        return;
+      }
+      const g = manualOpsGate(ctx);
+      if (!g) return;
+      if (ctx.hasUI) {
+        const proceed = await ctx.ui.confirm(
+          "Forget memory record",
+          `Mark ${path} superseded? Body is preserved; reversible via /kiwifs-forget-undo.`,
+        );
+        if (!proceed) {
+          ctx.ui.notify("forget cancelled", "info");
+          return;
+        }
+      } else if (!headlessYes) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "refused — headless forget requires --yes (record-mutating command)",
+            "error",
+          );
+        return;
+      }
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      const result = await forgetMemoryPath({
+        opLog: g.opLog,
+        openStore: g.manual.openStore,
+        path,
+        ...(reason !== undefined ? { reason } : {}),
+        actor: "user-command",
+        ...(rt?.tombstoneCache ? { tombstoneCache: rt.tombstoneCache } : {}),
+        ...(rt?.retrieval ? { registry: rt.retrieval.registry } : {}),
+      });
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          result.ok ? result.detail : `NOT forgotten — ${result.reason}`,
+          result.ok ? "info" : "error",
+        );
+    },
+  });
+
+  // Verified restore: read-back-verified status flip with provenance.
+  pi.registerCommand("kiwifs-forget-undo", {
+    description:
+      "Restore a forgotten KiwiFS record to active (read-back verified): /kiwifs-forget-undo <path>",
+    handler: async (args, ctx) => {
+      const path = (args ?? "").trim().split(/\s+/)[0];
+      if (!path) {
+        if (ctx.hasUI)
+          ctx.ui.notify("usage: /kiwifs-forget-undo <path>", "info");
+        return;
+      }
+      const g = manualOpsGate(ctx);
+      if (!g) return;
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      const result = await unforgetMemoryPath({
+        opLog: g.opLog,
+        openStore: g.manual.openStore,
+        path,
+        actor: "user-command",
+        ...(rt?.tombstoneCache ? { tombstoneCache: rt.tombstoneCache } : {}),
+      });
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          result.ok ? result.detail : `NOT restored — ${result.reason}`,
+          result.ok ? "info" : "error",
+        );
+    },
+  });
+
+  // LOCAL-ONLY board GC: prunes acked/skipped entries past retention from
+  // the durable delivery state file. Undelivered entries are never touched;
+  // no backend call exists on this path. Explicit confirmation is REQUIRED:
+  // a UI confirm dialog, or the literal --yes argument in headless/RPC mode.
+  pi.registerCommand("kiwifs-board-gc", {
+    description:
+      "Prune acked/skipped entries older than 14d from LOCAL board delivery state (confirmed; local-only; undelivered entries untouched)",
+    handler: async (args, ctx) => {
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      const delivery = rt?.delivery;
+      if (!delivery) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "board delivery not active (feature off, held, or consumerId unset)",
+            "info",
+          );
+        return;
+      }
+      let consent = false;
+      if (ctx.hasUI) {
+        consent = await ctx.ui.confirm(
+          "Board delivery GC",
+          "Prune acknowledged/skipped entries older than 14 days from LOCAL delivery state? Undelivered entries are never touched. No backend calls.",
+        );
+      } else {
+        consent = (args ?? "").includes("--yes");
+      }
+      if (!consent) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "cancelled — board GC requires explicit confirmation (UI confirm or --yes)",
+            "info",
+          );
+        return;
+      }
+      const removed = delivery.state.gc();
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          `board GC: removed ${removed} stale acked/skipped entr${removed === 1 ? "y" : "ies"} (local-only; undelivered entries untouched; no backend calls)`,
+          "info",
+        );
+    },
+  });
+
+  // Queue-failure inspection: sanitized stats + quarantined job fingerprints
+  // (seq/kind/attempts/name:code only — payloads are never shown).
+  pi.registerCommand("kiwifs-queue", {
+    description:
+      "Show KiwiFS outbox queue state and quarantined job fingerprints (sanitized)",
+    handler: async (_args, ctx) => {
+      const store = runtimeBox.getRuntime(ctx.cwd)?.store;
+      if (!store) {
+        if (ctx.hasUI) ctx.ui.notify("outbox unavailable", "info");
+        return;
+      }
+      const s = store.stats;
+      let text = `outbox: pending=${s.pending} quarantined=${s.quarantined} acked=${s.acked} bytes=${s.bytes}${s.paused ? " capture=PAUSED (coverage gap)" : ""}`;
+      for (const j of store.quarantined().slice(0, 20)) {
+        text += `\n- seq=${j.seq} kind=${j.kind} attempts=${j.attempts} lastError=${j.lastError ?? "(none)"}`;
+      }
+      if (s.quarantined > 20) text += `\n- … and ${s.quarantined - 20} more`;
+      if (ctx.hasUI)
+        ctx.ui.notify(text, s.quarantined > 0 ? "warning" : "info");
+    },
+  });
+
+  // B6 erasure disclosure: disclosure-only, zero I/O, deletes nothing.
+  pi.registerCommand("kiwifs-erasure-report", {
+    description:
+      "Show where KiwiFS record content is retained (B6 disclosure; nothing is deleted)",
+    handler: async (_args, ctx) => {
+      if (ctx.hasUI) ctx.ui.notify(erasureReportLines().join("\n"), "info");
+    },
+  });
 }
