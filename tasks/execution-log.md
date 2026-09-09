@@ -866,3 +866,34 @@ display, details }` CustomMessage (`buildEvidenceMessage`), matching
   settled stays queued until the next run — consistent with Pi's steering
   queue semantics and outside T13's injectable-input path (it would become
   a fresh input on delivery).
+
+## T13 — validation: acceptance boxes, gates and commit (validation chunk, 2026-09-09)
+
+### What was done
+
+- Independent re-verification of all four T13 chunks (`7bd8cb0`..`4924f99`,
+  tree was clean). All six T13 acceptance criteria checked off in
+  `tasks/prd-kiwifs-memory.md` with per-criterion evidence citations
+  (`test/inject.test.ts`, `test/recall-tools.test.ts`,
+  `test/tokenizer-config.test.ts`, `test/pi-rpc-fixture.test.ts`, T08/T11
+  inert-fence tests, and the source invariants they pin).
+- Gates re-run on the final tree by the validator, not trusted from the
+  chunks: `npm run check` 306 pass / 0 fail + prettier clean;
+  `npm run pack:check` loads in Pi RPC; `devenv test` "Tests passed :)".
+- Staged-files secret inspection before commit (synthetic fixtures only; the
+  AWS-pattern string exists solely as the redaction-proven fixture; no
+  `kiwifs-test.local.json`, no credentials, no live services, no deployment
+  edits, no push).
+
+### Honest limitations (recorded, non-blocking)
+
+- The RPC fixture proves the queued-steer consumed-input path in real Pi;
+  a dedicated `followUp` RPC variant (new agent run, still no
+  `before_agent_start`, stored expanded) is not yet exercised end-to-end —
+  its matching shares the proven raw-text fingerprint + occurrence guard,
+  and remains a follow-up.
+- Theoretical timing window (steer text identical to the fresh prompt,
+  registered between `before_agent_start` and the run's first context fire)
+  is closed by Pi's event ordering in practice (steers are accepted only
+  while streaming, i.e. after call 1's context fire), noted as timing- not
+  structurally-guaranteed.
