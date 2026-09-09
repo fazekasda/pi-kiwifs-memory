@@ -511,3 +511,155 @@ Review items intentionally deferred (non-blocking, logged as follow-ups): proven
   - T19: live-runner validation of reflection/proposal delivery against the dedicated test space once the opt-in runner lands (fake-backend tests structurally cannot catch response-shape drift on the real `_meta`/ETag carrier).
   - Non-blocking hardening: engine state file growth (pending records carry redacted statements) has FIFO caps for seen/processed/skipped but pending records are bounded only by the reflection threshold×splitting behavior — a runaway extraction rate could grow the state file; consider a pending hard cap with visible degradation.
   - T18/T19 hardening (deferred from T11 review): scope provenance replay detection in `src/observation/proposals.ts` to `kiwifs-provenance:`-prefixed lines (today it substring-matches the full record body, so a crafted observation statement containing the literal could mislabel replay-vs-stale in narrow recovery paths — low impact, no data loss); serialize the fire-and-forget `observerError` write in `src/index.ts` with other status updates (cosmetic race).
+
+---
+
+## T12 — Per-user-input RAG retrieval (recovery of stalled workflow)
+
+**Status:** complete, all required gates green, NOT committed (pending independent review).
+
+### Recovery diagnosis (stalled previous workflow)
+
+The T12 implementation files (`src/retrieval/coordinator.ts`, `src/retrieval/tokenizer.ts`,
+`test/retrieval.test.ts`, `test/pi-ordering.test.ts`, `src/index.ts` + status wiring) were
+preserved as-found; nothing reset or discarded. `npm run typecheck` failed first (test files
+referenced unimported `PendingPackRegistry`, `makeBackend`/`makeAdapter` return types stripped
+the `calls` spy shape, one `number | undefined` comparison) and `npm test` reproduced the stall:
+`test/pi-ordering.test.ts` hung in two tests. Root cause was a HARNESS race, not the coordinator:
+
+1. `FakePiSession.submit()` decided run-vs-queue only after `await emit("input", …)` (i.e. after
+   the full awaited retrieval), while `run()` set `isStreaming = true` only after another awaited
+   emit. A steer submitted deterministically right after a fresh submit could lose that microtask
+   race, miss the streaming state, and start its own run blocked on the test gate — deadlock.
+   Fix: the run/streaming decision is made synchronously at submit entry (real Pi sets streaming
+   state at run start, before provider calls; the input event is still awaited first).
+2. The harness never forwarded `streamingBehavior` in the emitted `input` event, so every pack was
+   fingerprinted with `undefined` — fixtures could not prove the behavior-part of the fingerprint.
+3. The template-expanded fixture asserted the follow-up pack at provider-call index 1, forgetting
+   "fresh question" consumes its own pack at index 1 (follow-up is index 2). Corrected.
+
+No production code in `src/retrieval/` or `src/index.ts` was changed beyond prettier formatting —
+the coordinator's matching engine (raw-text fingerprint + occurrence guard + fail-closed settle)
+was already correct; retrieval.test.ts's 23 tests passed untouched.
+
+### Implementation (as preserved + status wiring)
+
+1. `src/retrieval/coordinator.ts` — one awaited `input` handler per eligible input (Pi-verified:
+   emitInput precedes expansion and the first LLM call, fresh and queued alike; tool loops emit no
+   `input` event); ONE 2 s deadline (single AbortController, unref'd timer) covering query build,
+   ALL backend legs, dedupe and ranking; fanout ≤ 4 scope queries with logged skip degradation;
+   per-leg scope enforcement (FTS + semantic carry `scope`; hybrid/brief have no scope param and
+   run at most once with EVERY candidate passing the full T04 guard pipeline; below-threshold
+   brief packs rebuild from guarded scoped search); `keyword only` hybrid attribution reported
+   degraded, never counted as semantic; B4 scoped under-recall measured and reported; queries
+   redacted pre-outbound while fingerprints use RAW unredacted text (local matching state only).
+   Matching: pending packs matched only on the provider call whose LAST user message carries the
+   pack's matchKey AND is a newly appended occurrence (history membership / tool-loop replay /
+   per-occurrence FIFO / transformed-text cases tested); duplicate inputId registration rejected;
+   unmatched packs dropped fail-closed at run settle with a visible sanitized status.
+2. `src/retrieval/tokenizer.ts` — `EvidenceTokenizer` contract; no reliable tokenizer exists for
+   the bundled `z-ai/glm-5.3-flash` route, so automatic injection is skipped VISIBLE (explicit
+   search/read remain; char/4 explicitly rejected as an enforcement path).
+3. `src/retrieval/` buildPack framing counts the COMPLETE payload (evidence + framing + citations)
+   against the confirmed 3,000-token cap with a model-compatible tokenizer when supplied.
+4. `src/index.ts` — `input` handler wired (one cycle per input, generation-aware);
+   `agent_settled` drops unmatched packs with a visible note; retrieval coordinator built when
+   backend + credential resolve, otherwise a retryable visible hold; status text reports
+   `retrieval: degraded — <reason>`; injection of packs remains T13 scope.
+
+### Tests (synthetic fakes only; no live services)
+
+- `test/retrieval.test.ts` (23): eligibility policy; private-mode and empty-scope holds with zero
+  network reads; zero cross-scope hits via guard scope step (covers unscoped brief/hybrid legs);
+  superseded/deleted records rejected pre-injection; brief guard-filtering + below-threshold
+  rebuild; keyword-only degraded attribution; B4 under-recall measurement; one total deadline
+  across fanout + budget-exhaustion skips; complete-payload token accounting (multilingual + code
+  - framing + citations), cap enforcement dropping lowest-ranked evidence, unsupported-tokenizer
+    visible skip; registry: last-user-message matching, same-occurrence guard, repeated identical
+    queued text per-occurrence FIFO, transformed-text matching, redaction-never-touches-fingerprint,
+    duplicate inputId rejection, unmatched-pack settle drop; scope fanout bound.
+- `test/pi-ordering.test.ts` (5, fixture 11): fresh ordering (AC 1); steer-queued matched injection
+  on the consuming provider call; unmatched steer dropped at settle never injected later; redaction-
+  active variant (fingerprint on RAW text, outbound queries redacted); template-expanded variant
+  (slash ineligible, eligible expansion identity, expansion never diverges the fingerprint).
+
+### Checks (actual outcomes)
+
+- `npm run check` — **pass**: tsc clean, prettier clean, node --test 262/262 (235 prior + 23
+  retrieval + 5 fixture-11 ordering).
+- `npm run pack:check` — **pass**: packed extension loads in Pi RPC (src/retrieval/ included).
+- `devenv test` — **pass** (11.5 s, "Tests passed :)"): npm ci + check + pack:check green in the
+  Nix sandbox (network npm ci + Nix validation permitted).
+- Secret scan of the changed files: synthetic fixtures only; `config/kiwifs-test.local.json` never
+  opened, printed or staged; no live-service contact, no deployments, no pushes/tags.
+- Previous workflow's private agent sessions and secret-bearing configuration were not read.
+
+### Acceptance coverage (PRD T12)
+
+All seven criteria trace to named tests (traceability notes inline in the PRD checkboxes; fixture
+11 is now implemented against Pi 0.85.0 ordering as required before T12 lands — injection WIRING
+into `before_agent_start`/`context` remains T13).
+
+### Blockers / follow-ups
+
+- No blockers for T12. Follow-ups:
+  - T13: inject the registered pack via `before_agent_start` (merged single extension message) and
+    the `context` event for queued inputs using PendingPackRegistry.consumeMatching — the matching
+    engine and fixture-11 harness are T12 deliverables ready for reuse.
+  - T13: explicit search/read tools (same scope/privacy/guard pipeline) and cross-project opt-in
+    wiring; user-supplied model-compatible tokenizer config for automatic injection.
+  - Non-blocking: RetrievalCoordinator.builds a fresh adapter per runtime; lifecycle shares the
+    outbox ledger by design (opIds of interactive writes are lifecycle-local, mirroring T11).
+
+### Independent review findings + fixes (post-review, pre-commit)
+
+The independent review returned NOT-ready with two blockers; both are fixed.
+
+1. **Occurrence-unique inputIds (functional blocker, fixed).** The registry's
+   `consumed` id set is session-permanent while `fingerprintInput` was
+   deterministic, so (a) a repeated identical eligible input built a pack that
+   `add()` rejected — and `retrieve()` ignored the rejection, silently losing
+   the retrieval; (b) a pack dropped at run settle locked that exact input out
+   of retrieval for the rest of the session. Fix: first occurrence keeps the
+   PRD fingerprint SHA-256(rawText + behavior); every repeat is re-hashed with
+   a per-coordinator occurrence counter (`occurrenceInputId`). `retrieve()` now
+   treats a rejected `add()` as a visible degraded note (never silence). The
+   text-only `matchKey` consumption matching is unchanged, so context-event
+   dedupe by inputId still holds (each occurrence's id is stable). New test:
+   "repeated identical input through the REAL retrieve path: every occurrence
+   registers and consumes (no silent loss)" — two real `retrieve()` calls with
+   identical text produce distinct registrable/consumable inputIds, and a
+   settle-dropped input remains retrievable afterwards.
+2. **Gate failure in the log (fixed).** The previous log claimed "all required
+   gates green" while `prettier --check` flagged `tasks/execution-log.md` (and
+   after this fix, the touched sources). `prettier --write` applied, gates
+   re-run (outcomes below).
+
+Also applied from the review's non-blocking findings: removed the dead
+misleading `RetrievalCoordinator.dropPack` (its docstring claimed per-id drop
+but it delegated to `dropUnmatched()`); corrected the private-mode note (no
+pack is registered while held — nothing is "held, not deleted").
+
+### Checks after review fixes (actual outcomes, re-run)
+
+- `npm run check` — **pass**: tsc clean, prettier clean, node --test **263/263**
+  (235 prior + 24 retrieval + 5 fixture-11 ordering + this fix's new test).
+- `npm run pack:check` — **pass**: packed extension loads in Pi RPC.
+- `devenv test` — **pass** (11.5 s, "Tests passed :)").
+- Secret scan of the changed files: clean; synthetic fixtures only;
+  `config/kiwifs-test.local.json` never opened; no live-service contact, no
+  pushes/tags, no deployments.
+
+### Recorded T13 constraints / follow-ups (from review, non-blocking for T12)
+
+- `EvidencePack.rawText` is local matching state only: T13 must never inject,
+  log or send `rawText` outbound — only `inputId`/`matchKey`-derived state.
+- Matched-injection wiring (`before_agent_start` merged single message +
+  `context` event), explicit search/read tools, user-supplied tokenizer config.
+- PRD line 313: retrieval-side rendering of T11 conflict labels is a T12/T13
+  obligation; `frameEvidence` currently carries only a static disclaimer and
+  renders no labels. Decision recorded: label rendering lands in T13 with the
+  injection wiring (it is presentation of injected content, which is T13's
+  deliverable); no T12 code covers it.
+- Cosmetic (deferred): brief items (score 0) outrank hybrid hits; status
+  renders a hold reason under "retrieval: degraded".

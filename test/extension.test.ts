@@ -32,6 +32,7 @@ function loadCommand(): Command {
   assert.deepEqual([...commands.keys()], ["kiwifs-status"]);
   assert.deepEqual([...events].sort(), [
     "agent_settled",
+    "input",
     "session_before_compact",
     "session_before_fork",
     "session_before_switch",

@@ -22,6 +22,7 @@ import {
 } from "./observation/reflection.ts";
 import { ProposalLifecycle, ProposalOpLog } from "./observation/proposals.ts";
 import { SessionCoordinator, StateSchemaError } from "./pi/coordinator.ts";
+import { RetrievalCoordinator } from "./retrieval/coordinator.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
 import {
@@ -37,6 +38,8 @@ export const STATUS_MESSAGE =
 /** Last coordinator/observer init error, surfaced via status (fail-visible). */
 let lastCoordinatorError: (() => string | undefined) | undefined;
 let lastObserverError: (() => string | undefined) | undefined;
+/** Last retrieval degradation note, surfaced via status (fail-visible, T12). */
+let lastRetrievalNote: (() => string | undefined) | undefined;
 
 /** Test/inspection hook for the coordinator error probe. */
 export function setCoordinatorErrorProbe(
@@ -50,6 +53,13 @@ export function setObserverErrorProbe(
   probe: (() => string | undefined) | undefined,
 ): void {
   lastObserverError = probe;
+}
+
+/** Test/inspection hook for the retrieval note probe (T12). */
+export function setRetrievalNoteProbe(
+  probe: (() => string | undefined) | undefined,
+): void {
+  lastRetrievalNote = probe;
 }
 
 /**
@@ -79,6 +89,8 @@ export function resolveStatusText(): string {
   if (coordErr) text += `\nsession coordinator: DISABLED — ${coordErr}`;
   const obsErr = lastObserverError?.();
   if (obsErr) text += `\nobserver: DISABLED — ${obsErr}`;
+  const retrievalNote = lastRetrievalNote?.();
+  if (retrievalNote) text += `\nretrieval: degraded — ${retrievalNote}`;
   if (result.ok && result.config.enabled) {
     const features = effectiveFeatures(result.config);
     if (features.observation && !result.config.model.auth) {
@@ -166,6 +178,8 @@ interface SessionRuntime {
   observer: ObserverScheduler | undefined;
   reflection: ReflectionEngine | undefined;
   lifecycle: ProposalLifecycle | undefined;
+  retrieval: RetrievalCoordinator | undefined;
+  retrievalHeldReason: string | undefined;
   observerError: string | undefined;
   store: DurableOutbox | undefined;
 }
@@ -352,11 +366,56 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       observerError = `observer init failed: ${(err as Error).name}`;
     }
   }
+  // T12: per-user-input RAG retrieval. The authorized scope set is the
+  // resolved project scope plus personal (config); crossProjectOptIn values
+  // are deliberately NOT auto-included — cross-project recall requires
+  // explicit per-session opt-in (architecture.md §9), wired in T13.
+  // Retrieval requires a configured, credential-resolvable backend; without
+  // one it is held visibly, never silently skipped.
+  let retrieval: RetrievalCoordinator | undefined;
+  let retrievalHeldReason: string | undefined;
+  if (
+    store &&
+    config &&
+    config.enabled &&
+    config.mcp.url !== "" &&
+    config.mcp.auth
+  ) {
+    const retrievalScopes: string[] = [];
+    if (scope !== undefined) retrievalScopes.push(scope);
+    if (config.scopes.allowPersonalGlobal) retrievalScopes.push("personal");
+    if (retrievalScopes.length === 0) {
+      retrievalHeldReason =
+        "no authorized scope resolves (projectIdentity unset and personal scope disabled)";
+    } else if (!resolveAuthSecret(config.mcp.auth)) {
+      retrievalHeldReason =
+        "backend credential reference does not resolve (retryable hold)";
+    } else {
+      const mcpAuth: AuthRef = config.mcp.auth;
+      const mcpUrl = config.mcp.url;
+      retrieval = new RetrievalCoordinator({
+        adapter: new KiwiFSAdapter({
+          url: mcpUrl,
+          headers: {
+            Authorization: `Bearer ${resolveAuthSecret(mcpAuth) ?? ""}`,
+          },
+          ledger: store.ledger(),
+        }),
+        authorizedScopes: retrievalScopes,
+        deadlineMs: config.budgets.ragDeadlineMs,
+        tokenCap: config.budgets.evidenceTokenCap,
+        generation: coordinator.generation,
+        privateMode: () => config.privateMode,
+      });
+    }
+  }
   return {
     coordinator,
     observer,
     reflection,
     lifecycle,
+    retrieval,
+    retrievalHeldReason,
     observerError,
     store,
   };
@@ -376,10 +435,18 @@ export function registerSessionHandlers(
 ): void {
   let runtime: SessionRuntime | undefined;
   let runtimeError: string | undefined;
+  /** Sanitized note for packs dropped unmatched at run settle (T12). */
+  let retrievalDropNote: string | undefined;
   lastCoordinatorError = () => runtimeError;
   lastObserverError = () => {
     if (runtimeError) return runtimeError;
     return runtime?.observerError;
+  };
+  lastRetrievalNote = () => {
+    if (runtimeError) return runtimeError;
+    if (retrievalDropNote) return retrievalDropNote;
+    if (runtime?.retrievalHeldReason) return runtime.retrievalHeldReason;
+    return runtime?.retrieval?.lastDegradedNote;
   };
 
   const get = (ctx: ExtensionContext): SessionRuntime | undefined => {
@@ -411,7 +478,30 @@ export function registerSessionHandlers(
       });
     }
   });
+  // T12: per-input retrieval. `input` handlers are awaited by Pi BEFORE the
+  // first LLM call — including queued (steer/followUp) inputs — so the
+  // evidence pack exists before `before_provider_request` (verified ordering,
+  // mcp-contracts.md §6). Tool-loop LLM calls emit no `input` event and never
+  // repeat a cycle. Injection of the pack is the T13 context injector; this
+  // handler only guarantees one logical retrieval cycle per eligible input.
+  pi.on("input", async (event, ctx) => {
+    const rt = get(ctx);
+    if (!rt?.retrieval) return;
+    rt.retrieval.setGeneration(rt.coordinator.generation);
+    await rt.retrieval.retrieve(
+      event.text,
+      event.streamingBehavior,
+      event.source,
+    );
+  });
   pi.on("agent_settled", async () => {
+    // Fail closed: unmatched pending packs are dropped at run settle with a
+    // visible degraded note — never carried into a later unrelated turn.
+    const dropped = runtime?.retrieval?.registry.dropUnmatched() ?? [];
+    retrievalDropNote =
+      dropped.length > 0
+        ? `unmatched evidence pack(s) dropped at run settle: ${dropped.length}`
+        : undefined;
     runtime?.observer?.onAgentSettled();
   });
   pi.on("session_before_compact", async (event) => {
