@@ -1017,3 +1017,108 @@ fail-closed then recovers (AC4); backup paths cannot pass ordinary retrieval gua
   the suite proves is redacted before any chunk/manifest byte is produced
   (asserted absent from serialized manifest and outbox-accepted payloads via the
   outbox's own `looksSecretBearing` gate).
+
+## T15 — Backup verification and non-destructive export (finish_T15, 2026-09-09)
+
+### What was built (src/backup/verify.ts, src/backup/recovery.ts)
+
+- **Verification (`verifyBackup`, pure function over a delivered tree)**: recomputes
+  every chunk checksum from the _delivered bytes_ (manifest checksums are never
+  trusted as evidence of integrity); detects missing chunks, duplicated/extra
+  delivered chunks, reordering (chunk seq self-description vs manifest position),
+  corrupted bytes, manifest completeness violations (count/range/duplicate
+  coverage gaps, `entry-count-mismatch`) and unlinked parents (branch link into
+  an uncovered or later-seq entry). All findings are `BackupIssue`s with codes,
+  never exceptions.
+- **Fail-closed parsing**: manifest parse rejects `schemaVersion > 1`
+  (`schema-unsupported`), wrong `kind`, missing `redacted` flag, malformed chunk
+  records; chunk parse validates session id and seq shape. Foreign/newer
+  producers therefore abort before any export or further use.
+- **Recovery (`verifyRemoteBackup` in `recovery.ts`)**: reads a delivered backup
+  tree via the backend adapter, builds the chunk map from raw bytes, flags
+  undeliverable chunks for `verifyBackup`, and returns a typed result
+  (`missing` / `invalid` / `ok{verification}`).
+- **Export (`exportBackup`)**: writes only to an explicitly named directory that
+  does NOT exist (checked + created; refusal on existing target — never
+  overwrites, never implicit). Writes one `<seq>.json` chunk plus a
+  `export-summary.md` stating session/scope/entry counts, redaction summary and
+  omissions. Restore-into-Pi is NOT attempted (architecture §20 deferral);
+  completeness statements never claim byte-identical fidelity
+  (`fidelity: "redacted"` when redactions/omissions were recorded; a manifest
+  claiming `redacted: false` while carrying redaction metadata fails closed).
+- **Command wiring (`src/index.ts`)**: `/kiwifs-backup-verify <session-id>
+[export-dir]` — usage/disabled/scope messages without UI in headless mode;
+  verification runs on a read-only adapter (stub ledger: reads mint no opIds);
+  path-safety gate before any filesystem or backend access
+  (`PathEscapeError` → visible failure). Export destination must be passed
+  explicitly and must not exist.
+
+### Path exclusion privacy policy
+
+- Backup capture (T14) applies the same exclusion/redaction rules as observation;
+  pattern-only rules fire at capture time; `pathPrefix` rules cannot fire on
+  transcript entries (no backend path context) — disclosed in T14 log and
+  `docs/privacy.md`, not silently bypassed. T15 changes no exclusion semantics;
+  verification reads only what was already delivered under those rules and the
+  export faithfully reports recorded redactions/omissions.
+- The synthetic AWS-pattern secret from the T14 fixture remains asserted absent
+  from every exported byte in the round-trip test.
+
+### Tests (test/backup-verify.test.ts, test/extension.test.ts)
+
+- 11 new T15 tests: healthy verify + redaction-honest fidelity; missing /
+  duplicated / reordered / corrupted chunk detection; manifest completeness
+  gaps; unlinked parent; newer-schema fail-closed (manifest + chunk); malformed
+  manifest fail-closed; round-trip export with redaction/omissions represented;
+  export refusals (existing destination, unverified backup, unsafe path).
+- `test/extension.test.ts` updated for the T15 registration shape: `loadCommand`
+  returns `{ status, verify }`; removed the leftover `assert.ok(command)`
+  reference and a duplicated tools-registration block that broke the two
+  pre-existing T08 status tests; disabled-extension early-exit asserted.
+
+### Review fixes (final worker session)
+
+- **B1 (review blocker, fixed)**: `/kiwifs-backup-verify` previously performed
+  backend network reads (`adapter.connect()` + `kiwi_read`) with no private-mode
+  gate, contradicting `docs/privacy.md` (private mode = no network reads in any
+  of the three feature domains, including backup). Fixed in `src/index.ts`: the
+  command now checks `config.privateMode` after the enabled check and returns a
+  visible hold message ("private mode active — backup verify holds all backend
+  reads") before any adapter is constructed. Regression test
+  "private mode holds backup-verify backend reads" (`test/extension.test.ts`):
+  enabled + private-mode synthetic config fixture with `mcp.url` pointed at a
+  local recording listener; asserts the hold notice is emitted and the listener
+  received **zero** requests (gate fires before adapter construction).
+- Review follow-ups (export TOCTOU, error-detail loss, projectId cross-check,
+  null-range skip, bounded probe, export file modes) remain non-blocking and
+  are NOT addressed in this commit; the reviewer classified them as such.
+
+### Checks actually run (final tree)
+
+- `npm run check`: tsc clean, prettier clean, **329 pass / 0 fail**.
+- `npm run pack:check`: package OK; `src/backup/verify.ts` and
+  `src/backup/recovery.ts` included under the `src/` allowlist (6 backup files
+  in the tarball); packed extension loads in Pi RPC.
+- `devenv test`: "Tests passed :)" (full suite + pack smoke inside devenv).
+- No Node 22 re-run this task: T15 adds pure-TypeScript verification/export
+  code with the same language/test APIs as T14 (no new syntax beyond that
+  baseline); Node 24 local run is the evidence for this task and Node ≥22.19
+  remains the engines floor from T14.
+
+### Limits / honest notes (non-blocking)
+
+- `verifyBackup`'s branch-link pass re-parses each chunk a second time instead
+  of reusing the first-pass parse — an efficiency cost only; chunk files are
+  small (64 KiB cap) and verification is an explicit user-invoked command.
+- `entry-count-mismatch` is only reported when chunk ordering is otherwise
+  consistent; a seq self-description mismatch is reported by its own issue, so
+  one corrupt chunk can mask the aggregate count check until it is fixed.
+- `export-summary.md` currently drops blank-line separators between sections
+  (cosmetic; content is complete).
+- Restore-into-Pi and automatic remote deletion remain deferred
+  (architecture §20); export is the approved recovery path for v1.
+- No commit was made in this session; commit is a separate task after
+  independent review. Files changed: `src/index.ts`,
+  `src/backup/verify.ts` (new), `src/backup/recovery.ts` (new),
+  `test/backup-verify.test.ts` (new), `test/extension.test.ts`,
+  `tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`.

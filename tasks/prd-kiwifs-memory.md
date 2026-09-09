@@ -376,11 +376,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Missing, duplicated, reordered and corrupted chunks are detected.
-- [ ] Round-trip fixture recovers all promised fields, with redaction/omissions explicitly represented.
-- [ ] Recovery writes only to an explicit new destination after validation.
-- [ ] Foreign/newer schema versions cannot silently corrupt a local session.
-- [ ] Backup completeness does not claim byte-for-byte fidelity when redaction occurred.
+- [x] Missing, duplicated, reordered and corrupted chunks are detected. _T15: `test/backup-verify.test.ts` — "missing chunk is detected", "duplicated/extra delivered chunk is detected", "reordered chunks are detected (content seq ≠ manifest seq)", "corrupted chunk bytes fail the checksum" (checksum recomputed from delivered bytes, not trusted from the manifest), "manifest completeness — count/range/duplicate-coverage gaps detected", "unlinked parent (branch link into uncovered/later entry) is detected" (`src/backup/verify.ts` `verifyBackup`)._
+- [x] Round-trip fixture recovers all promised fields, with redaction/omissions explicitly represented. _T15: "round-trip export recovers promised fields with redaction/omissions represented" — redacted entries serialized with `redacted: true` + redaction metadata, binary omissions present, synthetic secret asserted absent from every exported byte; `verifyRemoteBackup` (`src/backup/recovery.ts`) reads the delivered tree, flags extra/missing chunks, and `exportBackup` writes files + `export-summary.md`._
+- [x] Recovery writes only to an explicit new destination after validation. _T15: "export refuses existing destination, unverified backups and unsafe paths" — export aborts on an existing target dir (never overwrites), on an unverified backup, and on `PathEscapeError`; restore-into-Pi is NOT attempted (architecture §deferral)._
+- [x] Foreign/newer schema versions cannot silently corrupt a local session. _T15: "foreign/newer schema versions fail closed (manifest and chunk)" — `schema-unsupported` parse failure for `schemaVersion > 1` at both levels; "malformed manifest fails closed (kind, redacted flag, chunk shape)"._
+- [x] Backup completeness does not claim byte-for-byte fidelity when redaction occurred. _T15: "healthy backup verifies; fidelity is redaction-honest" — manifest with a recorded redaction reports `fidelity: "redacted"`, an unredacted one reports the non-byte-identical completeness statement; `redacted: false`-claiming manifests with redaction metadata fail closed._
 
 ### T16 — Implement message board storage and tools
 
