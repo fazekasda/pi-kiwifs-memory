@@ -548,6 +548,13 @@ export class ObserverScheduler {
       enqueuedJob = this.outbox.enqueue({
         kind: "observation",
         scope: this.scope,
+        // The job's durable opId IS the batch opId (T19 long-session fix):
+        // the batch record was persisted BEFORE the model call under this
+        // identity ([P]), crash recovery re-derives under the SAME opId, and
+        // the sender validates payload.opId === job.opId — minting a fresh
+        // job opId here would quarantine EVERY scheduler-produced
+        // observation at delivery (reproduced by the long-session audit).
+        opId: batch.opId,
         idempotencyKey: key,
         payload: {
           opId: batch.opId,
@@ -557,7 +564,19 @@ export class ObserverScheduler {
           inputBudgetTokens: batch.inputBudgetTokens,
           outputBudgetTokens: batch.outputBudgetTokens,
           sourceEntryIds: batch.entryIds,
-          observations: result,
+          // The payload carries the observation ARRAY (T19 long-session fix):
+          // extractors return an ExtractionResult wrapper ({observations:
+          // [...]}) — storing the wrapper instead of the array failed the
+          // sender's payload validation and quarantined EVERY
+          // scheduler-produced observation at delivery (reproduced by the
+          // long-session audit). Array-returning fixtures pass through.
+          observations: Array.isArray(result)
+            ? result
+            : Array.isArray(
+                  (result as { observations?: unknown })?.observations,
+                )
+              ? (result as { observations: unknown[] }).observations
+              : result,
         },
       });
     } catch (err) {

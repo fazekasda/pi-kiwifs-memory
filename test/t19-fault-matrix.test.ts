@@ -42,6 +42,8 @@ import {
   createFakeServer,
   type FakeServerBehavior,
 } from "./fake-mcp-server.ts";
+import { BoardRepository } from "../src/board/repository.ts";
+import { BoardDelivery, DeliveryStateFile } from "../src/board/delivery.ts";
 
 const URL_ = "https://kiwifs.test/mcp";
 const SCOPE = "project/demo-proj";
@@ -139,7 +141,11 @@ function enqueueObservation(store: DurableOutbox, opId: string): OutboxJob {
   });
 }
 
-function backupChunkJob(store: DurableOutbox, sessionId = "s1"): OutboxJob {
+function backupChunkJob(
+  store: DurableOutbox,
+  sessionId = "s1",
+  scope = SCOPE,
+): OutboxJob {
   const entries = [
     {
       id: "e1",
@@ -154,7 +160,7 @@ function backupChunkJob(store: DurableOutbox, sessionId = "s1"): OutboxJob {
   const content = serializeChunk({ sessionId, seq: 1, entries });
   return store.enqueue({
     kind: "backup-chunk",
-    scope: SCOPE,
+    scope,
     idempotencyKey: createHash("sha256")
       .update(`backup:${sessionId}:1`)
       .digest("hex")
@@ -170,10 +176,14 @@ function backupChunkJob(store: DurableOutbox, sessionId = "s1"): OutboxJob {
   });
 }
 
-function boardJob(store: DurableOutbox, opId: string): OutboxJob {
+function boardJob(
+  store: DurableOutbox,
+  opId: string,
+  scope = SCOPE,
+): OutboxJob {
   return store.enqueue({
     kind: "board-message",
-    scope: SCOPE,
+    scope,
     opId,
     idempotencyKey: createHash("sha256")
       .update(`board:demo:${opId}`)
@@ -322,8 +332,13 @@ test("fault matrix: private-mode transition holds sends across all three feature
   const gate = new PrivateModeGate(false, () => new Date(0));
   const w = makeWorker(store, adapter, gate);
   enqueueObservation(store, OP_IDS.privateObs);
-  backupChunkJob(store);
-  boardJob(store, OP_IDS.board);
+  // Three DISTINCT scopes: the worker delivers one job per scope-head per
+  // tick, so each feature job must be its own scope head to be examined and
+  // HELD within a bounded tick loop (previously all three shared one scope
+  // and the "held 3" assertion counted duplicate refs of the SAME head job —
+  // exposed by the T19 hold-dedupe fix).
+  backupChunkJob(store, "s1", "project/demo-proj-backup");
+  boardJob(store, OP_IDS.board, "project/demo-proj-board");
   assert.equal(store.pending().length, 3);
   const writesAtConnect = writeCalls(server);
   gate.enable();
@@ -475,7 +490,7 @@ test("fault matrix: refusal/error strings carry no secret or user-content canari
 test("fault matrix: adversarial retrieval — superseded in-scope, out-of-scope active and keyword-only hybrid leak zero canaries into the pack", async () => {
   const server = createFakeServer();
   server.state.store.set(
-    "demo-proj/memory/observations/2026/01/active-in-scope.md",
+    "project/demo-proj/memory/observations/2026/01/active-in-scope.md",
     [
       "---",
       `scope: ${SCOPE}`,
@@ -485,7 +500,7 @@ test("fault matrix: adversarial retrieval — superseded in-scope, out-of-scope 
     ].join("\n"),
   );
   server.state.store.set(
-    "demo-proj/memory/observations/2026/01/forgotten-leak-attempt.md",
+    "project/demo-proj/memory/observations/2026/01/forgotten-leak-attempt.md",
     [
       "---",
       `scope: ${SCOPE}`,
@@ -505,7 +520,7 @@ test("fault matrix: adversarial retrieval — superseded in-scope, out-of-scope 
     ].join("\n"),
   );
   server.state.hybridAttribution.set(
-    "demo-proj/memory/observations/2026/01/active-in-scope.md",
+    "project/demo-proj/memory/observations/2026/01/active-in-scope.md",
     "keyword only",
   );
   const adapter = new KiwiFSAdapter({
@@ -614,3 +629,427 @@ test("fault matrix: bounded local state after shutdown — outbox state file sta
 function framePack(pack: EvidencePack): string {
   return pack.items.map((i) => `${i.path} ${i.body}`).join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// T19 chunk-1 additions (PRD AC1 remaining gaps): brief-leg cross-scope
+// leakage as a DEDICATED case, malformed SEARCH output, dropped vector jobs,
+// backend upgrade compatibility. Same real pipeline, same fake server.
+// ---------------------------------------------------------------------------
+
+test("fault matrix: brief-leg scope leakage is a dedicated fail-closed case — out-of-scope, superseded and fabricated brief sections never reach the pack", async () => {
+  const server = createFakeServer();
+  const inScope = "project/demo-proj/memory/observations/2026/01/brief-keep.md";
+  // Long benign body: the kept brief section must clear the 25%
+  // minimum-evidence threshold (§13 row 4) so the pack survives WITHOUT the
+  // rebuild path — proving the brief leg itself delivers the record.
+  const filler = "reliable context line for the team.\n".repeat(220);
+  server.state.store.set(
+    inScope,
+    [
+      "---",
+      `scope: ${SCOPE}`,
+      "memory_status: active",
+      "---",
+      `Postgres storage decision (real record body)\n${filler}`,
+    ].join("\n"),
+  );
+  server.state.store.set(
+    "other-proj/memory/observations/2026/01/brief-leak.md",
+    [
+      "---",
+      "scope: project/other-proj",
+      "memory_status: active",
+      "---",
+      `Postgres storage decision ${SECRET_CANARY}`,
+    ].join("\n"),
+  );
+  server.state.store.set(
+    "project/demo-proj/memory/observations/2026/01/brief-stale.md",
+    [
+      "---",
+      `scope: ${SCOPE}`,
+      "memory_status: superseded",
+      "---",
+      `Postgres storage decision ${CONTENT_CANARY}`,
+    ].join("\n"),
+  );
+  // Fabricated brief pack (server-side brief text is untrusted): the
+  // in-scope section's body claims canary content that the STORE does not
+  // contain. The guard must re-read and use ONLY the read-back body.
+  server.behavior.textOverrides = {
+    // Search legs yield nothing (server-side fault analogue): the ONLY
+    // candidate source this cycle is the brief pack.
+    kiwi_search: "malformed: no results",
+    kiwi_search_semantic: "malformed: no results",
+    kiwi_search_hybrid: "malformed: no results",
+    kiwi_brief: [
+      "Brief pack (estimated 512 tokens, budget 4000):",
+      "",
+      `=== ${inScope} ===`,
+      `FABRICATED BRIEF TEXT ${SECRET_CANARY}`,
+      "",
+      "=== other-proj/memory/observations/2026/01/brief-leak.md ===",
+      `Postgres storage decision ${SECRET_CANARY}`,
+      "",
+      "=== project/demo-proj/memory/observations/2026/01/brief-stale.md ===",
+      "Postgres storage decision",
+    ].join("\n"),
+  };
+  const adapter = new KiwiFSAdapter({
+    url: URL_,
+    fetchImpl: server.fetch,
+    ledger: createMemoryLedger(),
+  });
+  await adapter.connect();
+  const coord = new RetrievalCoordinator({
+    adapter,
+    authorizedScopes: [SCOPE],
+    deadlineMs: 2_000,
+    tokenCap: 3_000,
+    generation: 1,
+    redact: identityRedactor,
+    tokenizer: { id: "test", countTokens: (t) => t.split(/\s+/).length },
+  });
+  const outcome = await coord.retrieve(
+    "Postgres storage decision",
+    undefined,
+    "interactive",
+  );
+  assert.equal(outcome.kind, "pack", "the in-scope brief section survives");
+  const pack = (outcome as { pack: EvidencePack }).pack;
+  // Exactly one item: the in-scope record, sourced from the brief leg, with
+  // the REAL read-back body — the fabricated brief text never wins.
+  assert.equal(pack.items.length, 1);
+  assert.equal(pack.items[0]!.path, inScope);
+  assert.equal(pack.items[0]!.leg, "brief");
+  assert.match(pack.items[0]!.body, /real record body/);
+  assert.doesNotMatch(pack.items[0]!.body, /FABRICATED|SYNTHETIC-SECRET/);
+  // Out-of-scope (scope step) and superseded (status step) sections dropped
+  // with visible, content-free degradation notes.
+  assert.ok(
+    pack.degraded.some((d) =>
+      /brief section dropped: guard step 'scope'/.test(d),
+    ),
+    `scope drop disclosed: ${pack.degraded.join(" | ")}`,
+  );
+  assert.ok(
+    pack.degraded.some((d) =>
+      /brief section dropped: guard step 'status'/.test(d),
+    ),
+    `status drop disclosed: ${pack.degraded.join(" | ")}`,
+  );
+  noCanaries(
+    "brief-leak pack",
+    framePack(pack),
+    JSON.stringify(pack.degraded),
+    coord.lastDegradedNote,
+  );
+});
+
+test("fault matrix: malformed SEARCH output fabricates nothing — unparseable lines are skipped, phantom hits are guard-rejected, canaries never leak", async () => {
+  const server = createFakeServer();
+  const real = "project/demo-proj/memory/observations/2026/01/search-hit.md";
+  server.state.store.set(
+    real,
+    [
+      "---",
+      `scope: ${SCOPE}`,
+      "memory_status: active",
+      "---",
+      "Postgres storage decision",
+    ].join("\n"),
+  );
+  server.behavior.textOverrides = {
+    // Mixed garbage: negative score, score-less entry, prose noise — none of
+    // it may fabricate a hit; canaries inside malformed lines never parse.
+    kiwi_search: [
+      `noise line with ${SECRET_CANARY}`,
+      "1. path-without-score (N/A)",
+      "-2. negative/score.md (-1.00)",
+      `3. ${real} (3.00)`,
+      "4. trailing garbage (",
+      `5. ${CONTENT_CANARY}/x.md (high-score)`,
+    ].join("\n"),
+    // A well-formed hit for a path that does not exist: the guard's fresh
+    // read-back must reject it (fabricated candidates never injected).
+    kiwi_search_semantic: [
+      `9. project/demo-proj/memory/observations/2026/01/phantom.md (0.500)`,
+      `phantom score text ${SECRET_CANARY}`,
+    ].join("\n"),
+    // Unknown hybrid attribution strings must not fabricate hits.
+    kiwi_search_hybrid: [
+      `1. ${real} (vector-ish, #1)`,
+      `2. ${real} (both #1)`,
+    ].join("\n"),
+  };
+  const adapter = new KiwiFSAdapter({
+    url: URL_,
+    fetchImpl: server.fetch,
+    ledger: createMemoryLedger(),
+  });
+  await adapter.connect();
+  // Adapter level: parsers return only the well-formed hits — no throw, no
+  // fabrication (parse never throws; callers see empty/partial hits).
+  const fts = await adapter.searchFts("Postgres storage decision");
+  assert.deepEqual(
+    fts.hits.map((h) => h.path),
+    [real],
+  );
+  const hyb = await adapter.searchHybrid("Postgres storage decision");
+  assert.equal(hyb.hits.length, 0, "unknown attribution fabricates no hit");
+  const sem = await adapter.searchSemantic("Postgres storage decision");
+  assert.deepEqual(
+    sem.hits.map((h) => h.path),
+    ["project/demo-proj/memory/observations/2026/01/phantom.md"],
+  );
+
+  const coord = new RetrievalCoordinator({
+    adapter,
+    authorizedScopes: [SCOPE],
+    deadlineMs: 2_000,
+    tokenCap: 3_000,
+    generation: 1,
+    redact: identityRedactor,
+    tokenizer: { id: "test", countTokens: (t) => t.split(/\s+/).length },
+  });
+  const outcome = await coord.retrieve(
+    "Postgres storage decision",
+    undefined,
+    "interactive",
+  );
+  assert.equal(outcome.kind, "pack");
+  const pack = (outcome as { pack: EvidencePack }).pack;
+  // Only the real record entered the pack; the phantom was guard-rejected.
+  assert.deepEqual(
+    pack.items.map((i) => i.path),
+    [real],
+  );
+  assert.ok(
+    pack.degraded.some((d) =>
+      /candidate rejected: guard step 'read-back'/.test(d),
+    ),
+    `phantom rejection disclosed: ${pack.degraded.join(" | ")}`,
+  );
+  noCanaries(
+    "malformed-search pack",
+    framePack(pack),
+    JSON.stringify(pack.degraded),
+    coord.lastDegradedNote,
+  );
+});
+
+test("fault matrix: dropped vector jobs — a dropped INDEX job keeps the record recallable via FTS with B4 under-recall disclosed; a dropped DELETE job's ghost is read-back-rejected", async () => {
+  const server = createFakeServer();
+  const droppedIndex =
+    "project/demo-proj/memory/observations/2026/01/dropped-index.md";
+  const droppedIndex2 =
+    "project/demo-proj/memory/observations/2026/01/dropped-index-two.md";
+  const droppedDelete =
+    "project/demo-proj/memory/observations/2026/01/dropped-delete.md";
+  const body = (extra: string) =>
+    [
+      "---",
+      `scope: ${SCOPE}`,
+      "memory_status: active",
+      "---",
+      `Postgres storage decision ${extra}`,
+    ].join("\n");
+  server.state.store.set(droppedIndex, body("vector index job dropped"));
+  // A second record whose vector index job was dropped as well: the B4
+  // under-recall measurement then observes 1 semantic hit vs 2 FTS hits.
+  server.state.store.set(droppedIndex2, body("vector index job also dropped"));
+  // Dropped DELETE job: the record was deleted, but the vector index still
+  // carries it (delete job dropped when the queue was full — the concrete
+  // mcp-contracts.md §4 stale-vector fixture).
+  server.state.store.set(droppedDelete, body(`${CONTENT_CANARY} ghost`));
+  server.state.store.delete(droppedDelete);
+  server.state.semanticDropPaths.add(droppedIndex);
+  server.state.semanticDropPaths.add(droppedIndex2);
+  server.state.staleSemanticPaths.add(droppedDelete);
+  server.state.hybridAttribution.set(droppedIndex, "keyword only");
+  server.state.hybridAttribution.set(droppedIndex2, "keyword only");
+  server.state.hybridAttribution.set(droppedDelete, "semantic only");
+  const adapter = new KiwiFSAdapter({
+    url: URL_,
+    fetchImpl: server.fetch,
+    ledger: createMemoryLedger(),
+  });
+  await adapter.connect();
+  const coord = new RetrievalCoordinator({
+    adapter,
+    authorizedScopes: [SCOPE],
+    deadlineMs: 2_000,
+    tokenCap: 3_000,
+    generation: 1,
+    redact: identityRedactor,
+    tokenizer: { id: "test", countTokens: (t) => t.split(/\s+/).length },
+  });
+  const outcome = await coord.retrieve(
+    "Postgres storage decision",
+    undefined,
+    "interactive",
+  );
+  assert.equal(outcome.kind, "pack");
+  const pack = (outcome as { pack: EvidencePack }).pack;
+  const paths = pack.items.map((i) => i.path);
+  // Dropped INDEX job: the record is still recallable (FTS leg), never
+  // claimed as a semantic hit, and the under-recall is MEASURED (B4 note).
+  assert.ok(
+    paths.includes(droppedIndex),
+    "dropped-index record still recalled",
+  );
+  const idxItem = pack.items.find((i) => i.path === droppedIndex)!;
+  assert.notEqual(idxItem.leg, "semantic");
+  // B4 measurement: the dropped index job made the semantic leg return one
+  // hit fewer than FTS for this scope — the shortfall is REPORTED.
+  assert.ok(
+    pack.degraded.some((d) =>
+      /semantic scope leg under-recall \(B4 post-candidate filter\): 1 semantic hit\(s\) vs 2 FTS hit\(s\)/.test(
+        d,
+      ),
+    ),
+    `B4 under-recall measured: ${pack.degraded.join(" | ")}`,
+  );
+  assert.ok(
+    pack.degraded.some((d) =>
+      /hybrid search degraded: results lack full semantic attribution/.test(d),
+    ),
+    "keyword-only hybrid degradation disclosed",
+  );
+  // Dropped DELETE job: the ghost is surfaced by the vector leg but the
+  // read-back predicate rejects it — never injected.
+  assert.ok(
+    !paths.includes(droppedDelete),
+    "dropped-delete ghost excluded by read-back",
+  );
+  assert.ok(
+    pack.degraded.some((d) =>
+      /candidate rejected: guard step 'read-back'/.test(d),
+    ),
+    `ghost rejection disclosed: ${pack.degraded.join(" | ")}`,
+  );
+  noCanaries(
+    "dropped-vector pack",
+    framePack(pack),
+    JSON.stringify(pack.degraded),
+    coord.lastDegradedNote,
+  );
+});
+
+test("fault matrix: backend upgrade — additive tools/version are tolerated (capability-driven, no count); a regressive upgrade fails closed BEFORE any mutation; additive output-shape evolution parses unchanged", async () => {
+  // (a) Additive upgrade: more tools, newer server version — connect
+  // succeeds, capabilities are recorded, the real delivery pipeline works.
+  {
+    const store = DurableOutbox.open(newDir("upgrade-additive"), { now });
+    const server = createFakeServer({
+      extraTools: ["kiwi_graph_walk", "kiwi_future_thing"],
+      serverVersion: "9.9.9",
+    });
+    const adapter = new KiwiFSAdapter({
+      url: URL_,
+      fetchImpl: server.fetch,
+      ledger: store.ledger(),
+      requestTimeoutMs: 1_000,
+    });
+    const caps = await adapter.connect();
+    assert.ok(
+      caps.tools.includes("kiwi_future_thing"),
+      "new tools are recorded, never a count gate",
+    );
+    const w = makeWorker(store, adapter);
+    const job = enqueueObservation(store, OP_IDS.outage);
+    const tick = await w.tick();
+    assert.deepEqual(
+      tick.sent,
+      [job.opId],
+      "delivery works on an upgraded backend",
+    );
+    assert.ok(
+      [...server.state.store.keys()].some((p) =>
+        p.includes("memory/observations/"),
+      ),
+    );
+    store.close();
+  }
+  // (b) Regressive upgrade: a required tool disappeared. connect() fails
+  // closed BEFORE any mutation — the request log proves no write attempt.
+  {
+    const server = createFakeServer({ removeTools: ["kiwi_brief"] });
+    const adapter = new KiwiFSAdapter({
+      url: URL_,
+      fetchImpl: server.fetch,
+      ledger: createMemoryLedger(),
+    });
+    await assert.rejects(
+      adapter.connect(),
+      /missing required tools: kiwi_brief/,
+    );
+    const mutations = server.state.requests.filter(
+      (r) =>
+        r.body.includes('"kiwi_write"') || r.body.includes('"kiwi_delete"'),
+    );
+    assert.equal(mutations.length, 0, "no mutation before capability gate");
+  }
+  // (c) Additive output-shape evolution: unknown extra lines in changes and
+  // search results are tolerated — parsing neither fabricates nor breaks,
+  // and a board delivery cycle still completes over the evolved shape.
+  {
+    const server = createFakeServer({
+      textOverrides: {
+        kiwi_changes: [
+          "- A board/dev/0123456789abcdef0123456789abcdef.md (actor: alice, 2026-09-08T00:00:00Z)",
+          "",
+          "last_seq: c91d0a4",
+          "extra_field: future-server-metadata",
+          "trailing evolution line without a key",
+        ].join("\n"),
+      },
+    });
+    const adapter = new KiwiFSAdapter({
+      url: URL_,
+      fetchImpl: server.fetch,
+      ledger: createMemoryLedger(),
+    });
+    await adapter.connect();
+    const changes = await adapter.changes("");
+    assert.equal(changes.changes.length, 1);
+    assert.equal(changes.lastSeq, "c91d0a4");
+    // The delivery cycle consumes the evolved feed shape unchanged.
+    const repo = new BoardRepository(adapter, {
+      now: () => new Date("2026-09-08T00:00:00Z"),
+    });
+    const state = new DeliveryStateFile(newDir("upgrade-shape"), "consumer-a");
+    const delivered: string[] = [];
+    const delivery = new BoardDelivery({
+      repo,
+      state,
+      deliver: (m) => void delivered.push(m.msgId),
+      schedule: false,
+      activePollMs: 1000,
+      recipient: "them",
+    });
+    server.state.store.set(
+      "board/dev/0123456789abcdef0123456789abcdef.md",
+      [
+        "---",
+        "schemaVersion: 1",
+        "id: 0123456789abcdef0123456789abcdef",
+        "type: board-message",
+        "scope: personal",
+        "created: 2026-09-07T00:00:00Z",
+        "sources: []",
+        "status: active",
+        "to: them",
+        "from: alice",
+        "channel: dev",
+        "ttl: ",
+        "---",
+        "evolved-shape body",
+      ].join("\n"),
+    );
+    const cycle = await delivery.runCycle();
+    assert.deepEqual(cycle.delivered, ["0123456789abcdef0123456789abcdef"]);
+    assert.equal(delivered.length, 1);
+    assert.equal(cycle.discoveryFallback, undefined, "feed mode unaffected");
+  }
+});

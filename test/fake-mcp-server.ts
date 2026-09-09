@@ -15,6 +15,10 @@ export interface FakeServerState {
   hybridAttribution: Map<string, "both" | "keyword only" | "semantic only">;
   /** Paths whose FTS index still contains them despite deletion (stale vector analogue). */
   staleFtsPaths: Set<string>;
+  /** Dropped vector-INDEX job analogue: the semantic leg never sees these. */
+  semanticDropPaths: Set<string>;
+  /** Dropped vector-DELETE job analogue: the semantic leg still returns these (they are gone from the store). */
+  staleSemanticPaths: Set<string>;
   changesLog: { action: string; path: string; actor: string; ts: string }[];
   requests: {
     url: string;
@@ -30,6 +34,8 @@ export function createState(): FakeServerState {
     etags: new Map(),
     hybridAttribution: new Map(),
     staleFtsPaths: new Set(),
+    semanticDropPaths: new Set(),
+    staleSemanticPaths: new Set(),
     changesLog: [],
     requests: [],
   };
@@ -49,8 +55,20 @@ export interface FakeServerBehavior {
   stallBodyAfterBytes?: number;
   /** Throw a transport fault the next time this tool is called (once). */
   failToolOnce?: string;
+  /** Replace the successful text result of this tool with raw text. */
+  textOverrides?: Record<string, string>;
+  /** Backend-upgrade analogue: additional tools advertised by tools/list. */
+  extraTools?: string[];
+  /** Backend-downgrade analogue: tools removed from tools/list. */
+  removeTools?: string[];
+  /** Backend-upgrade analogue: bumped serverInfo version string. */
+  serverVersion?: string;
+  /** Live-deployment defect analogue: kiwi_changes IsErrors whenever the feed has entries. */
+  changesFaultWhenPopulated?: boolean;
   /** Drop the Authorization header check (simulate no-auth endpoint). */
   authHeaderSeen?: (value: string | undefined) => void;
+  /** Simulated per-request backend latency in ms (budget measurement). */
+  delayMs?: number;
 }
 
 export interface FakeServer {
@@ -136,6 +154,25 @@ export function createFakeServer(
       return new Response(stream, { status: 200 });
     }
 
+    if (behavior.delayMs !== undefined) {
+      await new Promise<void>((resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        const t = setTimeout(resolve, behavior.delayMs);
+        signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(t);
+            reject(new Error("aborted"));
+          },
+          { once: true },
+        );
+      });
+    }
+
     let req: {
       id?: unknown;
       method?: string;
@@ -181,12 +218,18 @@ export function createFakeServer(
       return {
         protocolVersion: "2025-03-26",
         capabilities: { tools: {} },
-        serverInfo: { name: "kiwifs", version: "1.0.0" },
+        serverInfo: {
+          name: "kiwifs",
+          version: behavior.serverVersion ?? "1.0.0",
+        },
       };
     }
     if (method === "tools/list") {
+      const names = [...TOOL_NAMES, ...(behavior.extraTools ?? [])].filter(
+        (n) => !behavior.removeTools?.includes(n),
+      );
       return {
-        tools: TOOL_NAMES.map((name) => ({
+        tools: names.map((name) => ({
           name,
           inputSchema: { type: "object" },
         })),
@@ -200,7 +243,11 @@ export function createFakeServer(
     }
     const tool = String(params["name"]);
     const args = (params["arguments"] ?? {}) as Record<string, unknown>;
-    return callTool(tool, args);
+    const result = await callTool(tool, args);
+    if (behavior.textOverrides?.[tool] !== undefined) {
+      return textResult(behavior.textOverrides[tool] as string);
+    }
+    return result;
   }
 
   function textResult(text: string, meta?: Record<string, unknown>): unknown {
@@ -352,6 +399,8 @@ export function createFakeServer(
         const limit = Math.min(Number(args["limit"] ?? 5) || 5, 50);
         const hits: string[] = [];
         for (const [p, c] of state.store) {
+          // Dropped vector-index job: the semantic leg never indexed it.
+          if (state.semanticDropPaths.has(p)) continue;
           if (!c.includes(query)) continue;
           const scope = args["scope"];
           if (typeof scope === "string") {
@@ -360,6 +409,11 @@ export function createFakeServer(
           }
           hits.push(p);
           if (hits.length >= limit) break;
+        }
+        // Dropped vector-DELETE job: the vector index still carries ghosts.
+        for (const p of state.staleSemanticPaths) {
+          if (hits.length >= limit) break;
+          if (!hits.includes(p)) hits.push(p);
         }
         return textResult(
           hits
@@ -372,7 +426,11 @@ export function createFakeServer(
         if (typeof query !== "string" || query === "")
           return errorResult("query is required");
         const hits: string[] = [];
-        for (const p of [...state.store.keys(), ...state.staleFtsPaths]) {
+        for (const p of [
+          ...state.store.keys(),
+          ...state.staleFtsPaths,
+          ...state.staleSemanticPaths,
+        ]) {
           const c = state.store.get(p);
           if (c !== undefined && !c.includes(query)) continue;
           hits.push(p);
@@ -409,6 +467,14 @@ export function createFakeServer(
           typeof since === "string" && since !== ""
             ? state.changesLog.filter((e) => e.ts > since)
             : state.changesLog;
+        // Live-deployment defect analogue (t19-live-report.json): the feed
+        // IsErrors with an internal server error whenever entries exist,
+        // while a quiet feed answers (empty, no last_seq).
+        if (behavior.changesFaultWhenPopulated && log.length > 0) {
+          return errorResult(
+            "Changes failed: internal server error (HTTP 500)",
+          );
+        }
         const limit = Math.min(Number(args["limit"] ?? 50) || 50, 500);
         const lines = log
           .slice(0, limit)

@@ -461,7 +461,11 @@ export function buildBoardInboxTool(
           snap.nextPollInMs !== undefined
             ? ` nextPollInMs=${snap.nextPollInMs}`
             : ""
-        }${snap.lastError ? ` lastError=${snap.lastError}` : ""}`,
+        }${snap.lastError ? ` lastError=${snap.lastError}` : ""}${
+          snap.discoveryFallback
+            ? " discovery=listing-fallback (changes feed rejected; bounded query_meta discovery in use)"
+            : ""
+        }`,
       ];
       if (inbox.unread === 0) {
         lines.push("Inbox: empty (no delivered-unacknowledged messages).");

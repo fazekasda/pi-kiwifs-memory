@@ -7,3 +7,5 @@ dist/
 package-lock.json
 devenv.lock
 config/kiwifs-test.local.json
+tasks/evidence/t19-budget-report.json
+tasks/evidence/t19-long-session-report.json

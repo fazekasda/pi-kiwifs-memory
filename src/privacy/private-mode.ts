@@ -44,6 +44,9 @@ export interface PendingJobRef {
 }
 
 export class PrivateModeGate {
+  /** Transition-log bound (T19 long-session audit): metadata-only FIFO cap. */
+  static readonly MAX_EVENTS = 100;
+
   private privateMode: boolean;
   private readonly events: PrivateModeEvent[] = [];
   private readonly held: PendingJobRef[] = [];
@@ -69,7 +72,7 @@ export class PrivateModeGate {
       features: ["observation", "backup", "board"],
       heldJobs: this.held.length,
     };
-    this.events.push(event);
+    this.pushEvent(event);
     return event;
   }
 
@@ -85,7 +88,7 @@ export class PrivateModeGate {
       features: ["observation", "backup", "board"],
       heldJobs: released.length,
     };
-    this.events.push(event);
+    this.pushEvent(event);
     for (const listener of this.releaseListeners) {
       listener(released);
     }
@@ -101,10 +104,17 @@ export class PrivateModeGate {
    * Registers a job as pending. While private mode is active the job is
    * HELD (never sent, never dropped); otherwise it is immediately sendable
    * and the caller proceeds.
+   *
+   * Deduped by opId (T19 long-session fix): the outbox worker re-holds the
+   * SAME pending job on every tick while private mode is active, so the raw
+   * per-tick push would grow the held set (and the resume release list)
+   * linearly with tick count. One ref per distinct job is the actual state.
    */
   holdWhilePrivate(job: PendingJobRef): { held: boolean } {
     if (this.privateMode) {
-      this.held.push(job);
+      if (!this.held.some((h) => h.opId === job.opId)) {
+        this.held.push(job);
+      }
       return { held: true };
     }
     return { held: false };
@@ -128,6 +138,14 @@ export class PrivateModeGate {
   /** Gate for creating new capture/backup/board jobs. */
   assertCaptureAllowed(feature: FeatureDomain): void {
     if (this.privateMode) throw new PrivateModeActiveError(feature);
+  }
+
+  /** Bounded transition log: metadata-only FIFO cap (oldest dropped). */
+  private pushEvent(event: PrivateModeEvent): void {
+    this.events.push(event);
+    if (this.events.length > PrivateModeGate.MAX_EVENTS) {
+      this.events.splice(0, this.events.length - PrivateModeGate.MAX_EVENTS);
+    }
   }
 
   private lastEvent(): PrivateModeEvent {

@@ -44,7 +44,12 @@ import {
   readFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { boardChannelOfPath, type BoardRepository } from "./repository.ts";
+import { isRetryable } from "../backend/errors.ts";
+import {
+  boardChannelOfPath,
+  boardMsgIdOfPath,
+  type BoardRepository,
+} from "./repository.ts";
 
 export const DELIVERY_SCHEMA_VERSION = 1;
 
@@ -57,6 +62,18 @@ export const BACKLOG_PAUSE_THRESHOLD = 500;
 /** Bounded catch-up: pages of ≤500 changes per cycle (§6 bound). */
 export const MAX_CHANGES_PAGES_PER_CYCLE = 20;
 export const CHANGES_PAGE_LIMIT = 500;
+/**
+ * Fallback-discovery bounds (T19): when the changes feed fails with a
+ * non-retryable domain rejection (the live deployment's IsError HTTP 500 —
+ * t19-live-report.json), the cycle falls back to ONE bounded
+ * `kiwi_query_meta` listing pass (MCP-only; same primitives as repo.list).
+ * ≤20 pages of ≤200 raw rows, ≤1000 kept board paths per cycle — bounds are
+ * visible, a truncated listing is DISCLOSED (`listingTruncated`), and the
+ * per-cycle bound never drops undelivered work: the backlog pause plus
+ * dedupe carry it to the next cycle.
+ */
+export const MAX_LISTING_PAGES_PER_CYCLE = 20;
+export const MAX_LISTING_PATHS_PER_CYCLE = 1_000;
 /**
  * Dedupe-set bound. Eviction removes ACKED and skipped entries (oldest
  * first) only — undelivered entries are NEVER evicted, so backlog growth
@@ -275,6 +292,13 @@ export interface DeliveryStatus {
   nextPollInMs?: number;
   lastCycleAt?: number;
   lastError?: string; // error name:code only — never message content
+  /**
+   * True when the last COMPLETED cycle discovered messages through the
+   * bounded query_meta fallback because the changes feed failed with a
+   * non-retryable domain rejection (disclosed degradation — never hidden,
+   * never counted as a healthy feed).
+   */
+  discoveryFallback?: boolean;
 }
 
 export interface CycleResult {
@@ -287,6 +311,15 @@ export interface CycleResult {
   /** Cycle aborted early — backlog pause, private mode, or backend unavailable. */
   paused: boolean;
   pauseReason?: "backlog" | "private" | "unavailable";
+  /**
+   * Set when discovery used the bounded query_meta fallback because the
+   * changes feed failed with a non-retryable domain rejection. The stored
+   * cursor is untouched in fallback mode; dedupe absorbs overlap when the
+   * feed recovers.
+   */
+  discoveryFallback?: "changes-feed-domain-error";
+  /** The fallback listing hit a per-cycle bound — more board paths may exist. */
+  listingTruncated?: boolean;
 }
 
 export interface BoardDeliveryOptions {
@@ -307,6 +340,9 @@ export interface BoardDeliveryOptions {
   backoffCapMs?: number;
   backlogPauseAt?: number;
   maxChangesPages?: number;
+  /** Fallback-discovery bounds (tests may tighten; defaults above). */
+  maxListingPaths?: number;
+  maxListingPages?: number;
   /** Test hook: skip scheduling, only runCycle is exercised. */
   schedule?: boolean;
 }
@@ -328,12 +364,15 @@ export class BoardDelivery {
   private readonly backoffCapMs: number;
   private readonly backlogPauseAt: number;
   private readonly maxChangesPages: number;
+  private readonly maxListingPaths: number;
+  private readonly maxListingPages: number;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
   private stopped = false;
   private consecutiveEmptyPolls = 0;
   private lastCycleAt: number | undefined;
   private lastError: string | undefined;
+  private lastDiscoveryFallback = false;
   private readonly scheduling: boolean;
 
   constructor(opts: BoardDeliveryOptions) {
@@ -348,6 +387,8 @@ export class BoardDelivery {
     this.backoffCapMs = opts.backoffCapMs ?? BACKOFF_CAP_MS;
     this.backlogPauseAt = opts.backlogPauseAt ?? BACKLOG_PAUSE_THRESHOLD;
     this.maxChangesPages = opts.maxChangesPages ?? MAX_CHANGES_PAGES_PER_CYCLE;
+    this.maxListingPaths = opts.maxListingPaths ?? MAX_LISTING_PATHS_PER_CYCLE;
+    this.maxListingPages = opts.maxListingPages ?? MAX_LISTING_PAGES_PER_CYCLE;
     this.scheduling = opts.schedule ?? true;
   }
 
@@ -401,6 +442,7 @@ export class BoardDelivery {
           ...(this.lastError !== undefined
             ? { lastError: this.lastError }
             : {}),
+          ...(this.lastDiscoveryFallback ? { discoveryFallback: true } : {}),
         };
       }
     }
@@ -413,6 +455,7 @@ export class BoardDelivery {
         ? { lastCycleAt: this.lastCycleAt }
         : {}),
       ...(this.lastError !== undefined ? { lastError: this.lastError } : {}),
+      ...(this.lastDiscoveryFallback ? { discoveryFallback: true } : {}),
     };
   }
 
@@ -465,27 +508,66 @@ export class BoardDelivery {
       // segment replays next cycle and the local dedupe set absorbs the
       // already-handled messages — undelivered work is never lost.
       let lastSeqSeen: string | undefined;
+      let fallbackReason: CycleResult["discoveryFallback"];
+      let listingTruncated = false;
       const seenThisCycle = new Set<string>();
       const pending: { path: string; msgId: string; channel: string }[] = [];
-      for (let page = 0; page < this.maxChangesPages; page++) {
-        const feed = await this.fetchChanges(since);
-        result.pages++;
-        result.changes += feed.changes.length;
-        for (const c of feed.changes) {
-          const channel = boardChannelOfPath(c.path);
-          if (channel === undefined) continue; // not a board path
-          const msgId = msgIdOfPath(c.path);
-          if (msgId === undefined) continue;
+      try {
+        for (let page = 0; page < this.maxChangesPages; page++) {
+          const feed = await this.fetchChanges(since);
+          result.pages++;
+          result.changes += feed.changes.length;
+          for (const c of feed.changes) {
+            const channel = boardChannelOfPath(c.path);
+            if (channel === undefined) continue; // not a board path
+            const msgId = boardMsgIdOfPath(c.path);
+            if (msgId === undefined) continue;
+            if (this.state.getEntry(msgId) !== undefined) continue; // dedupe
+            if (seenThisCycle.has(msgId)) continue; // overlapping pages
+            seenThisCycle.add(msgId);
+            pending.push({ path: c.path, msgId, channel });
+            empty = false;
+          }
+          if (feed.lastSeq === undefined || feed.lastSeq === since) break;
+          since = feed.lastSeq;
+          lastSeqSeen = feed.lastSeq;
+          if (feed.changes.length === 0) break;
+        }
+      } catch (err) {
+        // Availability faults (transport/network) pause the cycle: message
+        // state is unknown, discovery must NOT switch primitives mid-outage.
+        if (isRetryable(err)) throw err;
+        // Non-retryable domain rejection (IsError result — observed live as
+        // a persistent server-side HTTP 500 whenever the feed has entries).
+        // The feed is functionally broken for delivery, so this cycle falls
+        // back to ONE bounded MCP-only listing pass (repo discovery above).
+        // Same read/parse/TTL/dedupe/recipient pipeline follows; the stored
+        // cursor is untouched and the fallback is DISCLOSED, never silent.
+        // This is a disclosure of a degraded backend, not a health claim.
+        fallbackReason = "changes-feed-domain-error";
+        this.lastError = errorFingerprint(err);
+        // Already-handled paths are excluded so the per-cycle bound cannot
+        // starve the backlog behind a stable listing order.
+        const exclude = new Set<string>(seenThisCycle);
+        for (const e of Object.values(this.state.value.entries)) {
+          exclude.add(e.path);
+        }
+        const listing = await this.repo.listAllBoardMessagePaths({
+          maxPaths: this.maxListingPaths,
+          maxPages: this.maxListingPages,
+          exclude,
+        });
+        listingTruncated = listing.truncated;
+        for (const p of listing.paths) {
+          const channel = boardChannelOfPath(p);
+          const msgId = boardMsgIdOfPath(p);
+          if (channel === undefined || msgId === undefined) continue;
           if (this.state.getEntry(msgId) !== undefined) continue; // dedupe
-          if (seenThisCycle.has(msgId)) continue; // overlapping pages
+          if (seenThisCycle.has(msgId)) continue;
           seenThisCycle.add(msgId);
-          pending.push({ path: c.path, msgId, channel });
+          pending.push({ path: p, msgId, channel });
           empty = false;
         }
-        if (feed.lastSeq === undefined || feed.lastSeq === since) break;
-        since = feed.lastSeq;
-        lastSeqSeen = feed.lastSeq;
-        if (feed.changes.length === 0) break;
       }
       // Server ordering is not trusted (live sort unverified): deliver in
       // created order after reading, oldest first.
@@ -581,6 +663,10 @@ export class BoardDelivery {
         // cycle (unavailable/private) must not inflate backoff.
         this.consecutiveEmptyPolls = empty ? this.consecutiveEmptyPolls + 1 : 0;
         if (lastSeqSeen !== undefined) this.state.setLastSeq(lastSeqSeen);
+        this.lastDiscoveryFallback = fallbackReason !== undefined;
+        if (fallbackReason !== undefined)
+          result.discoveryFallback = fallbackReason;
+        if (listingTruncated) result.listingTruncated = true;
       }
       return result;
     } catch (err) {
@@ -608,14 +694,6 @@ export class BoardDelivery {
     const res = await this.repo.changes(since, { limit: CHANGES_PAGE_LIMIT });
     return { changes: res.changes, lastSeq: res.lastSeq };
   }
-}
-
-/** msg_id is the hex file name stem of a board path (board/{channel}/{id}.md). */
-function msgIdOfPath(path: string): string | undefined {
-  const m = /^board\/[a-z0-9][a-z0-9-]{0,63}\/([0-9a-f]{16,64})\.md$/.exec(
-    path,
-  );
-  return m?.[1];
 }
 
 /** Error fingerprint for durable status: name:code only, never a message. */

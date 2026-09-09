@@ -270,6 +270,90 @@ export class BoardRepository {
   }
 
   /**
+   * Cross-channel board-message discovery via `kiwi_query_meta` (T19).
+   *
+   * Fallback discovery primitive for the changes-feed failure mode observed
+   * live (persistent server-side IsError HTTP 500 whenever the feed has
+   * entries — tasks/evidence/t19-live-report.json): the board's ONLY inbound
+   * discovery was the feed, so a broken feed silently killed delivery.
+   *
+   * Contract basis (mcp-contracts.md §3/§5, MCP-only — no REST fallback):
+   * `kiwi_query_meta` takes exact frontmatter filters `$.field=value` with
+   * limit/offset pagination. Every message THIS extension delivers must
+   * parse as a `type: board-message` record (the read path rejects anything
+   * else as malformed), so filtering on `type` selects exactly the
+   * deliverable message set. Paths are still re-checked against the strict
+   * board-path shape — query results are never trusted as a boundary.
+   *
+   * Bounded: pages of ≤BOARD_LIST_MAX paths, at most `maxPages` pages, at
+   * most `maxPaths` kept; a page with no newly kept paths ends paging (also
+   * guards against offset-ignoring backends). `truncated: true` discloses a
+   * bound stop — callers surface it, never hide it. Adapter errors propagate
+   * (availability vs domain classification stays at the caller); private
+   * mode refuses before any network read.
+   */
+  async listAllBoardMessagePaths(
+    opts: {
+      maxPaths?: number;
+      maxPages?: number;
+      /** Paths already handled upstream (delivery dedupe) — never counted
+       * against the bound, so a bounded cycle cannot starve the backlog on a
+       * stable listing order. */
+      exclude?: ReadonlySet<string>;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<{ ok: true; paths: string[]; truncated: boolean }> {
+    this.assertNotPrivate();
+    const limit = BOARD_LIST_MAX;
+    const maxPages = opts.maxPages ?? 20;
+    const maxPaths = Math.max(1, opts.maxPaths ?? 1000);
+    const exclude = opts.exclude;
+    const seen = new Set<string>();
+    let offset = 0;
+    let truncated = false;
+    let lastPageRawCount = 0;
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.adapter.queryMeta(
+        { type: "board-message" },
+        { ...(offset !== 0 ? { offset } : {}), limit, signal: opts.signal },
+      );
+      let rawCount = 0;
+      for (const line of res.text.split("\n")) {
+        const m = /^path:\s*(\S+)/.exec(line);
+        if (!m) continue;
+        rawCount++;
+        const p = m[1] as string;
+        // Strict board-path shape (same predicate the delivery read applies).
+        if (boardChannelOfPath(p) === undefined) continue;
+        if (boardMsgIdOfPath(p) === undefined) continue;
+        if (exclude?.has(p)) continue; // handled upstream — never re-listed
+        if (seen.has(p)) continue;
+        if (seen.size >= maxPaths) {
+          truncated = true;
+          break;
+        }
+        seen.add(p);
+      }
+      // Empty page = exhausted listing. A page of only already-handled rows
+      // does NOT stop paging (that would starve the backlog behind a stable
+      // listing order); the page bound and the offset-ignoring case are
+      // covered by maxPages and the truncated disclosure instead.
+      if (rawCount === 0 || truncated) {
+        lastPageRawCount = rawCount;
+        break;
+      }
+      lastPageRawCount = rawCount;
+      offset += limit;
+    }
+    // A stop at the page bound with rows still arriving on the last page can
+    // mean an exhausted listing OR an offset-ignoring backend — not knowable
+    // from the observed evidence, so disclose truncation (never a silent
+    // false-complete).
+    if (truncated || lastPageRawCount > 0) truncated = true;
+    return { ok: true, paths: [...seen], truncated };
+  }
+
+  /**
    * Reads one message fresh from the backend (no trust in cached listings):
    * containment check → parse → client-side TTL. Expired messages are a
    * visible typed result, never silently dropped by the backend (B5: no
@@ -369,6 +453,18 @@ export function boardChannelOfPath(path: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * msg_id is the hex file name stem of a board path (board/{channel}/{id}.md).
+ * Exported so the delivery layer and the fallback discovery share ONE strict
+ * path predicate (never a looser local re-implementation).
+ */
+export function boardMsgIdOfPath(path: string): string | undefined {
+  const m = /^board\/[a-z0-9][a-z0-9-]{0,63}\/([0-9a-f]{16,64})\.md$/.exec(
+    path,
+  );
+  return m?.[1];
 }
 
 /** Kept local: path previews must never carry body content into errors. */

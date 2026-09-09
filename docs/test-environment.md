@@ -73,3 +73,8 @@ manifest-owned cleanup, zero leftovers):
   to report upstream, not a product blocker.
 - Post-delete absence verified; deletion is MCP-level only (no Git-history,
   index or backup purge claim).
+- Delivery consequence (T19): because inbound board discovery was feed-only,
+  the broken feed silently killed board delivery on this deployment. T19
+  remediated it with a bounded MCP-only `kiwi_query_meta` listing fallback
+  (architecture.md §8, disclosed degradation); the outbox remains
+  outbound-only and is never a substitute for inbound discovery.

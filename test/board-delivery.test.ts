@@ -24,7 +24,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { KiwiFSAdapter } from "../src/backend/adapter.ts";
-import { AvailabilityError } from "../src/backend/errors.ts";
+import { AvailabilityError, ValidationError } from "../src/backend/errors.ts";
 import { createMemoryLedger } from "../src/backend/opid.ts";
 import { deriveMsgPath } from "../src/backend/ids.ts";
 import { buildBoardMessage } from "../src/board/messages.ts";
@@ -562,3 +562,296 @@ function harnessClone(): Harness {
   Object.assign(h, fresh);
   return fresh;
 }
+// ---------------------------------------------------------------------------
+// T19: changes-feed failure (live deployment defect analogue) and the bounded
+// MCP-only listing fallback. Live evidence (tasks/evidence/t19-live-report.json):
+// kiwi_changes returns a server-side IsError "internal server error (HTTP 500)"
+// whenever the feed has entries. Inbound board discovery was feed-only, so
+// this defect silently killed delivery; the outbox is OUTBOUND-only and never
+// discovers inbound messages (pinned below). The fallback uses the verified
+// query_meta primitive (mcp-contracts.md §3/§5) — no REST, nothing weakened.
+// ---------------------------------------------------------------------------
+
+test("changes-feed domain rejection pauses discovery when the fallback is unavailable too (cursor untouched, nothing delivered)", async () => {
+  const h15 = harnessClone();
+  const msg = h15.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-15",
+    body: "stranded",
+    ts: "s1",
+  });
+  // Feed rejects with the live IsError shape; the listing fallback ALSO
+  // rejects (worst case: the whole backend meta surface is degraded).
+  const deadRepo = {
+    changes: () =>
+      Promise.reject(
+        new ValidationError(
+          "backend rejected kiwi_changes: Changes failed: internal server error (HTTP 500)",
+          "kiwi_changes",
+        ),
+      ),
+    listAllBoardMessagePaths: () =>
+      Promise.reject(
+        new ValidationError(
+          "backend rejected kiwi_query_meta: internal server error",
+          "kiwi_query_meta",
+        ),
+      ),
+  } as unknown as BoardRepository;
+  const state = new DeliveryStateFile(
+    mkdtempSync(join(tmpdir(), "kiwifs-fb-")),
+    "consumer-a",
+  );
+  const delivered: DeliveredMessage[] = [];
+  const delivery = new BoardDelivery({
+    repo: deadRepo,
+    state,
+    deliver: (m) => void delivered.push(m),
+    schedule: false,
+    activePollMs: 1000,
+  });
+  const c1 = await delivery.runCycle();
+  assert.equal(c1.paused, true);
+  assert.equal(c1.pauseReason, "unavailable");
+  assert.deepEqual(c1.delivered, []);
+  assert.equal(c1.discoveryFallback, undefined);
+  assert.equal(state.getEntry(msg.msgId), undefined);
+  assert.equal(state.lastSeq, undefined);
+  assert.match(delivery.statusSnapshot().lastError ?? "", /^ValidationError/);
+});
+
+test("changes-feed domain rejection: bounded listing fallback delivers, is disclosed, leaves the cursor untouched, and dedupes on replay", async () => {
+  const h16 = harnessClone();
+  const a = h16.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-16a",
+    body: "via fallback one",
+    ts: "s1",
+  });
+  const b = h16.seed({
+    channel: "other",
+    from: "carol",
+    to: "bob",
+    opId: "op-16b",
+    body: "via fallback two",
+    ts: "s2",
+  });
+  // Live defect analogue: the feed IsErrors whenever it has entries.
+  h16.server.behavior.changesFaultWhenPopulated = true;
+  const d = h16.makeDelivery({ recipient: "bob" });
+  const c1 = await d.delivery.runCycle();
+  assert.deepEqual(c1.delivered.sort(), [a.msgId, b.msgId].sort());
+  assert.equal(c1.discoveryFallback, "changes-feed-domain-error");
+  assert.equal(d.delivered.length, 2);
+  // Cross-channel discovery worked: the fallback is not channel-scoped and
+  // routing stays enforced at read time (recipient policy).
+  assert.ok(d.delivered.some((m) => m.channel === "other"));
+  // Cursor untouched in fallback mode (the feed never answered).
+  assert.equal(d.state.lastSeq, undefined);
+  // Status discloses the degraded discovery mode.
+  assert.equal(d.delivery.statusSnapshot().discoveryFallback, true);
+  // Replay: dedupe suppresses repeats; the fallback still runs (feed still
+  // broken) but delivers nothing new.
+  const c2 = await d.delivery.runCycle();
+  assert.deepEqual(c2.delivered, []);
+  assert.equal(c2.discoveryFallback, "changes-feed-domain-error");
+  assert.equal(d.delivered.length, 2);
+});
+
+test("feed recovery resumes normal discovery without double delivery", async () => {
+  const h17 = harnessClone();
+  const first = h17.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-17a",
+    body: "delivered via fallback",
+    ts: "s1",
+  });
+  h17.server.behavior.changesFaultWhenPopulated = true;
+  const d = h17.makeDelivery({ recipient: "bob" });
+  const c1 = await d.delivery.runCycle();
+  assert.deepEqual(c1.delivered, [first.msgId]);
+  // Feed recovers; a NEW message arrives.
+  delete h17.server.behavior.changesFaultWhenPopulated;
+  const second = h17.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-17b",
+    body: "delivered via feed",
+    ts: "s3",
+  });
+  const c2 = await d.delivery.runCycle();
+  assert.deepEqual(c2.delivered, [second.msgId]);
+  assert.equal(c2.discoveryFallback, undefined, "healthy feed mode disclosed");
+  assert.equal(d.delivery.statusSnapshot().discoveryFallback, undefined);
+  assert.equal(d.delivered.length, 2);
+  // The feed-answered cycle advanced the cursor (normal mode restored).
+  assert.ok(d.state.lastSeq !== undefined);
+});
+
+test("availability fault still pauses (no primitive switch mid-outage); fallback only on non-retryable domain rejections", async () => {
+  const h18 = harnessClone();
+  h18.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-18",
+    body: "during outage",
+    ts: "s1",
+  });
+  // Transport-level outage: changes() throws AvailabilityError. The listing
+  // fallback MUST NOT run — the backend is unreachable either way.
+  const outageRepo = {
+    changes: () => Promise.reject(new AvailabilityError("transport down")),
+    listAllBoardMessagePaths: () => {
+      throw new Error("fallback must not be called during an outage");
+    },
+  } as unknown as BoardRepository;
+  const state = new DeliveryStateFile(
+    mkdtempSync(join(tmpdir(), "kiwifs-fb2-")),
+    "consumer-a",
+  );
+  const delivery = new BoardDelivery({
+    repo: outageRepo,
+    state,
+    deliver: () => {},
+    schedule: false,
+    activePollMs: 1000,
+  });
+  const c1 = await delivery.runCycle();
+  assert.equal(c1.paused, true);
+  assert.equal(c1.pauseReason, "unavailable");
+  assert.equal(c1.discoveryFallback, undefined);
+});
+
+test("outbox board send is outbound-only (read-before-write + write, no listing); inbound discovery needs the delivery cycle's fallback", async () => {
+  const h20 = harnessClone();
+  // A send-capable repo whose adapter ledger we control (durable opId rule).
+  const ledger = createMemoryLedger();
+  const sendAdapter = new KiwiFSAdapter({
+    url: URL_,
+    requestTimeoutMs: 250,
+    fetchImpl: h20.server.fetch,
+    ledger,
+  });
+  await sendAdapter.connect();
+  const sendRepo = new BoardRepository(sendAdapter, {
+    now: () => new Date("2026-09-08T00:00:00Z"),
+  });
+  const opId = "0123456789abcdef0123456789abcdef";
+  ledger.record(opId);
+  const before = h20.server.state.requests.length;
+  const sent = await sendRepo.send(
+    {
+      channel: "outbox-demo",
+      from: "agent-me",
+      to: "agent-them",
+      body: "outbound only",
+    },
+    opId,
+    {},
+  );
+  assert.ok(sent.ok);
+  const sendTools = h20.server.state.requests
+    .slice(before)
+    .map((r) => {
+      try {
+        return String(
+          (JSON.parse(r.body).params as { name?: string } | undefined)?.name ??
+            "?",
+        );
+      } catch {
+        return "?";
+      }
+    })
+    .sort();
+  // The outbound path is read-before-write + write ONLY — no kiwi_query_meta,
+  // no discovery. The outbox NEVER solves inbound discovery.
+  assert.deepEqual(sendTools, ["kiwi_read", "kiwi_write"]);
+
+  // Inbound side: a message from another agent while the feed is broken.
+  const inbound = h20.seed({
+    channel: "dev",
+    from: "alice",
+    to: "agent-me",
+    opId: "op-20",
+    body: "inbound needs delivery",
+    ts: "s1",
+  });
+  h20.server.behavior.changesFaultWhenPopulated = true;
+  const d = h20.makeDelivery({ recipient: "agent-me" });
+  const c1 = await d.delivery.runCycle();
+  assert.deepEqual(c1.delivered, [inbound.msgId]);
+  assert.equal(c1.discoveryFallback, "changes-feed-domain-error");
+  const discoveryCalls = h20.server.state.requests.filter((r) =>
+    r.body.includes('"kiwi_query_meta"'),
+  ).length;
+  assert.ok(discoveryCalls >= 1, "inbound discovery used the listing fallback");
+});
+
+test("repo.listAllBoardMessagePaths bounds an offset-ignoring backend and never duplicates", async () => {
+  const stub = {
+    async queryMeta() {
+      return { text: "path: board/dev/0123456789abcdef0123456789abcdef.md\n" };
+    },
+  };
+  const repo = new BoardRepository(stub as unknown as KiwiFSAdapter);
+  const res = await repo.listAllBoardMessagePaths({ maxPages: 5 });
+  assert.ok(res.ok);
+  assert.deepEqual(res.paths, [
+    "board/dev/0123456789abcdef0123456789abcdef.md",
+  ]);
+  // The page bound was hit with rows still arriving (offset-ignoring
+  // backend): truncation is DISCLOSED, never a silent false-complete.
+  assert.equal(res.truncated, true);
+});
+
+test("truncated fallback listing is disclosed; the backlog carries over to the next cycle (never silent loss)", async () => {
+  const h22 = harnessClone();
+  const a = h22.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-22a",
+    body: "first",
+    ts: "s1",
+  });
+  const b = h22.seed({
+    channel: "dev",
+    from: "alice",
+    to: "bob",
+    opId: "op-22b",
+    body: "second",
+    ts: "s2",
+  });
+  h22.server.behavior.changesFaultWhenPopulated = true;
+  const state = new DeliveryStateFile(h22.dir, "consumer-tight");
+  const delivered: DeliveredMessage[] = [];
+  const tight = new BoardDelivery({
+    repo: h22.repo,
+    state,
+    deliver: (m) => void delivered.push(m),
+    schedule: false,
+    activePollMs: 1000,
+    maxListingPaths: 1,
+    recipient: "bob",
+  });
+  const c1 = await tight.runCycle();
+  assert.equal(c1.delivered.length, 1, "one message per tight cycle");
+  assert.equal(c1.listingTruncated, true, "truncation disclosed");
+  const c2 = await tight.runCycle();
+  assert.equal(c2.delivered.length, 1, "backlog carried, not lost");
+  assert.deepEqual(
+    [...c1.delivered, ...c2.delivered].sort(),
+    [a.msgId, b.msgId].sort(),
+  );
+  // Both cycles disclosed the bound (the exclude-set cannot mask it).
+  assert.equal(c2.listingTruncated, true);
+  assert.equal(delivered.length, 2);
+});

@@ -1867,3 +1867,315 @@ Files changed: `src/backend/live/runner.ts`, `test/live-runner.test.ts`,
 `tasks/evidence/t19-tui-pty-dialog.txt` (new),
 `tasks/evidence/t19-live-report.json` (new), `docs/research/live-mcp-runner.md`,
 `docs/test-environment.md`. No commit (per instructions).
+
+## T19 chunk 2 — remaining AC1 fault-matrix gaps + changes-feed 500 board-delivery remediation (this entry)
+
+Synthetic only (in-process fake MCP server; no live service, no network, no
+model calls). No commit (final worker commits after full acceptance review).
+
+### AC1 gaps closed (real integrated pipeline, `test/t19-fault-matrix.test.ts`, +4 tests)
+
+1. **Brief-leg scope leakage (dedicated).** The fake brief pack (which, per
+   contract, has no scope parameter and ignores `path_prefix`) carries an
+   out-of-scope page, a superseded page and a FABRICATED in-scope section
+   whose body claims canary content absent from the store; search legs are
+   faulted out so brief is the only candidate source. Result: out-of-scope
+   (guard 'scope') and superseded (guard 'status') sections dropped with
+   content-free notes; the kept section is attributed leg `brief` and carries
+   the REAL read-back body — fabricated brief text never wins (the guard
+   re-reads every page; pack ≥ the §13 row 4 minimum-evidence threshold so
+   the brief leg itself delivers, no rebuild).
+2. **Malformed SEARCH output.** Malformed FTS/semantic/hybrid text (negative
+   scores, score-less entries, unknown hybrid attributions, canary-bearing
+   noise): parsers fabricate nothing (adapter-level deep-equal on parsed
+   hits); a well-formed hit for a nonexistent path is rejected by the fresh
+   read-back; no canary reaches the pack or any degraded note; no crash.
+3. **Dropped vector jobs.** Dropped INDEX job (`semanticDropPaths`): record
+   still recalled via FTS/hybrid-keyword-only, never claimed as semantic, and
+   the B4 under-recall is MEASURED and reported (1 semantic vs 2 FTS hits for
+   the scope). Dropped DELETE job (`staleSemanticPaths`): the deleted record's
+   stale vector still surfaces it via the semantic/hybrid legs with
+   `semantic only` attribution; the read-back predicate rejects it — never
+   injected; zero canaries.
+4. **Backend upgrades.** (a) additive upgrade (extra tools in `tools/list`,
+   server version 9.9.9): connect succeeds capability-driven, a real
+   observation delivery completes; (b) regressive upgrade (required tool
+   removed): `connect()` fails closed naming the missing tool BEFORE any
+   mutation (request log has zero writes); (c) additive output-shape
+   evolution (unknown extra lines in changes/search results): parsing
+   tolerates without fabricating, and a board delivery cycle completes over
+   the evolved shape with the feed mode intact.
+
+### Test-fidelity fix (chunk-1 fixture)
+
+The chunk-1 adversarial-retrieval fixture used store paths under
+`demo-proj/memory/…` while the authorized scope is `project/demo-proj`, so
+guard step 4 (path-prefix) rejected every candidate before the asserted
+read-back/scope predicates ran — the fixture's "excluded by the read-back
+predicate / client-side scope gate" assertions were passing VACUOUSLY. All
+fake-server store paths in the matrix now use `project/demo-proj/…`, making
+those assertions real (strictly stronger; no product code changed).
+
+### `kiwi_changes` 500 → actual board delivery: impact, reproduction, remediation
+
+Live evidence (chunk 3, t19-live-report.json): the deployment's
+`kiwi_changes` IsErrors with HTTP 500 whenever the feed has entries. Impact
+assessment: inbound board discovery was feed-ONLY, so on that deployment
+board delivery was silently DEAD — the durable outbox is outbound-only and
+never discovers inbound messages (now pinned by test: the send path issues
+only read-before-write + write, zero listing calls; "the outbox solves
+inbound discovery" is explicitly not claimed anywhere).
+
+Contract assessment: a remediation that satisfies the full delivery
+requirements exists over verified MCP primitives — `kiwi_query_meta`
+(frontmatter filters `$.field=value`, limit/offset pagination,
+mcp-contracts.md §3/§5) filtered on `$.type=board-message` discovers exactly
+the deliverable message set (the delivery read path rejects any
+non-`board-message` record as malformed either way). No REST fallback, no
+weakened gate, no blocker. Implemented:
+
+- `BoardRepository.listAllBoardMessagePaths()`: bounded paginated discovery —
+  page ≤200 raw rows, ≤20 pages, ≤1000 kept paths, strict board-path shape
+  post-filter, offset-ignoring-backend guard, `truncated` disclosure, private
+  mode refuses before any network read; an optional `exclude` set (already-
+  handled paths) keeps the per-cycle bound from starving the backlog behind a
+  stable listing order; a stop at the page bound with rows still arriving is
+  disclosed as truncated (never a silent false-complete).
+- `BoardDelivery.runCycle()`: when the feed fails with a NON-retryable domain
+  rejection (the live IsError shape), the cycle runs ONE bounded listing
+  fallback pass through the SAME read/parse/TTL/dedupe/recipient/deliver
+  pipeline. Availability faults still pause (no primitive switch mid-outage —
+  pinned). The stored cursor is untouched in fallback mode; dedupe absorbs
+  overlap when the feed recovers (pinned). Disclosed via
+  `CycleResult.discoveryFallback` / `listingTruncated`,
+  `DeliveryStatus.discoveryFallback` and the `kiwifs_board_inbox` polling
+  line — a degraded-mode disclosure, never a health claim. architecture.md
+  §8/§12 and test-environment.md updated accordingly.
+
+Tests (`test/board-delivery.test.ts`, +8): live-defect reproduction with the
+fallback unavailable → paused unavailable, nothing delivered, cursor and
+state untouched; fallback delivery across channels with disclosure + dedupe
+on replay; feed recovery → normal mode, no double delivery, cursor advances
+again; availability fault → pause (fallback must not run); outbox send
+request log proves read+write only (outbound-only) while inbound discovery
+uses the fallback listing; offset-ignoring bounded listing; truncation
+disclosure with backlog carried to the next cycle (never silent loss).
+
+### Gates (all re-run after the final edits)
+
+- `npm run check` PASS — typecheck + format + **456 tests** (up from 445)
+- `npm run pack:check` PASS — packed extension loads in Pi RPC
+- `devenv test` PASS
+- **Exact Node floor v22.19.0 verified obtainable and passing**: `npx -y
+node@22.19.0 --test test/*.test.ts` → 456/456 PASS (v22.23 is no longer
+  the only Node-22 evidence).
+
+### Remaining T19 acceptance (honest gaps, unchanged scope)
+
+- AC5: measured retrieval latency / context usage / extraction call volume
+  against the confirmed T02 budgets (2 s deadline, 3,000-token cap,
+  6,000/3,000 extraction batch) — not yet measured.
+- AC6: documented deterministic retrieval-fixture expectations and
+  observation-coverage criteria — not yet documented as a deliverable.
+- AC7: long-session test demonstrating bounded local state and a full
+  active-handle audit after shutdown — partial (bounded state file +
+  closed-store refusal only).
+- Live suite re-run not required this chunk (no runner or product-contract
+  change that would alter live behavior beyond the disclosed fallback; the
+  feed defect itself is server-side and already disclosed in the runner
+  report).
+
+Files changed: `src/board/repository.ts`, `src/board/delivery.ts`,
+`src/board/tools.ts`, `test/fake-mcp-server.ts`,
+`test/t19-fault-matrix.test.ts`, `test/board-delivery.test.ts`,
+`docs/architecture.md`, `docs/test-environment.md`,
+`tasks/plans/T19-chunk1-workplan.md` (new), `tasks/prd-kiwifs-memory.md`,
+`tasks/execution-log.md`. No commit (per instructions).
+
+## T19 chunk 2b — AC5 budget measurements + AC6 documented quality baselines (this entry)
+
+Synthetic only (in-process fake MCP server + scripted extract stub + the
+synthetic tokenizer fixture; no live service, no network, no model calls).
+No commit (final worker commits after full acceptance review).
+
+### AC5 — budgets measured (`test/t19-budgets-quality.test.ts`, 11 tests)
+
+Harness: REAL pipeline (KiwiFSAdapter → fake server, RetrievalCoordinator)
+plus ObserverScheduler with a deterministic scripted extract stub. A new
+additive fake-server knob (`behavior.delayMs`, abort-respecting) simulates
+per-request backend latency. Measured values regenerate
+`tasks/evidence/t19-budget-report.json` on every run.
+
+- **Latency vs the confirmed 2 s total deadline**: 5 retrieval cycles with
+  50 ms simulated latency on EVERY fake-server call (search legs + guard
+  read-backs + brief) measured 959/959/959/960/962/965 ms band (max 965)
+  — inside the budget. Enforcement, not just compliance: 600 ms backend vs
+  a 400 ms configured deadline degraded at 401 ms with zero injection
+  (deadline cut the cycle; the backend delay never overran it).
+- **Context usage vs the confirmed 3,000-token cap**: the REAL
+  cap-enforcement path (`loadConfiguredTokenizer` → buildPack) runs with
+  the synthetic word/punct tokenizer fixture — explicitly labeled NOT
+  production-model-compatible — counting the COMPLETE framed payload: 8
+  offered ≈400-word records → 6 kept, 2,645/3,000 tokens, lowest-ranked
+  dropped first, 25-token framing baseline, identical input re-counts
+  identically (deterministic accounting).
+- **Extraction call volume vs the [P] batching budgets**: batch payload
+  records inputBudgetTokens 6000 / outputBudgetTokens 3000; a 60-entry
+  backlog (~150 tokens/turn) split into 2 disjoint model calls (33+27
+  entries) whose union covers every entry; 12 turns below the token
+  threshold → exactly 1 batch / 1 call with full coverage.
+
+### AC6 — documented deterministic expectations (`docs/t19-quality-baselines.md`)
+
+Named fixtures with EXPLICIT outcomes (exact path sets, exact guard steps,
+exact notes; exact set equalities for coverage) — no percentages, no
+statistics, mock-model limits disclosed up front:
+
+- Retrieval QF-R1 (exact in-scope path set in FTS score order), QF-R2
+  (out-of-scope candidate guard-rejected at the `scope` step), QF-R3
+  (superseded guard-rejected at the `status` step), QF-R4 (keyword-only
+  hybrid disclosed degraded, never counted as semantic), QF-R5 (empty
+  result → empty pack + visible note, no fabrication).
+- Coverage QF-C1 (full-batch coverage: outbox `sourceEntryIds` == batch
+  set), QF-C2 (budget overflow → disjoint sequential batches, complete
+  union), QF-C3 (queue-cap overflow → merge-into-oldest; accepted ∪
+  pending == all entries, disjoint, nothing left unbatched), QF-C4
+  (repeated settles over unchanged coverage → zero model calls), QF-C5
+  (failed extraction → SAME opId + full entry set durably pending).
+- The doc states what this evidence is NOT: no production tokenizer
+  compatibility, no production latency/token-accounting/quality
+  certification, extraction quality not measured (scripted stub).
+
+### Honest limitations
+
+- Latency numbers are client-pipeline overhead under a controlled
+  simulated backend delay — not production network/backend variance.
+- Token counts are fixture counts (word/punct), not model-native counts.
+- Observation "quality" is out of scope for these fixtures (scripted
+  responses); scheduling/coverage/volume only.
+- Node floor: re-verified below with the full gates.
+
+### Gates (all re-run after the final edits)
+
+- `npm run check` PASS — typecheck + format + **467 tests** (up from 456)
+- `npm run pack:check` PASS — packed extension loads in Pi RPC
+- `devenv test` PASS
+- **Exact Node floor v22.19.0 re-verified with the new harness included**:
+  `npx -y node@22.19.0 --test test/*.test.ts` → 467/467 PASS
+  (v22.23 remains excluded as floor evidence)
+
+### Remaining T19 acceptance
+
+- AC7: long-session active-handle audit after shutdown — still partial
+  (out of this chunk's scope).
+- Live suite re-run: not required (no live-contract change; measurement
+  additions are offline-only).
+
+Files changed: `test/t19-budgets-quality.test.ts` (new),
+`test/fake-mcp-server.ts` (+additive `delayMs` knob),
+`docs/t19-quality-baselines.md` (new),
+`tasks/evidence/t19-budget-report.json` (new, synthetic, regenerated),
+`tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`. No commit (per
+instructions).
+
+## T19 chunk 3 (final) — AC7 long-session bounded state + no-active-handles shutdown (this entry)
+
+Synthetic only (in-process fake MCP server + scripted extract stub + synthetic
+tokenizer fixture; no live service, no network, no model calls).
+
+### AC7 — long-session test (`test/t19-long-session.test.ts`, 5 tests)
+
+REAL pipeline end to end (fake server + KiwiFSAdapter + DurableOutbox/worker +
+SessionCoordinator + ObserverScheduler + BackupCapture + BoardDeliveryRuntime
+with its consumer lock + RetrievalCoordinator): 60 cycles (120 extracted
+turns, one backup capture and one guarded retrieval per cycle), private-mode
+windows every 7th cycle, switch every 5th / tree every 10th, full reload
+epochs at cycles 20/40 (store close/reopen, durable-state re-init); teardown
+mirrors the extension's `session_shutdown` order. Measured values regenerate
+`tasks/evidence/t19-long-session-report.json`.
+
+- **Bounded state (measured, final)**: outbox journal 16,285 B / 0 pending /
+  0 quarantined / acked pruned to 1 (retention) — journal growth is
+  manifest-payload proportionality (backup manifests grow with captured
+  content), not leaks; observer state 40 B with 0 pending batches (20-batch
+  cap); delivery dedupe set 2 entries (2,000 cap); board delivery
+  exactly-once across private windows and reloads (durable dedupe set).
+  Coordinator consumed-coverage registry (120 entries / 829 B) and backup
+  state (10,558 B) grow PROPORTIONALLY to consumed entries / captured
+  content by design (coverage correctness, architecture.md §3.3,
+  decisions.md #8) — measured and documented, never claimed as unbounded.
+- **No active handles (measured)**: after session_shutdown the coordinator
+  interval is stopped (`timerRunning=false`), the board consumer lock is
+  released and immediately re-acquirable, the closed store refuses work, and
+  in-process `process.getActiveResourcesInfo()` returns to the pre-test
+  baseline (zero Timeout, zero TCPSocketWrap; only the test's stdio pipe).
+  The dedicated child process
+  (`test/fixtures/t19-long-session-child.ts`) runs the same pipeline under
+  REAL timers (10 ms coordinator tick interval + 10 ms board poll chain,
+  reload epochs included) and must EXIT BY DRAINING after shutdown — it
+  exits in ~1.7–3 s (30 s kill bound) leaving only its stdio pipe
+  (numerical resource counts in the report). A leaked timer, interval or
+  socket would hang the child and fail the test.
+
+### Production defects found by the audit and FIXED (not limit-bumped)
+
+1. **Every scheduler-produced observation quarantined at delivery.** The
+   observation scheduler enqueued extraction jobs with a fresh job opId
+   while the payload carried the batch opId; `parseObservationPayload`
+   requires `payload.opId === job.opId`, so the real pipeline's automatic
+   extractions always failed with `ValidationError` and quarantined. The
+   fault-matrix fixtures hand-built payloads with matching opIds and never
+   delivered scheduler-produced jobs, so this was invisible until the
+   long-session audit. Fix: the job carries the batch's durable opId (the
+   identity persisted BEFORE the model call, [P]; crash recovery re-derives
+   under the SAME opId).
+2. **Observation payload stored the extraction WRAPPER, not the array.**
+   Extractors return `ExtractionResult {observations: [...]}`; the payload
+   stored the wrapper where the sender requires the observation array — a
+   second guaranteed delivery failure. Now normalized (array-returning
+   fixtures pass through unchanged).
+
+### PrivateModeGate bounded-state fixes (defects, not raised limits)
+
+- Held-job refs are DEDUPED by opId: the outbox worker re-holds the same
+  pending job on every tick while private, so the held set (and the resume
+  release list) grew linearly with tick count over a long private session.
+- The transition event log is FIFO-capped at 100 events (metadata only;
+  newest transitions survive).
+- The fault-matrix private-mode fixture was corrected accordingly: its
+  "held 3" assertion had counted duplicate refs of ONE job (all three jobs
+  shared one scope, so the worker only ever examined the scope head). All
+  three feature jobs now use distinct scopes so each is genuinely HELD —
+  the test's intent is now real, not vacuous.
+
+### Honest limitations
+
+- Extraction model is a scripted stub; the retrieval tokenizer is the
+  synthetic word fixture — this evidence measures STATE BOUNDING and HANDLE
+  cleanup, NOT observation quality or production token accounting.
+- Coordinator/backup state proportionality is documented behavior, not an
+  unbounded leak; both are per-session state bounded by session length.
+- Child-drain evidence covers timers/intervals/sockets (ref'd resources);
+  unref'd timers are audited by code review (all six unref sites have
+  cleared/cleared-at-abort paths) and reflected in the drain counts.
+
+### Gates (all re-run after the final edits)
+
+- `npm run check` PASS — typecheck + format + **472 tests** (up from 467)
+- `npm run pack:check` PASS — packed extension loads in Pi RPC
+- `devenv test` PASS
+- **Exact Node floor v22.19.0 re-verified with the long-session harness
+  included** (`npx -y node@22.19.0 --test test/*.test.ts` → 472/472 PASS).
+- Secret scan of all changed/new files: clean (synthetic canaries only).
+
+### Remaining T19 acceptance
+
+- None. AC1–AC7 all closed; PRD T19 marked complete with this entry.
+
+Files changed: `src/observation/scheduler.ts` (opId + observations-array
+delivery fixes), `src/privacy/private-mode.ts` (hold dedupe + FIFO event
+cap), `test/t19-long-session.test.ts` (new),
+`test/fixtures/t19-long-session-child.ts` (new),
+`test/t19-fault-matrix.test.ts` fixture correction, `.prettierignore`
+(+report), `tasks/evidence/t19-long-session-report.json` (new, synthetic,
+regenerated), `tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`.
