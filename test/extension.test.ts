@@ -10,19 +10,26 @@ import kiwifsMemory, {
 } from "../src/index.ts";
 
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
+type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 
 function loadCommand(): Command {
   const commands = new Map<string, Command>();
+  const tools = new Map<string, Tool>();
   const events: string[] = [];
   const api = {
     registerCommand(name: string, command: Command) {
       assert.equal(commands.has(name), false);
       commands.set(name, command);
     },
+    registerTool(tool: Tool) {
+      assert.equal(tools.has(tool.name), false);
+      tools.set(tool.name, tool);
+    },
     on(event: string) {
       events.push(event);
     },
   } satisfies Pick<ExtensionAPI, "registerCommand"> & {
+    registerTool: (tool: Tool) => void;
     on: (event: string) => void;
   };
 
@@ -30,8 +37,19 @@ function loadCommand(): Command {
   // (T08) are registered by event name only.
   kiwifsMemory(api as unknown as ExtensionAPI);
   assert.deepEqual([...commands.keys()], ["kiwifs-status"]);
+  // T13: the two explicit recall tools must be registered at startup.
+  assert.deepEqual([...tools.keys()].sort(), [
+    "kiwifs_memory_read",
+    "kiwifs_memory_search",
+  ]);
+  for (const tool of tools.values()) {
+    assert.ok(tool.description.length > 0);
+    assert.ok(tool.execute);
+  }
   assert.deepEqual([...events].sort(), [
     "agent_settled",
+    "before_agent_start",
+    "context",
     "input",
     "session_before_compact",
     "session_before_fork",

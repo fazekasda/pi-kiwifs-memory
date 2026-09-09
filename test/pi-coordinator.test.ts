@@ -325,6 +325,7 @@ test("headless/RPC safety: handlers never require TUI-only APIs", async () => {
   >();
   const api = {
     registerCommand: () => {},
+    registerTool: () => {},
     on(
       event: string,
       handler: (event: unknown, ctx: unknown) => Promise<void>,
@@ -394,6 +395,7 @@ test("newer state schemaVersion fails closed with a visible error", () => {
   >();
   const api = {
     registerCommand: () => {},
+    registerTool: () => {},
     on(
       event: string,
       handler: (event: unknown, ctx: unknown) => Promise<void>,
