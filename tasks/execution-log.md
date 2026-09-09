@@ -1682,3 +1682,188 @@ tokens/comments only): `docs/memory-lifecycle.md`, `scripts/smoke-package.mjs`,
 `test/discovery.test.ts`, `test/board-lock.test.ts`,
 `test/runtime-controls.test.ts`, `test/t18-commands.test.ts`,
 `tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`.
+
+## T19 chunk 1 — integrated offline fault matrix + queued followUp/repeated-identical gates (this entry)
+
+Implemented and run (synthetic only — in-process fake MCP server; no live
+service, no network, no model calls, no commit):
+
+- `test/t19-fault-matrix.test.ts` (8 tests): the REAL shared pipeline
+  (KiwiFSAdapter over `test/fake-mcp-server.ts`, OutboxWorker with the
+  durable-journal op-id ledger wired exactly like `src/index.ts`,
+  createObservationSender dispatch for observation/backup-chunk/board-message
+  kinds, RetrievalCoordinator) under one matrix:
+  outage (HTTP 500 → AvailabilityError → capped backoff → recovery
+  delivers); crash-after-enqueue → reopen delivers from local state only,
+  replay tick re-writes nothing (B2); conflicting write at the deterministic
+  path fails closed, quarantines with a name:code fingerprint, original
+  backend content intact; private-mode enable holds all three feature kinds
+  with ZERO backend mutation, resume releases and delivers; malformed payload
+  quarantines before any write; refusal/error/degradation leak scan
+  (synthetic secret + user-content canaries absent from quarantine reasons,
+  enqueue-gate refusal, private-mode refusal, settle-drop metadata, adversarial
+  evidence pack); adversarial retrieval — superseded record surfaced by the
+  hybrid/FTS legs is rejected by the read-back predicate, out-of-scope record
+  excluded by the client-side gate, keyword-only hybrid attribution reported
+  as pack-wide degradation and never counted as semantic evidence; bounded
+  outbox state file + closed-store refusal.
+- `test/pi-ordering.test.ts` (+3 tests): closed the fixture-11 occurrence
+  gate — repeated identical QUEUED followUp text registers occurrence-unique
+  packs and consumes them FIFO per occurrence on its own provider call;
+  repeated identical FRESH inputs across turns stay registrable/consumable
+  (occurrence counter defeats the permanent consumed-id set); an identical
+  input whose first pack settled away unmatched is still consumable.
+
+Runtime defects found and fixed (bounded, with the suites re-run):
+
+1. Unref'd bounded abort timers could be dropped while the hung operation was
+   the only pending work, leaving the pending promise never settling
+   (exposed by Node 22.23.2's test runner as "Promise resolution is still
+   pending but the event loop has already resolved"; a real Pi process would
+   only hit it at drain). Fixes: extraction timeout
+   (`src/observation/model.ts`), compact-flush self-timeout
+   (`src/observation/scheduler.ts`), retrieval deadline
+   (`src/retrieval/coordinator.ts`), recall-tool deadline
+   (`src/inject/tools.ts`) are now AUTHORITATIVE (ref'd) — each is bounded
+   by its configured timeout (extraction default cap, compact flush, 2 s RAG
+   deadline), so teardown can be delayed at most by that bound.
+2. Harness finding (documented in the matrix test): the adapter's op-id
+   ledger must be the outbox store's durable journal (as `src/index.ts`
+   wires it); an in-memory ledger fails closed with OpIdNotPersistedError.
+   No product change needed — the wiring contract is now pinned by the
+   matrix test.
+
+Gates after the final edits: `npm run check` PASS (typecheck + format +
+440 tests, up from 429); `npm run pack:check` PASS (packed extension loads
+in Pi RPC, registers commands, headless status flow); `devenv test` PASS.
+Node matrix: Node v24.19.0 (default) and Node v22.23.2 (npx distribution,
+≥22.19.0) — 440/440 PASS under BOTH (automated runs; nothing here is human
+manual signoff).
+
+Remaining for T19 chunks 2+ (honest gaps, tests not weakened):
+
+- Live dedicated MCP suite execution (`npm run test:live` against MCP 8182,
+  manifest-bound cleanup verified after partial failure, bounded duration) —
+  not run in this chunk per instructions (no live service).
+- Live TUI/PTY gate from T18 still open: interactive confirm-dialog flows in
+  a real terminal session; needs an isolated PTY harness with the synthetic
+  config and explicit dialog interaction (chunk 2).
+- Fault-matrix additions: brief-leg scope leakage as a dedicated case,
+  malformed SEARCH output, dropped vector jobs, backend upgrade simulation,
+  cross-feature budget/latency measurement against T02 baselines, long-session
+  active-handle audit.
+
+Files changed: `test/pi-ordering.test.ts`, `test/t19-fault-matrix.test.ts`
+(new), `src/observation/model.ts`, `src/observation/scheduler.ts`,
+`src/retrieval/coordinator.ts`, `src/inject/tools.ts`,
+`tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`.
+No commit (per instructions).
+
+## T19 chunk 3 — opt-in live MCP runner safety fixes + dedicated-space integration acceptance + T18 live TUI/PTY gate (this entry)
+
+Authorized dedicated-space execution only (config/kiwifs-test.local.json consumed
+programmatically; no values, headers or URL ever printed or sent to any model;
+synthetic records under random `integration-tests/{run-id}/` paths; manifest-owned
+cleanup; routing verified before every mutation; no production contact; no REST
+fallback; no model calls).
+
+### Runner safety inspection (src/backend/live/runner.ts) — two defects found and fixed, with tests
+
+1. **Cleanup shared the run's abort signal.** On run-deadline expiry the signal
+   is already aborted, so every manifest-owned cleanup delete threw
+   CancelledError: records were left LIVE on the backend and falsely reported
+   as leftovers — violating the manifest-cleanup-even-after-partial-failure
+   gate. Fix: cleanup uses a fresh AbortController; still bounded because every
+   request carries the transport per-request timeout. Pinned by
+   "run deadline expiry still cleans manifest-owned records (fresh cleanup
+   signal)" (fake server delete delayed past the run deadline).
+2. **Changes-feed step hardened without weakening.** Read-only `kiwi_changes`
+   calls retry once at the runner level (spec permits one retry; a server-side
+   IsError maps to a non-retryable typed error in the adapter). When the feed
+   VERIFIES (record reported), the identical-input replay contract is asserted
+   HARD (divergence = suite failure, never disclosed away). When the backend
+   itself is degraded, the fact is recorded as a disclosed degradation — new
+   outcome `clean-pass-with-degradations` (exit code 5) with a
+   `disclosedDegradations[]` report field — never hidden, never counted as a
+   verified capability. ETag-carrier fact added as a HARD assert on write
+   results (adapter's not_modified fallback depends on it).
+
+New offline tests in `test/live-runner.test.ts` (5 added, file total 10; repo
+total 445, up from 440): degradation disclosure, replay-divergence hard failure,
+deadline-expiry cleanup, ETag-absence failure, contract-facts clean pass
+(changes cursor + hybrid attribution asserted).
+
+### Authorized live execution against the dedicated test space (MCP 8182)
+
+`KIWIFS_LIVE_TESTS=1 npm run test:live` — final run `clean-pass-with-degradations`
+(exit 5), runId `fd4cffcf587a`, bounded (~0.3 s of tool time, run deadline 60 s
+never approached). Facts recorded (redacted; no sensitive raw responses). A sanitized
+machine-readable report of the final run is persisted as
+`tasks/evidence/t19-live-report.json` (pure LiveReport JSON, runId
+`c8c3f769862b`; verified to contain no URLs, headers, tokens or config
+values — tool names, step details, timings and cleanup results only):
+
+- Capability discovery: **71 tools advertised** (KiwiFS v0.19.62 deployment), no
+  REQUIRED_TOOLS missing; adapter stays capability-driven.
+- Routing check BEFORE mutation: sentinel read absent — dedicated-space routing
+  verified (connectivity evidence only; no auth/tenant-isolation claim, ports
+  open / shared infrastructure per test-environment.md).
+- Synthetic CRUD round trip: create → read-back → update verified live; **ETag
+  carrier present on both write results** (T04 probe fact now pinned by the
+  suite); FTS hit disclosed as `pending async indexing` (eventual consistency).
+- Hybrid search surfaced the record with `degraded=true, attribution=keyword
+only` — vector index not ready within the run window; disclosed as supported
+  degradation, never counted as semantic evidence.
+- **`kiwi_changes` is non-functional on this deployment**: persistent server-side
+  IsError `Changes failed: internal server error (HTTP 500)` whenever the feed
+  has entries (all cursor variants: `""`, `"0"`, absent; immediate and after
+  30 s), and an empty feed with NO `last_seq` when the space is quiet — while
+  read-back proves the record exists. Disclosed degradation; the product is
+  unaffected by design (local durable state is authoritative; the feed is a
+  reconciliation aid only — architecture.md §2). Worth reporting upstream to the
+  KiwiFS deployment owner.
+- Delete + post-delete absence verified (MCP-level deletion only — no
+  history/index purge claim).
+- Manifest-owned cleanup: **zero leftovers** across every live run and probe
+  (4 suite runs + 4 bounded read/write probes, each with its own random run id;
+  probe 2/3/4 each created exactly one manifest-owned record, deleted and
+  absence-verified in `finally`).
+
+### T18 live TUI/PTY gate — CLOSED (automated, labeled)
+
+Isolated real-terminal PTY session (herdr sidecar pane created and closed by me;
+no other pane inspected), pi v0.85.0 TUI, isolated HOME/PI_CODING_AGENT_DIR/
+KIWIFS_MEMORY_STATE_DIR temp dirs, synthetic config pointing at an unreachable
+loopback backend (auth by env reference of a dummy token), extension loaded from
+src/index.ts, zero model calls (no prompt sent). `/kiwifs-forget` in the TUI:
+
+- confirm dialog rendered verbatim (title, path, reversibility note, Yes/No
+  selector, key hints) — captured from the live ANSI screen;
+- explicit cancel (down+enter) → `forget cancelled`, no backend call;
+- explicit confirm (enter on Yes) → gated action executed and failed safely
+  with Pi's sanitized `transport fault: fetch failed` extension error (no URL,
+  credentials or content leaked).
+
+Evidence: `tasks/evidence/t19-tui-pty-dialog.txt`, labeled AUTOMATED — this is
+not human manual signoff; a human may still re-run the dialog by hand.
+
+### Gates (all re-run after the final edits)
+
+- `npm run check` PASS — typecheck + format + **445 tests** (up from 440)
+- `npm run pack:check` PASS — packed extension loads in Pi RPC
+- `devenv test` PASS
+- Node matrix: v24.19.0 (default) 445/445; v22.23.2 (npx `node@22`, ≥22.19.0; an
+  alternate node@22 cache may resolve to 22.22.3 — both satisfy the floor and
+  were verified passing) — automated runs only, nothing presented as human signoff.
+- Review nits fixed: "4 added"→"5 added" prose correction (file total 10,
+  verified by test runner); Node 22 provenance clarified (`npx -y node@22`
+  resolves to v22.23.2 in this environment); sanitized machine-readable
+  `LiveReport` JSON persisted (`tasks/evidence/t19-live-report.json`) from a
+  fresh authorized live run, outcome unchanged
+  (`clean-pass-with-degradations`, exit 5, zero leftovers).
+
+Files changed: `src/backend/live/runner.ts`, `test/live-runner.test.ts`,
+`tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`,
+`tasks/evidence/t19-tui-pty-dialog.txt` (new),
+`tasks/evidence/t19-live-report.json` (new), `docs/research/live-mcp-runner.md`,
+`docs/test-environment.md`. No commit (per instructions).

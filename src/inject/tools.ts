@@ -116,11 +116,14 @@ export function buildMemorySearchTool(
         );
       }
       const controller = new AbortController();
+      // The recall deadline is AUTHORITATIVE (T19 runtime fix, mirrors
+      // src/observation/model.ts): ref'd so the bounded abort is guaranteed
+      // to fire while a hung backend call is the only pending work (an
+      // unref'd timer can be dropped when the loop would otherwise drain).
       const timer = setTimeout(
         () => controller.abort(),
         Math.max(0, deps.deadlineMs),
       );
-      timer.unref?.();
       try {
         const scopes = rt.coordinator.scopeSet().slice(0, MAX_SCOPE_QUERIES);
         const byPath = new Map<

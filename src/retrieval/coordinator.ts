@@ -533,8 +533,13 @@ export class RetrievalCoordinator {
       () => controller.abort(),
       Math.max(0, this.deadlineMs),
     );
-    // Never hold process shutdown on the deadline timer.
-    timer.unref?.();
+    // The retrieval deadline is AUTHORITATIVE (T19 runtime fix, mirrors
+    // src/observation/model.ts): the timer stays ref'd so the bounded abort
+    // is guaranteed to fire while a hung backend call is the only pending
+    // work. An unref'd timer can be dropped when the loop would otherwise
+    // drain (exposed by Node 22.23's test runner: a pending retrieval then
+    // never settles; in a real Pi process teardown waits at most the
+    // confirmed 2 s default). Bounded either way.
     const signal = controller.signal;
     const expired = () =>
       signal.aborted || this.now() - started >= this.deadlineMs;

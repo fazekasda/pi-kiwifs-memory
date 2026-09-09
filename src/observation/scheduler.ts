@@ -776,7 +776,10 @@ export class ObserverScheduler {
         () => reject(new Error("compact-flush-timeout")),
         this.compactFlushTimeoutMs,
       );
-      timer.unref?.();
+      // The self-timeout is AUTHORITATIVE (T19 runtime fix, mirrors
+      // src/observation/model.ts): ref'd so the bounded reject is guaranteed
+      // to fire while the hung extraction is the only pending work. Unbounded
+      // hold is impossible either way (bounded by compactFlushTimeoutMs).
     });
     let onAbort: (() => void) | undefined;
     const abort = new Promise<never>((_, reject) => {

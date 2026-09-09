@@ -184,3 +184,175 @@ test("run ids are random and paths stay beneath integration-tests/", () => {
   assert.deepEqual(reasons, []);
   assert.equal(config.safety?.recordPrefix, "integration-tests/");
 });
+
+test("contract facts (T19): changes feed, ETag carrier and hybrid attribution are verified on a clean pass", async () => {
+  const server = createFakeServer();
+  const report = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: server.fetch,
+    randomId: () => "feedface1234",
+  });
+  assert.equal(report.outcome, "clean-pass");
+  const names = report.steps.map((s) => s.name);
+  assert.ok(names.includes("changes-cursor-facts"));
+  assert.ok(names.includes("hybrid-facts"));
+  for (const s of report.steps) {
+    assert.equal(s.ok, true, `step ${s.name} failed: ${s.detail}`);
+  }
+  const changesStep = report.steps.find(
+    (s) => s.name === "changes-cursor-facts",
+  );
+  assert.ok(changesStep?.detail?.includes("created record reported"));
+  assert.ok(changesStep?.detail?.includes("stable"));
+  const hybridStep = report.steps.find((s) => s.name === "hybrid-facts");
+  assert.ok(hybridStep?.detail?.includes("degraded=false"));
+});
+
+test("run deadline expiry still cleans manifest-owned records (fresh cleanup signal)", async () => {
+  const server = createFakeServer();
+  const original = server.fetch;
+  const delayed = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = typeof init?.body === "string" ? init.body : "";
+    if (body.includes('"kiwi_delete"')) {
+      // Outlive the run deadline (200 ms < 600 ms < requestMs 1000): the run
+      // signal aborts while this request is in flight.
+      await new Promise((r) => setTimeout(r, 600));
+    }
+    return original(input, init);
+  }) as typeof fetch;
+  const report = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: delayed,
+    randomId: () => "deadbeef1234",
+    runDeadlineMs: 200,
+  });
+  assert.equal(report.outcome, "suite-failed-after-cleanup");
+  // The defect this pins: cleanup previously shared the (now-aborted) run
+  // signal and every delete failed, leaving the record live on the backend.
+  assert.deepEqual(
+    [...server.state.store.keys()].filter((p) =>
+      p.startsWith("integration-tests/"),
+    ),
+    [],
+    "deadline expiry must not orphan manifest-owned records",
+  );
+  assert.deepEqual(report.cleanup?.leftovers, []);
+});
+
+test("a write result without an ETag fails the ETag contract-fact step", async () => {
+  const server = createFakeServer();
+  const original = server.fetch;
+  const stripped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const res = await original(input, init);
+    const parsed = JSON.parse(await res.text());
+    const text = parsed.result?.content?.[0]?.text;
+    if (typeof text === "string" && text.startsWith("Written ")) {
+      parsed.result.content[0].text = text.replace(/ \(ETag: [^)]+\)/, "");
+    }
+    // The original body is consumed; always rebuild the response.
+    return new Response(JSON.stringify(parsed), { status: res.status });
+  }) as typeof fetch;
+  const report = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: stripped,
+    randomId: () => "e77faced123",
+  });
+  assert.equal(report.outcome, "suite-failed-after-cleanup");
+  assert.ok(
+    report.steps.some(
+      (s) => !s.ok && s.detail?.includes("did not carry an ETag"),
+    ),
+  );
+  // The record was still created before the failure — cleanup must remove it.
+  assert.deepEqual(
+    [...server.state.store.keys()].filter((p) =>
+      p.startsWith("integration-tests/"),
+    ),
+    [],
+  );
+  assert.deepEqual(report.cleanup?.leftovers, []);
+});
+
+test("a broken changes feed is disclosed as a degradation, never hidden (T19)", async () => {
+  const server = createFakeServer();
+  const original = server.fetch;
+  const sabotaged = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = typeof init?.body === "string" ? init.body : "";
+    const res = await original(input, init);
+    const parsed = JSON.parse(await res.text());
+    if (
+      body.includes('"kiwi_changes"') &&
+      parsed.result?.content?.[0]?.text !== undefined
+    ) {
+      // Adapter maps an IsError tool result to a typed non-retryable error.
+      parsed.result.isError = true;
+      parsed.result.content[0].text =
+        "Changes failed: internal server error (HTTP 500)";
+    }
+    return new Response(JSON.stringify(parsed), { status: res.status });
+  }) as typeof fetch;
+  const report = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: sabotaged,
+    randomId: () => "baadf00d1234",
+  });
+  assert.equal(report.outcome, "clean-pass-with-degradations");
+  assert.ok(
+    report.disclosedDegradations?.some((d) =>
+      d.includes("kiwi_changes unverified live"),
+    ),
+  );
+  const changesStep = report.steps.find(
+    (s) => s.name === "changes-cursor-facts",
+  );
+  assert.equal(changesStep?.ok, false);
+  // The core contracts still passed; the record was cleaned up.
+  assert.deepEqual(report.cleanup?.leftovers, []);
+  assert.deepEqual(
+    [...server.state.store.keys()].filter((p) =>
+      p.startsWith("integration-tests/"),
+    ),
+    [],
+  );
+});
+
+test("an identical-input replay divergence is a hard failure, never disclosed away", async () => {
+  const server = createFakeServer();
+  const original = server.fetch;
+  let changesCalls = 0;
+  const diverging = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = typeof init?.body === "string" ? init.body : "";
+    if (body.includes('"kiwi_changes"')) {
+      changesCalls += 1;
+      if (changesCalls === 2) {
+        const reqId = JSON.parse(body).id;
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: reqId,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: "- A /diverged.md (actor: x, ts)\n\nlast_seq: c91d0a4",
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        );
+      }
+    }
+    return original(input, init);
+  }) as typeof fetch;
+  const report = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: diverging,
+    randomId: () => "d1verge12345",
+  });
+  assert.equal(report.outcome, "suite-failed-after-cleanup");
+  assert.ok(report.steps.some((s) => !s.ok && s.detail?.includes("DIVERGED")));
+  assert.equal(report.disclosedDegradations, undefined);
+  // Cleanup still ran.
+  assert.deepEqual(report.cleanup?.leftovers, []);
+});

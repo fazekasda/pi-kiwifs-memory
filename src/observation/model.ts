@@ -476,8 +476,13 @@ export function createModelExtractor(
     }
     for (let attempt = 0; attempt <= maxValidationRetries; attempt++) {
       const controller = new AbortController();
+      // The extraction timeout is AUTHORITATIVE (T19 runtime fix): the timer
+      // stays ref'd so the bounded abort is guaranteed to fire while the
+      // hung model call is the only pending work. An unref'd timer can be
+      // dropped when the loop would otherwise drain (exposed by Node
+      // 22.23's test runner: a pending call then never settles; in a real
+      // Pi process it would delay teardown by at most timeoutMs — bounded).
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-      timer.unref?.();
       try {
         const response = await transport({
           model: wire,

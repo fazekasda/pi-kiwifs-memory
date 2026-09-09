@@ -53,3 +53,23 @@ Provisioning validation used two random run IDs and manifest-owned paths. It cov
 - Redact headers, URL credentials and sensitive response content from diagnostics.
 - Use no model calls or real conversation data for initial backend tests.
 - Never claim deletion purges Git history, indexes or remote backups.
+
+## T19 live execution facts (dedicated space, MCP 8182)
+
+Recorded during the T19 authorized live suite runs (synthetic records only,
+manifest-owned cleanup, zero leftovers):
+
+- 71 tools advertised; all adapter-required tools present.
+- ETag carrier verified live on `kiwi_write` results (both create and update).
+- FTS indexing is asynchronous (hit appears after indexing; miss disclosed).
+- Hybrid search: synthetic record surfaced with `keyword only` attribution
+  (vector index not ready within the run window) — degradation is disclosed,
+  never counted as semantic evidence.
+- `kiwi_changes` is NON-FUNCTIONAL on this deployment: persistent server-side
+  `internal server error (HTTP 500)` IsError whenever the feed has entries (all
+  cursor variants, immediate and after 30 s), and an empty feed with no
+  `last_seq` when quiet — while read-back proves records exist. Local durable
+  state remains authoritative (architecture.md §2); this is a deployment defect
+  to report upstream, not a product blocker.
+- Post-delete absence verified; deletion is MCP-level only (no Git-history,
+  index or backup purge claim).

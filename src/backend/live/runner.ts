@@ -39,7 +39,10 @@ export interface LiveRunnerConfig {
 }
 
 export type LiveOutcome =
-  "clean-pass" | "suite-failed-after-cleanup" | "setup-blocked";
+  | "clean-pass"
+  | "clean-pass-with-degradations"
+  | "suite-failed-after-cleanup"
+  | "setup-blocked";
 
 export interface LiveStep {
   name: string;
@@ -60,6 +63,12 @@ export interface LiveReport {
   /** Connectivity evidence label — never an auth/isolation claim. */
   authNote: string;
   reasons?: string[];
+  /**
+   * Backend-side capability degradations observed live (e.g. a broken
+   * changes feed). Disclosed facts, never silently dropped and never
+   * counted as verified capability.
+   */
+  disclosedDegradations?: string[];
 }
 
 const EXPECTED_SAFETY: Required<
@@ -159,6 +168,13 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
 
   const runController = new AbortController();
   const runTimer = setTimeout(() => runController.abort(), runMs);
+  // Cleanup NEVER shares the run signal: when the run deadline fires, the run
+  // signal is already aborted and every cleanup delete would throw
+  // CancelledError — manifest-owned records would be left live on the
+  // backend and falsely reported as leftovers. Cleanup gets a fresh signal;
+  // it is still bounded because every request carries the transport's
+  // per-request timeout (requestMs).
+  const cleanupController = new AbortController();
   const runId = (opts.randomId ?? defaultRandomId)();
   const prefix = `${EXPECTED_SAFETY.recordPrefix}${runId}/`;
   const manifest: string[] = [];
@@ -183,6 +199,7 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
   let outcome: LiveOutcome = "suite-failed-after-cleanup";
   let advertisedTools: string[] | undefined;
   let requiredMissing: string[] | undefined;
+  const disclosedDegradations: string[] = [];
 
   try {
     // Capability discovery FIRST — abort before any mutation on a gap.
@@ -262,7 +279,7 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
     s = stepStart();
     try {
       const body = `---\nscope: project/${opts.config.space?.name ?? "unknown"}\nmemory_status: active\n---\nSynthetic live-runner payload ${runId}.`;
-      await adapter.write(record, body, {
+      const created = await adapter.write(record, body, {
         opId: opCreate,
         signal: runController.signal,
       });
@@ -271,12 +288,25 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
       if (back.state !== "ok" || !back.body.includes(runId)) {
         throw new Error("read-back did not return the synthetic payload");
       }
-      await adapter.write(record, `${body}\nupdated.`, {
+      const updated = await adapter.write(record, `${body}\nupdated.`, {
         opId: opUpdate,
         signal: runController.signal,
       });
+      // T19 contract fact: the ETag carrier. The adapter's not_modified
+      // fallback depends on mutation results carrying `ETag:` (T04 probe:
+      // write/append carry it in the text result; read _meta is empty).
+      if (
+        typeof created.etag !== "string" ||
+        created.etag === "" ||
+        typeof updated.etag !== "string" ||
+        updated.etag === ""
+      ) {
+        throw new Error(
+          "kiwi_write result did not carry an ETag (adapter contract fact; not_modified fallback depends on it)",
+        );
+      }
       const search = await adapter.searchFts(
-        `synthetic live-runner payload ${runId}`,
+        `Synthetic live-runner payload ${runId}`,
         {
           pathPrefix: prefix,
           limit: 10,
@@ -306,6 +336,104 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
       }
     } catch (err) {
       steps.push(step("crud-round-trip", false, started() - s, describe(err)));
+      return await finish(err);
+    }
+
+    // T19 contract facts: changes feed + hybrid attribution (as supported,
+    // disclosed — never semantic evidence).
+    s = stepStart();
+    try {
+      // Same identical input window twice: the changes feed must be stable
+      // (idempotent replay of an identical cursor input) and must report the
+      // run's own record. Read-only calls retry ONCE on any failure (spec:
+      // at most one retry).
+      const feedWithRetry = async () => {
+        try {
+          return await adapter.changes("", {
+            limit: 50,
+            signal: runController.signal,
+          });
+        } catch {
+          await new Promise((r) => setTimeout(r, 250));
+          return await adapter.changes("", {
+            limit: 50,
+            signal: runController.signal,
+          });
+        }
+      };
+      let feed1: Awaited<ReturnType<typeof adapter.changes>>;
+      let feed2: Awaited<ReturnType<typeof adapter.changes>>;
+      let feedError: string | undefined;
+      try {
+        feed1 = await feedWithRetry();
+        feed2 = await feedWithRetry();
+      } catch (err) {
+        feed1 = { changes: [] };
+        feed2 = { changes: [] };
+        feedError = describe(err);
+      }
+      if (feed1.changes.some((c) => c.path === record)) {
+        // The feed works here: the replay contract is asserted HARD.
+        const replayIdentical =
+          JSON.stringify(feed2.changes) === JSON.stringify(feed1.changes);
+        const lastSeqDisclosed = feed1.lastSeq !== undefined;
+        steps.push(
+          step(
+            "changes-cursor-facts",
+            replayIdentical,
+            started() - s,
+            `created record reported; identical-input replay ${replayIdentical ? "stable" : "DIVERGED"}; last_seq ${lastSeqDisclosed ? "disclosed" : "absent"}; observed action order: ${feed1.changes.map((c) => c.action).join(",")}`,
+          ),
+        );
+        if (!replayIdentical) {
+          throw new Error(
+            "kiwi_changes replay with an identical input window diverged",
+          );
+        }
+      } else {
+        // Backend-side degradation (observed live on the dedicated test
+        // deployment: persistent `Changes failed: internal server error
+        // (HTTP 500)` whenever the feed has entries; empty feed without
+        // last_seq otherwise — while read-back proves the record exists).
+        // Disclosed, never silently dropped, never counted as verified.
+        const detail =
+          feedError !== undefined
+            ? `changes feed unavailable on this backend: ${feedError}`
+            : `changes feed did not report the run's record (${feed1.changes.length} lines, last_seq ${feed1.lastSeq === undefined ? "absent" : "disclosed"}) — empty or eventually-consistent beyond the run window`;
+        steps.push(step("changes-cursor-facts", false, started() - s, detail));
+        disclosedDegradations.push(
+          `kiwi_changes unverified live: ${detail} (offline contract pinned by fixtures; product treats the feed as a reconciliation aid only — local durable state is authoritative)`,
+        );
+      }
+    } catch (err) {
+      steps.push(
+        step("changes-cursor-facts", false, started() - s, describe(err)),
+      );
+      return await finish(err);
+    }
+
+    s = stepStart();
+    try {
+      const hybrid = await adapter.searchHybrid(
+        `Synthetic live-runner payload ${runId}`,
+        { pathPrefix: prefix, limit: 10, signal: runController.signal },
+      );
+      const present = hybrid.hits.some((h) => h.path === record);
+      // Degradation (keyword-only attribution) is an async-indexing fact to
+      // DISCLOSE, never a failure and never semantic evidence.
+      steps.push(
+        step(
+          "hybrid-facts",
+          present,
+          started() - s,
+          `hits=${hybrid.hits.length} degraded=${hybrid.degraded} attribution=[${hybrid.hits.map((h) => h.attribution).join(", ")}] (async vector indexing may lag; degradation disclosed, not asserted)`,
+        ),
+      );
+      if (!present) {
+        throw new Error("hybrid search did not surface the run's record");
+      }
+    } catch (err) {
+      steps.push(step("hybrid-facts", false, started() - s, describe(err)));
       return await finish(err);
     }
 
@@ -340,6 +468,11 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
     }
 
     outcome = "clean-pass";
+    if (disclosedDegradations.length > 0) {
+      // Core contracts (routing, CRUD, ETag carrier, hybrid, cleanup) all
+      // verified; backend-side capability gaps are disclosed, never hidden.
+      outcome = "clean-pass-with-degradations";
+    }
     return await finish(undefined, true);
   } finally {
     clearTimeout(runTimer);
@@ -366,7 +499,9 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
     } else if (success) {
       outcome =
         cleanup.leftovers.length === 0
-          ? "clean-pass"
+          ? disclosedDegradations.length > 0
+            ? "clean-pass-with-degradations"
+            : "clean-pass"
           : "suite-failed-after-cleanup";
     }
     return {
@@ -380,6 +515,7 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
       cleanup,
       authNote:
         "connectivity evidence only — never proof of authentication, VPN-only access or tenant isolation",
+      ...(disclosedDegradations.length > 0 ? { disclosedDegradations } : {}),
       ...(err !== undefined && !success ? { reasons: [describe(err)] } : {}),
     };
   }
@@ -395,14 +531,14 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
       try {
         const op = mintOpId();
         ledger.record(op);
-        await adapter.del(path, { opId: op, signal: runController.signal });
+        await adapter.del(path, { opId: op, signal: cleanupController.signal });
       } catch {
         leftovers.push(path);
         continue;
       }
       try {
         const check = await adapter.read(path, {
-          signal: runController.signal,
+          signal: cleanupController.signal,
         });
         if (check.state === "missing") deleted.push(path);
         else leftovers.push(path);
@@ -454,6 +590,8 @@ export async function main(): Promise<number> {
   switch (report.outcome) {
     case "clean-pass":
       return 0;
+    case "clean-pass-with-degradations":
+      return 5;
     case "setup-blocked":
       return 3;
     default:

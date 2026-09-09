@@ -42,6 +42,7 @@ import {
   PendingPackRegistry,
   RetrievalCoordinator,
   fingerprintInput,
+  occurrenceInputId,
 } from "../src/retrieval/coordinator.ts";
 import { identityRedactor } from "../src/backend/guard.ts";
 import { createRedactor } from "../src/privacy/redaction.ts";
@@ -421,6 +422,121 @@ test("fixture 11 template-expanded queued variant: slash inputs are ineligible; 
   assert.equal(
     session.injectedPerCall[2],
     fingerprintInput("queued follow-up detail", "followUp"),
+  );
+  assert.equal(coordinator.registry.pendingCount, 0);
+});
+
+// ---- T19 chunk 1: repeated identical inputs (occurrence-unique pack ids) --
+
+test("T19: repeated identical QUEUED followUp text — each occurrence registers, and each consumes its own pack on its own provider call (FIFO per occurrence)", async () => {
+  const { adapter } = makeBackend();
+  const coordinator = new RetrievalCoordinator({
+    adapter,
+    authorizedScopes: ["project/alpha"],
+    deadlineMs: 2000,
+    tokenCap: 3000,
+    generation: 1,
+    redact: identityRedactor,
+    tokenizer: TOKENIZER,
+  });
+  const session = makeSession(coordinator);
+  const text = "queued follow-up detail";
+  // Fresh run starts streaming, held; TWO identical followUp inputs arrive
+  // while it is in flight (the second is an occurrence-unique re-registration
+  // of the exact same input text).
+  session.holdRun();
+  const runPromise = session.submit("start working on the index");
+  await new Promise((r) => setTimeout(r, 5));
+  await session.submit(text, { streamingBehavior: "followUp" });
+  await session.submit(text, { streamingBehavior: "followUp" });
+  session.release();
+  await runPromise;
+
+  // THREE retrieval cycles (one per input event) — the repeated identical
+  // input never silently unregisters the second occurrence.
+  assert.equal(adapter.calls.filter((c) => c.tool === "kiwi_search").length, 3);
+  // Occurrence-unique ids: occurrence 1 keeps the base fingerprint,
+  // occurrence 2 is re-hashed with the #occ:2 counter.
+  const base = fingerprintInput(text, "followUp");
+  assert.notEqual(base, occurrenceInputId(base, 2));
+  // Provider calls: [0] fresh consumes its own pack, [1] and [2] the two
+  // queued occurrences consume theirs, FIFO — the SECOND identical occurrence
+  // is consumed by the provider call whose last user message carries the
+  // same match key, guarded by the new-occurrence barrier (not history
+  // membership, which would only ever match once).
+  assert.equal(
+    session.injectedPerCall[0],
+    fingerprintInput("start working on the index", undefined),
+  );
+  assert.equal(session.injectedPerCall[1], base);
+  assert.equal(session.injectedPerCall[2], occurrenceInputId(base, 2));
+  // Tool-loop replays of the same message never re-consume: the registry's
+  // consumed-id set is session-permanent, so a THIRD identical provider call
+  // (drained queue is empty → no third queued occurrence) is impossible here;
+  // assert the settled state has nothing left pending.
+  assert.equal(coordinator.registry.pendingCount, 0);
+  assert.equal(session.trace.filter((t) => t === "drain-queued").length, 2);
+});
+
+test("T19: repeated identical FRESH inputs across turns — occurrence counter keeps the second turn registrable and consumable", async () => {
+  const { adapter } = makeBackend();
+  const coordinator = new RetrievalCoordinator({
+    adapter,
+    authorizedScopes: ["project/alpha"],
+    deadlineMs: 2000,
+    tokenCap: 3000,
+    generation: 1,
+    redact: identityRedactor,
+    tokenizer: TOKENIZER,
+  });
+  const session = makeSession(coordinator);
+  const text = "what did alpha decide about the index?";
+  await session.submit(text); // turn 1
+  await session.submit(text); // turn 2, identical text
+  // Two cycles; turn 2's pack has an occurrence-unique id.
+  assert.equal(adapter.calls.filter((c) => c.tool === "kiwi_search").length, 2);
+  const base = fingerprintInput(text, undefined);
+  assert.equal(session.injectedPerCall[0], base);
+  assert.equal(session.injectedPerCall[1], occurrenceInputId(base, 2));
+  // Both consumed once; nothing left pending after settle.
+  assert.equal(coordinator.registry.pendingCount, 0);
+});
+
+test("T19: first occurrence's pack settled away unmatched — second identical input still registers and consumes (occurrence counter defeats the permanent consumed-id set)", async () => {
+  const { adapter } = makeBackend();
+  const coordinator = new RetrievalCoordinator({
+    adapter,
+    authorizedScopes: ["project/alpha"],
+    deadlineMs: 2000,
+    tokenCap: 3000,
+    generation: 1,
+    redact: identityRedactor,
+    tokenizer: TOKENIZER,
+  });
+  const session = makeSession(coordinator);
+  const text = "check the sqlite scope";
+  // Turn 1: steer arrives while the run is held; the queue is then removed so
+  // the pack settles UNMATCHED (dropped fail-closed at agent_settled).
+  session.holdRun();
+  const runPromise1 = session.submit("begin");
+  await new Promise((r) => setTimeout(r, 5));
+  await session.submit(text, { streamingBehavior: "steer" });
+  session.queue.length = 0;
+  session.release();
+  await runPromise1;
+  assert.equal(coordinator.registry.pendingCount, 0);
+  // Turn 2: the IDENTICAL input again — this time delivered and consumed.
+  await session.submit(text, { streamingBehavior: "steer" });
+  assert.equal(
+    adapter.calls.filter((c) => c.tool === "kiwi_search").length,
+    3,
+    "all three cycles ran",
+  );
+  const base = fingerprintInput(text, "steer");
+  assert.equal(
+    session.injectedPerCall.at(-1),
+    occurrenceInputId(base, 2),
+    "second identical occurrence consumable despite the settled-away first",
   );
   assert.equal(coordinator.registry.pendingCount, 0);
 });

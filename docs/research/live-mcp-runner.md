@@ -36,3 +36,22 @@ Any precondition failure, capability gap, routing anomaly, redirect, or deadline
 ## Notes on B1 reconciliation
 
 B1 (unauthenticated standalone MCP on the production deployment's port 8181) governs the **production** endpoint choice. The live runner targets only this network-restricted dedicated test service; 8182's auth behavior is recorded as evidence each run and never assumed — a passing header-bearing run must never be cited as proof of authentication or tenant isolation (`test-environment.md`, `architecture-review.md` S-3).
+
+## T19 execution addendum (implementation deltas)
+
+Two deltas landed in T19 while executing the suite; both are backwards-compatible
+with this spec:
+
+- **Degradation disclosure.** A backend-side capability failure that cannot be
+  verified live (observed: `kiwi_changes` returning `internal server error (HTTP
+500)` IsError whenever the feed has entries, and an empty feed without
+  `last_seq` otherwise) is recorded in `disclosedDegradations[]` and the run
+  outcome becomes `clean-pass-with-degradations` (exit code **5**) when every
+  core contract otherwise passed. Contract violations observable only when the
+  feed works (e.g. identical-input replay divergence) remain hard failures.
+- **Cleanup signal isolation.** Manifest cleanup uses a fresh abort signal, not
+  the run's signal: a run-deadline expiry must never orphan manifest-owned
+  records. Cleanup stays bounded via per-request timeouts.
+- **Read-only retry.** Read-only suite calls (e.g. `kiwi_changes`) retry once at
+  the runner level on any failure, per this spec's one-retry bound; the adapter's
+  typed-error policy is unchanged.
