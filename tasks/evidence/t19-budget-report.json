@@ -8,11 +8,11 @@
   ],
   "latency50msPerCall": {
     "runs": [
-      971,
-      959,
-      959,
-      959,
-      957
+      964,
+      958,
+      960,
+      960,
+      959
     ],
     "budgetDeadlineMs": 2000,
     "unit": "ms"
