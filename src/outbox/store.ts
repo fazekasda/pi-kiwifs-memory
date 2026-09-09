@@ -146,6 +146,13 @@ export interface EnqueueInput {
   scope: string;
   idempotencyKey: string;
   payload: unknown;
+  /**
+   * Optional caller-supplied opId (T16 board sends): the payload carries the
+   * opId it was built around, so it must be minted by the caller and stored
+   * in the SAME durable write — the opId is persisted BEFORE any side
+   * effect either way. When omitted the store mints a fresh UUID.
+   */
+  opId?: string;
 }
 
 export interface OutboxStoreOptions {
@@ -371,7 +378,7 @@ export class DurableOutbox {
       schemaVersion: OUTBOX_SCHEMA_VERSION,
       kind: input.kind,
       scope: input.scope,
-      opId: randomUUID(),
+      opId: input.opId ?? randomUUID(),
       idempotencyKey: input.idempotencyKey,
       payload: input.payload,
       attempts: 0,

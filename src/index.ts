@@ -33,6 +33,14 @@ import {
   type RecallRuntime,
   type RecallToolsDeps,
 } from "./inject/tools.ts";
+import {
+  buildBoardReadTool,
+  buildBoardListTool,
+  buildBoardSendTool,
+  type BoardRuntime,
+  type BoardToolsDeps,
+} from "./board/tools.ts";
+import { createRedactor } from "./privacy/redaction.ts";
 import { QueryMetaTombstoneCache } from "./backend/guard.ts";
 import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
 import { validateProjectId } from "./domain/paths.ts";
@@ -631,6 +639,37 @@ export function registerSessionHandlers(
   // Deps resolve lazily per call (runtime is built at first session event).
   pi.registerTool(buildMemorySearchTool(recallDeps));
   pi.registerTool(buildMemoryReadTool(recallDeps));
+
+  // T16: agent board tools. Sends ride the durable outbox (opId + created
+  // persisted at enqueue, delivery by the worker's at-least-once sender);
+  // list/read go through the BoardRepository's strict client-side channel
+  // containment and client-side TTL. Same private-mode/hold gates as the
+  // recall tools — never a bypass. The runtime source is the retrieval
+  // adapter (same MCP config gating: enabled + url + auth resolve); when
+  // retrieval is held, the board is held with the same sanitized reason.
+  const boardDeps = (): BoardToolsDeps | undefined => {
+    const configResult = loadConfig();
+    if (!configResult.ok) return undefined;
+    const config = configResult.config;
+    const rt = runtime;
+    const getBoardRuntime = (): BoardRuntime | undefined => {
+      if (!rt?.retrieval?.adapter) return undefined;
+      return {
+        adapter: rt.retrieval.adapter,
+        outbox: rt.store,
+        boardEnabled: effectiveFeatures(config).board,
+      };
+    };
+    return {
+      getRuntime: getBoardRuntime,
+      getHeldReason,
+      privateMode: () => config.privateMode,
+      redact: createRedactor(),
+    };
+  };
+  pi.registerTool(buildBoardSendTool(boardDeps));
+  pi.registerTool(buildBoardListTool(boardDeps));
+  pi.registerTool(buildBoardReadTool(boardDeps));
 
   // No-UI access: handlers only read ctx.sessionManager / ctx.cwd.
   pi.on("session_start", async (event, ctx) => {

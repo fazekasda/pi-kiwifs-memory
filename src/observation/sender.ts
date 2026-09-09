@@ -38,6 +38,7 @@ import {
 import { DATA_FENCE_END } from "./model.ts";
 import { sendProposalJob, sendReflectionJob } from "./reflection.ts";
 import { sendBackupJob } from "../backup/capture.ts";
+import { sendBoardJob } from "../board/job.ts";
 
 /**
  * Retryable availability gap: the observation delivery backend is not
@@ -249,16 +250,24 @@ export function createObservationSender(
   deps: BackendSenderDeps,
 ): (job: OutboxJob) => Promise<void> {
   return async (job: OutboxJob) => {
-    const scope = deps.scope;
-    if (scope === undefined) {
-      throw new SenderNotWiredError(
-        "record scope not yet resolved (project identity pending, T18) — record delivery held",
-      );
-    }
     const backend = await deps.openBackend();
     if (!backend) {
       throw new SenderNotWiredError(
         "backend not configured — record delivery pending",
+      );
+    }
+    if (job.kind === "board-message") {
+      // T16: board messages are cross-agent and need no resolved project
+      // scope (identity fields are validated in the payload itself); they
+      // dispatch BEFORE the scope hold so an unresolved project identity
+      // never blocks board delivery.
+      await sendBoardJob(job, backend);
+      return;
+    }
+    const scope = deps.scope;
+    if (scope === undefined) {
+      throw new SenderNotWiredError(
+        "record scope not yet resolved (project identity pending, T18) — record delivery held",
       );
     }
     if (job.kind === "reflection") {

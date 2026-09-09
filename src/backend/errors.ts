@@ -94,6 +94,17 @@ export class OpIdNotPersistedError extends BackendError {
   }
 }
 
+/**
+ * Privacy gate refused content before it left the process (T16 board send
+ * defense in depth). Permanent, non-retryable (code "validation").
+ */
+export class PrivacyGateError extends BackendError {
+  constructor(message: string) {
+    super("validation", message);
+    this.name = "PrivacyGateError";
+  }
+}
+
 /** True for error codes that may legitimately be retried (transport faults). */
 export function isRetryable(err: unknown): boolean {
   return err instanceof BackendError && err.code === "availability";

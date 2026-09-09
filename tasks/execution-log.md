@@ -1190,3 +1190,186 @@ both fixed in `src/backup/verify.ts` and verified by the full gate suite.
 - `devenv test`: "Tests passed :)".
 - Diff secret-scanned before staging; only the five reviewed task files
   staged; commit created fresh (no amend of b703c26).
+
+## T16 — Board schema, identity and send/read/list domain operations (chunk 1, 2026-09-09, no commit)
+
+Scope per instructions: board message schema/path identity and send/read/list
+domain operations plus focused synthetic tests. Tools chunk (Pi tool
+registrations) and `src/index.ts` wiring are deliberately NOT touched — the
+interfaces below are the contract the tools chunk consumes.
+
+### Files
+
+- `src/board/messages.ts` (new): board-message schema helpers over the T05
+  record format (`type: board-message`, `to`/`from`/`channel`/`ttl`
+  frontmatter). `validateBoardIdentities` enforces the strict id grammar on
+  channel/from/to BEFORE any network use; `buildBoardMessage` derives
+  `msg_id`/path via the T04 op-id identity (`deriveMsgId`/
+  `deriveMsgPath`, 16-hex [P] default — unchanged) and never from content;
+  `parseBoardMessage` parses a fresh read and reports client-side expiry;
+  `isExpired` implements the B5 client-side TTL (`created + ttl < now`).
+  Bodies are opaque data — nothing here interprets them.
+- `src/board/repository.ts` (new): `BoardRepository` over `KiwiFSAdapter`.
+  - `send(input, opId)`: validates identities, applies the injected privacy
+    redactor (fail closed), builds the record, writes via the adapter's
+    B2 `writeImmutable` (read-before-write). Same-job replay → same op-derived
+    path → `replayed: true` no-op; differing content at the path → typed
+    `{ok:false, quarantined:true, reason:"content-collision"}` — never
+    overwrites. `opId` persistence is enforced by the adapter ledger.
+  - `list(channel, {to, limit, offset})`: `kiwi_query_meta` with
+    `channel`/`to` filters, limit clamped to `BOARD_LIST_MAX` (200),
+    offset forwarded; every returned path re-checked by strict
+    `pathWithinBoardChannel` containment (query results are never trusted as
+    a scope boundary on the shared-key backend).
+  - `read(path, {includeExpired})`: channel containment check → fresh
+    `kiwi_read` → parse → client-side TTL (`expired` typed result, visible,
+    never silently dropped). Body returned verbatim.
+  - Private mode: injected `PrivateModeGate` refuses send/list/read with zero
+    network requests (board domain fully disabled).
+  - Authorization disclosure constant/docs: routing labels are not
+    confidentiality (single shared apikey); no per-path authorization exists.
+- `test/board.test.ts` (new, 12 tests): fixture 5b dual-sender identical
+  payload → two distinct messages persist; replay → same path, no duplicate,
+  no second write; differing-content collision → quarantined, original
+  intact; invalid identities rejected with zero network I/O; list
+  post-filtering drops foreign-channel and `board-alpha/` prefix-lookalike
+  results that a shared-key peer could plant (with frontmatter matching the
+  filter — lying results still filtered); client-side TTL incl. expired/
+  includeExpired/no-ttl paths; hostile message body read back verbatim with
+  exactly one `kiwi_read` and no other tool triggered; opId-not-persisted
+  fail closed with nothing written; redaction gate refuses secret-bearing
+  bodies pre-wire; private mode refuses all three operations with zero
+  requests; limit clamp 200 + offset forwarded per query_meta contract;
+  send/read result shapes carry safe ids only (no credentials).
+
+### Design note (replay determinism)
+
+`created` is part of `BoardMessageInput` and MUST be carried in the persisted
+outbox payload: byte-identical replay content requires a deterministic
+instant minted at enqueue, not at send. This is an integration requirement
+for the T07 outbox wiring (tools chunk); a caller omitting `created` gets a
+fresh timestamp and a replay then fails closed as content-collision (safe,
+but the no-op guarantee requires persisting `created`).
+
+### Chunk-1 mapping to T16 acceptance criteria (all still OPEN in the PRD)
+
+- Dual-sender + replay fixtures: implemented and passing (synthetic).
+- Client policy/denial + shared-key disclosure: enforced pre-wire + doc'd;
+  UI-level disclosure wording lands with the tools chunk.
+- TTL client-side, ordering/pagination per contract: TTL done; ordering is
+  query_meta sort — the fake server ignores sort/offset, so live contract
+  verification of ordering stays an honest gap for the tools/full-T16 pass.
+- Collision fail-closed/quarantined: done at repository level; outbox
+  quarantine status surface lands with wiring.
+- Messages never trigger execution: enforced structurally (verbatim body,
+  single-read test).
+- Safe tool responses: repository results are ids/status only; tool-layer
+  response shaping belongs to the tools chunk.
+
+### Checks actually run
+
+- `npx tsc --noEmit`: clean.
+- `node --test test/board.test.ts`: 12 pass / 0 fail (3 consecutive runs —
+  deterministic; an initial flake exposed the `created` determinism flaw).
+- `npm run check`: tsc + prettier clean, 344 pass / 0 fail.
+- `npm run pack:check` / `devenv test`: NOT run in this chunk (reserved for
+  the final T16 gates after the tools chunk).
+
+### Limits / honest notes
+
+- Fake server `kiwi_query_meta` filters by frontmatter substring and ignores
+  `sort`/`offset` — repo post-filtering and arg forwarding are asserted, but
+  server-side sort behavior remains fixture-unverified.
+- No commit (per task instructions). Files staged only if the coordinator
+  instructs the final worker commit.
+
+## T16 — Board tools, outbox delivery wiring, acceptance completion (chunk 2, 2026-09-09, no commit)
+
+### Files
+
+- `src/board/job.ts` (new) — board-message outbox job integration:
+  `parseBoardPayload` (typed permanent failure on malformed/tampered payload,
+  strict identity re-validation), `buildBoardJobMessage` (deterministic wire
+  content re-derived from the persisted payload + durable opId; `created`
+  comes from the payload, never a wall-clock read), `sendBoardJob`
+  (adapter `writeImmutable`, B2; ConflictError → `ValidationError` so the
+  worker quarantines with a visible reason; never deletes/rewrites).
+- `src/board/tools.ts` (new) — `kiwifs_board_send`, `kiwifs_board_list`,
+  `kiwifs_board_read` following the T13 recall-tool discipline: private-mode
+  refusal (send enqueues NOTHING), held-runtime/board-disabled refusals with
+  sanitized reasons, redaction gate BEFORE enqueue (fail closed), sends ride
+  the durable outbox (opId minted by the tool and persisted in the SAME
+  durable enqueue write; `created` persisted in the payload), tool returns
+  safe local status only (queued msgId/path, never the body), list/read via
+  `BoardRepository`, bodies framed as UNTRUSTED DATA, routing-
+  not-confidentiality disclosure on every result.
+- `src/outbox/store.ts` — `EnqueueInput` gains optional caller-supplied
+  `opId` (board payload carries the opId it was built around; still persisted
+  BEFORE any side effect in the same durable write). No behavior change for
+  existing callers.
+- `src/observation/sender.ts` — `board-message` kind dispatches BEFORE the
+  project-scope hold (board is cross-agent; scope stays required for
+  observation/reflection/proposal/backup).
+- `src/index.ts` — board tools registered at startup; runtime source is the
+  retrieval adapter (same MCP config gating), outbox from the session
+  runtime, redactor via `createRedactor()`.
+- `test/board-tools.test.ts` (new, 9 tests) — durable enqueue contract
+  (payload opId === job.opId, `created` persisted, zero wire requests, body
+  never echoed back); redaction gate pre-queue; secret-bearing body screened
+  at enqueue (nothing queued); private mode zero reads/writes/no jobs; held
+  - disabled refusals; worker tick delivers → parse-back verifies frontmatter
+    and byte-stable replay tick (one message, no duplicate, job acked);
+    planted foreign content at the deterministic path → tick quarantines the
+    job with a visible reason, foreign content intact, queued content never
+    written; list returns filtered paths + disclosure and refuses bad channels
+    pre-wire; read TTL client-side (fresh → expired refusal → includeExpired),
+    untrusted framing, credential-free outputs.
+- `test/extension.test.ts` — startup tool set now includes the three board
+  tools.
+
+### Chunk-2 mapping to T16 acceptance criteria (PRD boxes updated)
+
+- Dual-sender + replay fixtures: green end-to-end through tool → durable
+  outbox → worker → adapter (chunk 1 covered the repository level).
+- Client policy/denial + disclosure: tool descriptions and EVERY result
+  carry the shared-key routing-not-confidentiality wording; invalid
+  identities/paths refused pre-wire.
+- TTL client-side + ordering/pagination: TTL enforced client-side at read
+  (fresh/expired/includeExpired); limit clamp + offset forwarded. Honest
+  remaining gap: the fake server ignores `sort`, so server-side ordering is
+  validated only against the recorded contract by arg-forwarding tests,
+  not against a sorting backend.
+- Collision fail-closed/quarantined: worker-level test — differing content
+  at the deterministic path → job quarantined, reason visible
+  (name:code-only), nothing overwritten.
+- No automatic execution: bodies returned verbatim as untrusted data; no
+  code path in board send/list/read parses or executes bodies.
+- Safe responses: ids/status only; credential-free assertion in tests.
+
+### Checks actually run (final tree, all green)
+
+- `npx tsc --noEmit`: clean.
+- `node --test test/board-tools.test.ts test/board.test.ts`: 22 pass / 0 fail.
+- `npm run check`: tsc + prettier clean, 354 pass / 0 fail.
+- `npm run pack:check`: clean (packed extension loads in Pi RPC).
+- `devenv test`: passed.
+
+### Limits / honest notes
+
+- Server-side `kiwi_query_meta` sort ordering remains fixture-unverified
+  (fake server ignores `sort`); offset forwarding and the client-side
+  channel containment re-check are tested.
+- Sender identity (`from`) is a self-claimed routing label (validated
+  grammar only) — disclosed in tool output; the shared key cannot
+  authenticate senders (never claimed otherwise).
+- No commit (per task instructions). No T17 feature work in this chunk
+  (no polling, cursors, or acks beyond the worker's local ack).
+
+### Review fixes (post-review, 2026-09-09)
+
+- Review follow-up #2: the repository send privacy gate no longer throws
+  `PathEscapeError` (a path-semantics error) for a content refusal; it now
+  throws a dedicated `PrivacyGateError` (`BackendError`, code `validation`,
+  non-retryable → worker quarantines with visible reason). Behavior
+  unchanged; error name now matches semantics. Test asserts the typed error
+  and its non-retryability.
