@@ -731,3 +731,56 @@ pack is registered while held — nothing is "held, not deleted").
 - None blocking. Note: `consumeMatching` ambiguity policy is FIFO-oldest per
   matchKey (one injection per occurrence); a second identical pending pack
   fails closed to settle drop rather than double-injecting.
+
+## T13 — recall-tools and tokenizer/config tests (tools_tokenizer chunk, 2026-09-08)
+
+### Changes
+
+- `test/recall-tools.test.ts` (new, 16 tests): private-mode ZERO backend reads
+  (search + read, no searchFts and no fresh reads); held-runtime sanitized
+  refusals with no reads; fresh-read guard gates each proven to reject its
+  failure case — read-back (missing), status (superseded), scope
+  (unauthorized, no content leak), path-prefix, redaction (fail closed, no
+  body) — plus framing/source-ids on success; advisory tombstone cache: a
+  HIT refuses before any read, a stale/empty cache can NEVER authorize a
+  forgotten record (read-back gate holds via read tool and search);
+  timeouts — hanging search fanout degrades visibly ("deadline exceeded",
+  no fabricated evidence, bounded 50 ms) and an aborted read signal
+  degrades with no content; deterministic output bounds (maxResults,
+  maxBodyChars); fanout bounded to the coordinator's authorized scope set.
+- `test/tokenizer-config.test.ts` (new, 10 tests): `loadConfiguredTokenizer`
+  success (default + named export, relative path vs baseDir), sanitized load
+  failure, malformed exports (non-object/no-id/empty-id/non-function),
+  throwing/NaN/negative/Infinity/string counts → `undefined` (never a char
+  estimate); config schema `budgets.tokenizer` valid shape carried through
+  and every malformed shape rejected; tokenizer readiness timing —
+  tokenizer-less packs visibly skip injection with
+  `TOKENIZER_UNAVAILABLE_NOTE`, `setTokenizer` covers only inputs retrieved
+  after attachment and never overrides an existing tokenizer; cross-project
+  opt-in mapping through `authorizedScopeSet` (own project + personal +
+  `cross/` opt-ins gate recall; non-`cross/` values and >N≤4 fail closed).
+- **Source fixes proven necessary by the tests** (minimal):
+  - `src/inject/tools.ts` read tool: a transport failure / deadline abort on
+    the guard read degrades visibly (sanitized refusal, "deadline exceeded")
+    instead of crashing the tool — fail closed, no content reported.
+  - `src/config/schema.ts` `budgets.tokenizer`: unknown keys inside the
+    tokenizer object are rejected (consistent with mcp/model sections).
+
+### Evidence
+
+- `npx tsx --test test/recall-tools.test.ts test/tokenizer-config.test.ts`:
+  26 pass / 0 fail (<0.3 s, timeout-bound tests bounded).
+- `npm run check`: 305 pass / 0 fail, prettier clean.
+- `npm run pack:check`: "Packed extension loads in Pi RPC and reports
+  scaffold status."
+- `devenv test`: "Tests passed :)" (12.2 s).
+- Secret scan: synthetic fixtures only; no `kiwifs-test.local.json`; no
+  credentials, live services, pushes, or deployment edits.
+
+### Blockers / follow-ups
+
+- None. `src/inject/` persists-consumed-outbound invariants remain covered by
+  `test/inject.test.ts`; recall-tool suite complements it. End-to-end
+  Pi-runtime RPC proof (retrieve → inject → source recall against a real Pi
+  session, not fakes) remains the manual/RPC-level follow-up noted by the
+  injection chunk.

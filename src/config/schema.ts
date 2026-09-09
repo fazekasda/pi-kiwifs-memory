@@ -417,6 +417,15 @@ export function validateConfig(raw: unknown): ValidationResult {
               "tokenizer must be an object { module: string, export?: string }",
           });
         } else {
+          const unknown = Object.keys(t).filter(
+            (k) => k !== "module" && k !== "export",
+          );
+          if (unknown.length > 0) {
+            issues.push({
+              path: "budgets.tokenizer",
+              message: `unknown tokenizer key(s): ${unknown.join(", ")}`,
+            });
+          }
           const spec: { module: string; export?: string } = {
             module: t["module"] as string,
           };

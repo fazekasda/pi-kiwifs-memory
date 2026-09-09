@@ -248,18 +248,29 @@ export function buildMemoryReadTool(
           "memory read refused: record is locally tombstoned (forgotten) — refresh pending",
         );
       }
-      const guarded = await guardCandidate(
-        params.path,
-        {
-          adapter: rt.adapter,
-          authorizedScopes: rt.coordinator.scopeSet(),
-          redact: rt.coordinator.guardRedactor,
-          ...(deps.tombstoneCache
-            ? { tombstoneCache: deps.tombstoneCache }
-            : {}),
-        },
-        signal,
-      );
+      // A transport failure / deadline abort on the read itself degrades
+      // visibly (sanitized) instead of crashing the tool — fail closed.
+      let guarded: Awaited<ReturnType<typeof guardCandidate>>;
+      try {
+        guarded = await guardCandidate(
+          params.path,
+          {
+            adapter: rt.adapter,
+            authorizedScopes: rt.coordinator.scopeSet(),
+            redact: rt.coordinator.guardRedactor,
+            ...(deps.tombstoneCache
+              ? { tombstoneCache: deps.tombstoneCache }
+              : {}),
+          },
+          signal,
+        );
+      } catch (err) {
+        const e = err as { name?: string; code?: string };
+        const aborted = signal?.aborted === true || e?.name === "AbortError";
+        return refusal(
+          `memory read degraded: backend read failed${aborted ? " (deadline exceeded)" : ""} — no content reported (${e?.code ?? e?.name ?? "error"})`,
+        );
+      }
       if (!guarded.ok) {
         // Sanitized: step name only — never record content, never paths
         // beyond the caller's own input echoed as an id.
