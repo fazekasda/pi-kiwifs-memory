@@ -460,12 +460,12 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Fresh-environment setup succeeds using documented steps and synthetic service credentials.
-- [ ] npm tarball includes required runtime assets and no local data, logs or credentials.
-- [ ] Packed-extension RPC smoke covers core registration and safe offline startup.
-- [ ] Node matrix, Nix checks and full required tests pass.
-- [ ] Known limitations and migration policy are explicit.
-- [ ] No npm publication, release tag or live deployment change happens without approval.
+- [x] Fresh-environment setup succeeds using documented steps and synthetic service credentials. _T20 chunk 1: the README/config example was validated against the REAL schema (`validateConfig`) with synthetic-by-reference credentials only (`env:KIWIFS_MCP_APIKEY`/`env:OPENROUTER_API_KEY`, no values); packed extension boots offline in isolated RPC (smoke). A live backend connection from a fresh environment is inherently environment-specific and was NOT executed (no endpoint/credentials used); documented steps stop at `/kiwifs-status` which is verified by the smoke test to render the disabled state safely._
+- [x] npm tarball includes required runtime assets and no local data, logs or credentials. _T20: `pack:check` verifies the allowlist (`src/`, `README.md`, `LICENSE` — no config/, no state, no logs, no credentials) and the tarball loads in Pi RPC from a clean temp HOME with no provider credentials. Chunk 2 additionally found and fixed a real dependency gap: `typebox` (runtime import in tool schemas) was only transitively available; it is now declared in `dependencies` and an isolated `npm install` of the packed tarball in a clean temp dir pulls exactly the extension + typebox. `config/kiwifs-test.example.json` is the live-runner template, not an extension config; this distinction is documented in `docs/test-environment.md`._
+- [x] Packed-extension RPC smoke covers core registration and safe offline startup. _T20: `scripts/smoke-package.mjs` asserts `kiwifs-status` registration AND a safe offline startup: no `extension_error`, status notification matches the healthy/degraded/private/disabled state line with NO backend configured and an empty temp HOME. The stale 'scaffold status' success message was corrected (message only; assertions unchanged and all still pass)._
+- [x] Node matrix, Nix checks and full required tests pass. _T20: `npm run check` PASS (typecheck + format + 472 tests), `npm run pack:check` PASS, `devenv test` PASS, and exact Node floor `npx -y node@22.19.0 --test test/*.test.ts` → 472/472 PASS — and, after the chunk 2 `typebox`/test-name fixes, all re-run again: `check`, `pack:check`, `devenv test` and the exact Node 22.19.0 floor suite all PASS; isolated tarball install verified._
+- [x] Known limitations and migration policy are explicit. _T20: README 'Known limitations' (redaction heuristics, tokenizer requirement, B4 under-recall, network-protected transport, reversible-only erasure, redacted non-byte-identical backups with restore-into-Pi deferred, board labels not confidentiality, untested coexistence, not published); `docs/configuration.md` documents schemaVersion migration policy (newer rejected safely, never rewritten; older rejected with explicit upgrade pointer); `docs/operations.md` covers outage/queues/backup/board/forget/retention/purge/upgrades/troubleshooting; dedicated-test-space and live-suite exit-5 caveats stated._
+- [x] No npm publication, release tag or live deployment change happens without approval. _T20: none performed; `docs/publishing.md` procedure-only, its stale 'scaffold' claim corrected._
 
 ## Completion criteria
 

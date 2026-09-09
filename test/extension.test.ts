@@ -172,7 +172,7 @@ test("private mode holds backup-verify backend reads", async () => {
   }
 });
 
-test("reports scaffold status without claiming memory works", async () => {
+test("status reports the disabled state without claiming memory works", async () => {
   const notifications: unknown[][] = [];
   const ctx = {
     hasUI: true,

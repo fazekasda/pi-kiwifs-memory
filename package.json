@@ -1,7 +1,7 @@
 {
   "name": "@fazekasda/pi-kiwifs-memory",
   "version": "0.1.0",
-  "description": "Development scaffold for a KiwiFS memory extension for Pi coding agent",
+  "description": "KiwiFS memory extension for the Pi coding agent: observational memory, redacted backups, agent message board",
   "type": "module",
   "license": "MIT",
   "author": "David Fazekas",
@@ -46,6 +46,9 @@
     "check": "npm run typecheck && npm run format:check && npm test",
     "pack:check": "node scripts/check-package.mjs && node scripts/smoke-package.mjs",
     "prepublishOnly": "npm run check && npm run pack:check"
+  },
+  "dependencies": {
+    "typebox": "1.3.7"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

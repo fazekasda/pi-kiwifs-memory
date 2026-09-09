@@ -103,7 +103,9 @@ try {
     });
     send({ id: "commands", type: "get_commands" });
   });
-  console.log("Packed extension loads in Pi RPC and reports scaffold status.");
+  console.log(
+    "Packed extension loads in isolated Pi RPC: commands registered, safe offline startup (disabled state, no backend).",
+  );
 } finally {
   if (child && child.exitCode === null && child.signalCode === null) {
     child.kill("SIGKILL");

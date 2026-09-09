@@ -63,7 +63,8 @@ the changed lockfile. Keep the devenv CLI version in CI and README aligned.
 
 ## Before the first release
 
-1. Implement and test the intended memory behavior. The current version is only a scaffold.
+1. The extension implements and tests the intended memory behavior (see
+   `tasks/prd-kiwifs-memory.md`, tasks T01–T20).
 2. Confirm npm account ownership of the `@fazekasda` scope and check name availability.
 3. Enable npm two-factor authentication.
 4. Run `devenv test` and review `npm run pack:check` output.
@@ -89,7 +90,7 @@ npm publish --access public
 Complete npm's interactive authentication and 2FA prompts. `prepublishOnly` runs
 checks first, including a packed-extension RPC smoke test with isolated settings
 and no provider credentials. The smoke test requires `tar`, provided by the Nix
-shell and Linux CI runners. This publication was not performed during scaffold setup.
+shell and Linux CI runners. No publication has been performed as of T20.
 
 After initial publication, create its matching Git tag if needed, but do not publish
 a GitHub release for that already-published version with the automated job enabled.

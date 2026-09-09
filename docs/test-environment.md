@@ -28,7 +28,7 @@ Edit `config/kiwifs-test.local.json`. This file is ignored by Git and formatting
 
 Prefer a credential restricted by the server to this test space. If the service only supports a shared key, the client must verify the routing mechanism before writes; the key itself does not enforce isolation.
 
-The tracked `config/kiwifs-test.example.json` contains no credentials. To recreate the local file if missing:
+The tracked `config/kiwifs-test.example.json` contains no credentials. It is the template for this live-runner configuration and uses the runner's own field shape (`mcp.headers`, `space`, `safety`, `timeouts`), not the extension config schema validated by `validateConfig`; the extension's own example lives in the README. To recreate the local file if missing:
 
 ```sh
 (umask 077; cp config/kiwifs-test.example.json config/kiwifs-test.local.json)
