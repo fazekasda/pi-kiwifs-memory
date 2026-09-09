@@ -52,6 +52,9 @@ export const EVIDENCE_MESSAGE_TYPE = "kiwifs-evidence";
  * does not re-export the CustomMessage type.
  */
 export type EvidenceCustomMessage = {
+  /** Pi AgentMessage role; required for the `context`-path injected message
+   * to survive pi's convertToLlm (verified against real Pi RPC, T13). */
+  role: "custom";
   customType: string;
   content:
     | string
@@ -102,6 +105,7 @@ export function buildEvidenceMessage(
     ...(pack.tokenCount !== undefined ? { tokenCount: pack.tokenCount } : {}),
   };
   return {
+    role: "custom",
     customType: EVIDENCE_MESSAGE_TYPE,
     content: frameEvidence(pack.items),
     display: true,

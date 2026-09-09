@@ -784,3 +784,85 @@ pack is registered while held — nothing is "held, not deleted").
   Pi-runtime RPC proof (retrieve → inject → source recall against a real Pi
   session, not fakes) remains the manual/RPC-level follow-up noted by the
   injection chunk.
+
+## T13 — real isolated Pi RPC/headless fixture: retrieve → inject → source-recall (rpc chunk, 2026-09-08)
+
+### What was built
+
+- `test/pi-rpc-fixture.test.ts` (new): a bounded (~3 s) end-to-end fixture
+  that spawns the REAL Pi 0.85.0 CLI in `--mode rpc --no-session` with the
+  actual `src/index.ts` extension loaded, and drives a genuine agent
+  session. Fully local and synthetic — no paid model, no network service,
+  no credentials:
+  - **Local scripted model**: a loopback `openai-completions` SSE server
+    registered through Pi's own `~/.pi/agent/models.json` mechanism, with a
+    deterministic call-count script (tool call → tool call → final text).
+  - **Local fake KiwiFS backend**: the existing `test/fake-mcp-server.ts`
+    bridged onto a loopback HTTP server; records seeded under
+    `project/t13/demo/memory/` so the guard pipeline's path-prefix, scope
+    and read-back steps all exercise for real.
+  - **Local tokenizer module** (fixture `countTokens`) wired via
+    `budgets.tokenizer`; the fixture polls `/kiwifs-status` over RPC until
+    the status line reports the attached tokenizer before prompting.
+- Scenario proven against the real Pi process (assertions on the raw
+  provider request bodies, the fake MCP request log, RPC events, and
+  extension-error silence):
+  1. Fresh prompt → one retrieval cycle (FTS + semantic + hybrid + brief
+     legs, guard read-back) → the pack is injected as the single custom
+     message via `before_agent_start` and persists in every later request
+     exactly once.
+  2. The model's tool call runs the REAL `kiwifs_memory_search` tool
+     through Pi's tool runner and the guard pipeline to the fake backend;
+     the tool result is visible in the next provider request.
+  3. A secret-bearing recall query (`AKIA…`, fixture-only) reaches the
+     backend ONLY as `[REDACTED:aws-access-key:20]`; the raw secret never
+     appears in any outbound request.
+  4. A queued steer prompt (sent while the agent is streaming) is delivered
+     after the tool turn with NO fresh `before_agent_start` for it
+     (empirically confirmed: the steer begins no new agent run when
+     delivered mid-stream), its pack is injected via the transient
+     `context` path exactly once, and it is absent from the next
+     tool-loop call — proving consumed-input linkage and per-call dedupe in
+     real Pi, not fakes.
+
+### Real-Pi finding and source fix
+
+- **`src/inject/injector.ts` bug found by the real-Pi fixture** (fakes could
+  never catch this): the message returned by the `context`-path injector
+  lacked `role: "custom"`. Pi's `convertToLlm` silently DROPS role-less
+  custom messages, so every queued steer/followUp evidence pack was consumed
+  but never actually reached the provider context — a silent loss on the
+  exact path the PRD's queued-input linkage depends on. Fix: build the
+  evidence message as a full `{ role: "custom", customType, content,
+display, details }` CustomMessage (`buildEvidenceMessage`), matching
+  Pi 0.85.0 `CustomMessage`/`convertToLlm` semantics verified in
+  `pi-agent-core/dist/harness/messages.js`. The `before_agent_start` path is
+  unaffected (Pi wraps the returned Pick into a proper custom message), and
+  the extra role field is accepted there.
+- Also empirically confirmed against Pi source/behavior: the steer message
+  arrives in the provider context AFTER the tool turn's `toolResult`
+  (steering delivery point), and the `context` event fires per provider call
+  with the cloned message list — matching the architecture §3.1 model.
+
+### Evidence
+
+- `npx tsx --test test/pi-rpc-fixture.test.ts test/inject.test.ts`:
+  17 pass / 0 fail (bounded; fixture ~3 s, all waits deadline-bounded,
+  scripted model bounded at 8 calls, child killed + tmp tree removed in
+  `finally`).
+- `npm run check`: 306 pass / 0 fail, prettier clean.
+- `npm run pack:check`: "Packed extension loads in Pi RPC and reports
+  scaffold status."
+- `devenv test`: see below.
+- Synthetic fixtures only; the only "secret" is the fixture AWS-pattern
+  string, which the test proves is redacted before any outbound call; no
+  `kiwifs-test.local.json`, no live services, no pushes or deployment edits.
+
+### Blockers / follow-ups
+
+- None blocking. Notes: the fixture asserts the steer is delivered
+  mid-run (steering queued while the first model call streams, delivered
+  after that turn's tool calls); a steer that arrives after the agent has
+  settled stays queued until the next run — consistent with Pi's steering
+  queue semantics and outside T13's injectable-input path (it would become
+  a fresh input on delivery).
