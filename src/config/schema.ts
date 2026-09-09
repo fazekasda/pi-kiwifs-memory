@@ -74,11 +74,18 @@ export interface MemoryConfig {
   privacy: {
     exclusions: ExclusionRule[];
   };
-  /**
-   * Explicit project identity override (`host/repo`) for non-Git projects or
+  /** Explicit project identity override (`host/repo`) for non-Git projects or
    * ambiguous remotes (architecture.md §2 [P], decisions.md #5).
    */
   projectIdentity?: string;
+  /**
+   * T17 board delivery identity. `consumerId` names the durable per-consumer
+   * delivery state file (stable across sessions — cursors must outlive a
+   * session); delivery is HELD visibly when unset. `recipient` is an optional
+   * client-side routing filter: messages whose `to` differs are skipped as
+   * unauthorized (labels, not confidentiality — architecture.md §8).
+   */
+  board?: { consumerId: string; recipient?: string };
 }
 
 export const DEFAULT_CONFIG: MemoryConfig = {
@@ -214,6 +221,7 @@ export function validateConfig(raw: unknown): ValidationResult {
     "features",
     "privacy",
     "projectIdentity",
+    "board",
   ]);
   for (const key of Object.keys(raw)) {
     if (!known.has(key)) {
@@ -536,6 +544,60 @@ export function validateConfig(raw: unknown): ValidationResult {
     }
   }
 
+  /** T17 board delivery identity (optional block; consumerId grammar-safe
+   * for a state filename).
+   */
+  let board: MemoryConfig["board"];
+  if (raw["board"] !== undefined) {
+    const rawBoard = raw["board"];
+    if (!isPlainObject(rawBoard)) {
+      issues.push({ path: "board", message: "board must be an object" });
+    } else {
+      for (const key of Object.keys(rawBoard)) {
+        if (key !== "consumerId" && key !== "recipient") {
+          issues.push({
+            path: `board.${key}`,
+            message: "unknown board key",
+          });
+        }
+      }
+      const consumerId = rawBoard["consumerId"];
+      if (
+        typeof consumerId !== "string" ||
+        !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(consumerId)
+      ) {
+        issues.push({
+          path: "board.consumerId",
+          message:
+            "must be a stable id matching [a-z0-9][a-z0-9_-]{0,63} (delivery is held without it)",
+        });
+      }
+      const recipient = rawBoard["recipient"];
+      if (
+        recipient !== undefined &&
+        (typeof recipient !== "string" ||
+          recipient === "" ||
+          recipient.length > 64)
+      ) {
+        issues.push({
+          path: "board.recipient",
+          message: "must be a non-empty string of at most 64 characters",
+        });
+      }
+      if (
+        typeof consumerId === "string" &&
+        /^[a-z0-9][a-z0-9_-]{0,63}$/.test(consumerId)
+      ) {
+        board = {
+          consumerId,
+          ...(typeof recipient === "string" && recipient !== ""
+            ? { recipient }
+            : {}),
+        };
+      }
+    }
+  }
+
   let projectIdentity: string | undefined;
   if (raw["projectIdentity"] !== undefined) {
     const v = raw["projectIdentity"];
@@ -565,6 +627,7 @@ export function validateConfig(raw: unknown): ValidationResult {
       budgets,
       features,
       ...(projectIdentity ? { projectIdentity } : {}),
+      ...(board ? { board } : {}),
     },
   };
 }

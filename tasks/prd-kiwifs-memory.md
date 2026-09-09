@@ -409,12 +409,12 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Reconnect/restart replays do not cause repeated logical notifications beyond the documented at-least-once + client-dedupe guarantee.
-- [ ] Two consumers maintain independent local cursors; offline startup works without the remote cursor.
-- [ ] Expired (client-side TTL) or unauthorized messages are not delivered.
-- [ ] Private mode and session teardown stop delivery and background resources.
-- [ ] Polling frequency/backoff and maximum unread work remain bounded and visible in status (backlog pause threshold enforced).
-- [ ] Acknowledgment and delivery are demonstrably local-state only: no remote mutation occurs on ack, and no automatic remote deletion exists (manual GC command only).
+- [x] Reconnect/restart replays do not cause repeated logical notifications beyond the documented at-least-once + client-dedupe guarantee. _T17: replay/restart dedupe tests over the durable per-consumer state (chunk 1); chunk 2 adds a fresh-runtime-over-same-state-dir test — the feed still contains the message, dedupe suppresses the repeat, the entry stays visible path-only (never loss)._
+- [x] Two consumers maintain independent local cursors; offline startup works without the remote cursor. _T17: two-consumer test with fully independent dedupe sets and offline first poll (chunk 1); chunk 2 adds same-dir/different-consumerId with distinct state files and recipient-filtered routing._
+- [x] Expired (client-side TTL) or unauthorized messages are not delivered. _T17: expired/unauthorized visibly skipped (never silent), recipient filter is client policy only (chunk 1 tests; routing-labels-not-confidentiality disclosed in tool output)._
+- [x] Private mode and session teardown stop delivery and background resources. _T17 chunk 2: live private-mode gate re-read per cycle (fail closed: invalid config → zero reads; test asserts request count frozen while private, resume after flip-back); `stop()` wired to session_before_switch/fork/tree/shutdown; a new poller over the same durable state starts at session_start (dedupe makes restart replay-safe)._
+- [x] Polling frequency/backoff and maximum unread work remain bounded and visible in status (backlog pause threshold enforced). _T17: 60 s active interval, 3 empty polls → capped backoff 15 min, ≤20 pages/cycle, backlog pause at 500 with visible `backlog-paused` (chunk 1); chunk 2 surfaces a sanitized snapshot (`state/unread/consumer`, error name:code fingerprints) via `/kiwifs-status` and the `kiwifs_board_inbox` tool._
+- [x] Acknowledgment and delivery are demonstrably local-state only: no remote mutation occurs on ack, and no automatic remote deletion exists (manual GC command only). _T17: the delivery state file holds no backend reference (structural local-only); request-count-unchanged assertions at runtime and tool level; `kiwifs_board_ack` discloses “no remote mutation”; no deletion path exists anywhere in delivery (manual /kiwifs-board-gc is T18’s explicit-confirmation command)._
 
 ### T18 — Implement user controls, forgetting and status
 

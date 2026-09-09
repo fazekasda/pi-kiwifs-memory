@@ -40,8 +40,10 @@ function loadCommand(): { status: Command; verify: Command } {
     ["kiwifs-backup-verify", "kiwifs-status"],
     [...commands.keys()].sort(),
   );
-  // T13/T16: recall tools plus the three board tools registered at startup.
+  // T13/T16/T17: recall tools, board tools, delivery inbox + local ack.
   assert.deepEqual([...tools.keys()].sort(), [
+    "kiwifs_board_ack",
+    "kiwifs_board_inbox",
     "kiwifs_board_list",
     "kiwifs_board_read",
     "kiwifs_board_send",

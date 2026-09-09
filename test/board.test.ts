@@ -384,8 +384,16 @@ test("list clamps limit and forwards offset per the query_meta contract", async 
   const res = await t.repo.list("paged", { limit: 5000, offset: 1 });
   if (!res.ok) throw new Error("list should succeed");
   assert.equal(res.paths.length, 1); // fake server ignores offset; contract
-  // is that the repository forwards it verbatim (args asserted below).
-  const args = lastToolArgs(t.server.state, "kiwi_query_meta");
+  // is that the repository forwards it verbatim on the FIRST page (args
+  // asserted below); underfill recovery may fetch bounded further pages.
+  const calls = t.server.state.requests.filter((r) =>
+    r.body.includes("kiwi_query_meta"),
+  );
+  const args = JSON.parse(calls[0]?.body ?? "{}").params.arguments as Record<
+    string,
+    unknown
+  >;
+  assert.ok(calls.length >= 1);
   assert.equal(args["limit"], 200); // clamped, not 5000
   assert.equal(args["offset"], 1);
   const filters = args["filters"] as Record<string, string>;

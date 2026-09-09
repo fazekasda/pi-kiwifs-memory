@@ -1373,3 +1373,157 @@ but the no-op guarantee requires persisting `created`).
   non-retryable → worker quarantines with visible reason). Behavior
   unchanged; error name now matches semantics. Test asserts the typed error
   and its non-retryability.
+
+## T17 — Board delivery and acknowledgment (chunk 1: domain modules, no integration)
+
+### Implemented
+
+- `src/board/delivery.ts`: `DeliveryStateFile` (durable per-consumer state,
+  atomic temp+fsync+rename writes, acked-only pruning, undelivered entries
+  never evicted) and `BoardDelivery` (bounded `kiwi_changes` poll cycles:
+  ≤20 pages/cycle, 60 s active interval, 3 empty polls → capped backoff
+  15 min, backlog pause at 500 with visible `backlog-paused` status,
+  private mode stops delivery with zero reads, client-side TTL at read
+  time, recipient routing check as client policy, msg_id dedupe,
+  created-order delivery because server sort is untrusted, opaque bodies).
+  Remote cursor persisted only after a fully completed cycle, so an
+  availability/private pause never strands undelivered messages.
+- T16 follow-up fixes in `src/board/repository.ts`:
+  - read faults on availability now return typed `unavailable` (not
+    `missing`, which masked transient outages); `CancelledError` rethrown.
+  - `list` pages past containment-filter underfill (bounded `maxPages`,
+    safe against offset-ignoring backends); documented that server-side
+    `sort` is not relied upon.
+- Ack is structural local-state only: `DeliveryStateFile` holds no backend
+  reference; `ack()` issues no network request (test asserts request count
+  unchanged).
+
+### Tests actually run
+
+- `test/board-delivery.test.ts` (new, 17 tests): replay/restart dedupe,
+  two independent consumers, offline startup without remote cursor,
+  expired/unauthorized visibly skipped, ack local-only + durable,
+  private mode zero I/O, backlog pause/resume, backoff growth+cap,
+  transient read fault pause without cursor advance then delivery retry,
+  deliver-callback crash → at-least-once replay, created-order delivery,
+  opaque body passthrough, repo `unavailable` mapping, list underfill
+  paging + offset-ignoring tolerance.
+- Updated `test/board.test.ts` paging-contract test for the new bounded
+  multi-page listing (first page still forwards clamped limit + offset
+  verbatim).
+
+### Checks actually run (all green)
+
+- `npx tsc --noEmit`: clean; `npx prettier --check .`: clean.
+- `npm run check`: 371 pass / 0 fail.
+
+### Limits / honest notes
+
+- No index/tool/status integration yet (next chunk); no commit (per task
+  instructions).
+- Backlog pause counts delivered-but-unacked plus undelivered entries;
+  eviction removes only acked/skipped entries, so an all-unacked backlog
+  beyond 2,000 entries keeps growing on disk by design (visible, never
+  silently dropped).
+- `DeliveryStateFile` throws on a newer on-disk schema version (fail
+  closed, file never destructively rewritten).
+- Server sort remains live-unverified; delivery orders client-side.
+
+## T17 — Board delivery and acknowledgment (chunk 2: Pi lifecycle/tools/status integration)
+
+### Implemented
+
+- `src/board/runtime.ts` (new): `BoardDeliveryRuntime` — session-scoped
+  wrapper over the chunk-1 domain modules.
+  - HELD VISIBLY (sanitized reason in status) when the board feature is off,
+    the backend is unconfigured, the credential reference does not resolve,
+    or `board.consumerId` is not configured — per-consumer cursors must
+    outlive a session, so there is no safe default consumer identity.
+    Send/list/read remain available without it.
+  - `start()` schedules the bounded poller; `stop()` is wired to every
+    generation-changing lifecycle event (switch/fork/tree/shutdown); a fresh
+    poller over the same durable state file starts at `session_start`
+    (dedupe makes restart replay-safe). In-flight cycle completes
+    best-effort (architecture §133); the remote cursor only advances on a
+    fully completed cycle, so pauses never strand undelivered messages.
+  - Live private-mode gate: config re-read per cycle; an INVALID config
+    fails closed to private (zero reads). Zero I/O while private is
+    asserted by test.
+  - Notification policy boundary: delivery never interrupts active work —
+    no injection, no model-loop callbacks. Delivered bodies go to a bounded
+    in-memory buffer (cap 50, oldest dropped) surfaced by
+    `kiwifs_board_inbox`; deliveries from previous sessions are listed
+    path-only from the durable state (never lost; read explicitly with
+    `kiwifs_board_read`). Bodies are UNTRUSTED DATA, framed verbatim, never
+    parsed or executed (decisions.md #4).
+- `src/board/tools.ts`: `kiwifs_board_inbox` (delivery status + unread
+  entries, untrusted framing, routing-labels disclosure) and
+  `kiwifs_board_ack` (LOCAL-ONLY ack; output and tool text state "no remote
+  mutation, no deletion"). Both share the existing private-mode/hold gates.
+- `src/config/schema.ts`: optional `board: { consumerId, recipient? }`
+  block. `consumerId` grammar `^[a-z0-9][a-z0-9_-]{0,63}$` (filename-safe);
+  unknown keys/empty recipient fail validation. `recipient` is an optional
+  client-side routing filter (labels, not confidentiality).
+- `src/index.ts`: runtime construction (own adapter instance, ledger-bound),
+  held-reason plumbing, `lastBoardNote` status probe (sanitized
+  `state/unread/consumer` + name:code error fingerprints), tool
+  registration, and lifecycle start/stop wiring.
+
+### Tests actually run
+
+- `test/board-integration.test.ts` (new, 16 tests): config validation
+  (accept/reject matrix), timer-path delivery + stop() halts all backend
+  requests, restart over the same durable state without repeated
+  notifications (previous-session entry listed path-only), same-dir
+  different-consumerId independence with recipient filter, live private
+  gate zero-reads/resume, buffer cap with full durable coverage (nothing
+  lost), runtime + tool ack local-only (request count unchanged), tool
+  refusals (unconfigured/private), status held reasons, and the full
+  lifecycle test (session_start → poller runs and surfaces sanitized state
+  → switch/shutdown stop it; offline startup against an unreachable
+  endpoint does not crash).
+- `test/extension.test.ts` updated for the two registered tools.
+
+### Checks actually run (final tree, all green)
+
+- `npx tsc --noEmit`: clean; `prettier --check .`: clean.
+- `npm run check`: 387 pass / 0 fail (371 prior + 16 new).
+- `npm run pack:check`: clean (packed extension loads in Pi RPC).
+- `devenv test`: passed.
+
+### Limits / honest notes
+
+- Delivery interval, backlog threshold, and backoff are the §13 row 12
+  defaults; they are not user-configurable yet (T18 owns user controls).
+- The `board.recipient` filter skips not-addressed-to-me messages as
+  "unauthorized"; with no recipient configured, every board-channel message
+  is delivered (bounded by the backlog pause and visible in status).
+- Server-side `kiwi_changes` sort remains live-unverified; delivery orders
+  client-side by `created` (unchanged from chunk 1).
+- Ack retention/eviction bounds are the chunk-1 defaults (14 d retention,
+  2,000-entry cap, undelivered never evicted).
+- No commit (per task instructions; staged files listed for review).
+
+### Review fixes (post-review, 2026-09-10)
+
+- Visible hold when the board feature is on but `mcp.auth` is unset:
+  `deliveryHeldReason` now names the missing credential and board-tool
+  refusals surface it. Verified during testing that the schema already
+  rejects an enabled config without `mcp.auth` ("credential reference is
+  required"), so the primary visibility is the config error itself; the
+  runtime branch is fail-visible defense in depth (the schema type is
+  optional). Test asserts the visible config-level rejection.
+- `BoardDelivery.start()` is idempotent (a second call no longer chains a
+  second timer tree).
+- `fetchChanges` uses a typed `BoardRepository.changes()` seam instead of
+  reaching into the private adapter field via `as unknown as`.
+- `unreadCount()` dropped its unused `now` parameter.
+- `ack()` purges the acknowledged body from the in-memory buffer
+  (durable state remains authoritative).
+- Single-instance assumption documented in `runtime.ts`: one process per
+  `consumerId` (two concurrent writers to one state file would
+  last-write-wins; distinct consumer ids are fully independent).
+- Known-remaining (cosmetic, deferred): after `stop()`, the last cycle's
+  `lastError` fingerprint can drop from the runtime status snapshot; ack
+  state thresholds are still the chunk-1 defaults until T18 owns user
+  controls; server-side sort remains live-unverified.

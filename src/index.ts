@@ -33,13 +33,17 @@ import {
   type RecallRuntime,
   type RecallToolsDeps,
 } from "./inject/tools.ts";
+import { BoardRepository } from "./board/repository.ts";
 import {
   buildBoardReadTool,
   buildBoardListTool,
   buildBoardSendTool,
+  buildBoardInboxTool,
+  buildBoardAckTool,
   type BoardRuntime,
   type BoardToolsDeps,
 } from "./board/tools.ts";
+import { BoardDeliveryRuntime } from "./board/runtime.ts";
 import { createRedactor } from "./privacy/redaction.ts";
 import { QueryMetaTombstoneCache } from "./backend/guard.ts";
 import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
@@ -65,6 +69,8 @@ let lastRetrievalNote: (() => string | undefined) | undefined;
 let lastTokenizerNote: (() => string | undefined) | undefined;
 /** Last backup capture error/note, surfaced via status (fail-visible, T14). */
 let lastBackupNote: (() => string | undefined) | undefined;
+/** Last board delivery note/status, surfaced via status (fail-visible, T17). */
+let lastBoardNote: (() => string | undefined) | undefined;
 
 /** Test/inspection hook for the coordinator error probe. */
 export function setCoordinatorErrorProbe(
@@ -101,6 +107,13 @@ export function setBackupNoteProbe(
   lastBackupNote = probe;
 }
 
+/** Test/inspection hook for the board delivery note probe (T17). */
+export function setBoardNoteProbe(
+  probe: (() => string | undefined) | undefined,
+): void {
+  lastBoardNote = probe;
+}
+
 /**
  * Resolves the configuration for display. Never throws: configuration
  * problems are visible status output, not crashes (fail-visible, T03).
@@ -134,6 +147,8 @@ export function resolveStatusText(): string {
   if (tokenizerNote) text += `\ntokenizer: ${tokenizerNote}`;
   const backupNote = lastBackupNote?.();
   if (backupNote) text += `\nbackup: ${backupNote}`;
+  const boardNote = lastBoardNote?.();
+  if (boardNote) text += `\nboard delivery: ${boardNote}`;
   if (result.ok && result.config.enabled) {
     const features = effectiveFeatures(result.config);
     if (features.observation && !result.config.model.auth) {
@@ -232,6 +247,9 @@ interface SessionRuntime {
   /** T14: incremental transcript backup capture (may be undefined). */
   backup: BackupCapture | undefined;
   backupHeldReason: string | undefined;
+  /** T17: bounded board delivery + local ack state (may be undefined). */
+  delivery: BoardDeliveryRuntime | undefined;
+  deliveryHeldReason: string | undefined;
 }
 
 /**
@@ -522,6 +540,70 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       }
     }
   }
+  // T17: bounded board delivery + local acknowledgment state. Requires the
+  // board feature, a configured/resolvable backend and a STABLE consumer id
+  // (board.consumerId) — per-consumer cursors must outlive a session, so
+  // there is no safe default; without it delivery is HELD VISIBLY. The
+  // private-mode gate is re-evaluated per cycle (fail closed: invalid config
+  // → zero reads) and stop() is wired to every generation-changing lifecycle
+  // event below.
+  let delivery: BoardDeliveryRuntime | undefined;
+  let deliveryHeldReason: string | undefined;
+  if (store && config && config.enabled && config.mcp.url !== "") {
+    const features17 = effectiveFeatures(config);
+    if (features17.board) {
+      if (!config.mcp.auth) {
+        // Visible hold (T17 review fix): the backend can never be reached,
+        // so delivery must not look silently "idle/empty" — and the inbox
+        // tool's refusal must point at the real cause, not at consumerId.
+        deliveryHeldReason =
+          "mcp.auth not configured — no backend reads; configure the credential to enable board delivery";
+      } else if (!resolveAuthSecret(config.mcp.auth)) {
+        deliveryHeldReason =
+          "backend credential reference does not resolve (retryable hold)";
+      } else if (!config.board?.consumerId) {
+        deliveryHeldReason =
+          "board.consumerId not configured — per-consumer delivery state requires a stable id; send/list/read remain available";
+      } else {
+        try {
+          const mcpAuth: AuthRef = config.mcp.auth;
+          const mcpUrl = config.mcp.url;
+          // Live gates: re-read config per cycle/call; an INVALID config
+          // fails closed to private (zero reads, zero writes).
+          const liveGate = () => {
+            const r = loadConfig();
+            return !r.ok || r.config.privateMode;
+          };
+          const repoGate = {
+            get isPrivate() {
+              return liveGate();
+            },
+          };
+          const boardRepo = new BoardRepository(
+            new KiwiFSAdapter({
+              url: mcpUrl,
+              headers: {
+                Authorization: `Bearer ${resolveAuthSecret(mcpAuth) ?? ""}`,
+              },
+              ledger: store.ledger(),
+            }),
+            { privateMode: repoGate },
+          );
+          delivery = new BoardDeliveryRuntime({
+            stateDir: join(stateDir, "board"),
+            consumerId: config.board.consumerId,
+            ...(config.board.recipient !== undefined
+              ? { recipient: config.board.recipient }
+              : {}),
+            repo: boardRepo,
+            isPrivate: liveGate,
+          });
+        } catch (err) {
+          deliveryHeldReason = `board delivery init failed: ${(err as Error).message}`;
+        }
+      }
+    }
+  }
   return {
     coordinator,
     observer,
@@ -535,6 +617,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     tokenizerNote,
     backup,
     backupHeldReason,
+    delivery,
+    deliveryHeldReason,
   };
 }
 
@@ -597,6 +681,16 @@ export function registerSessionHandlers(
     const lines = runtime?.backup?.pendingStatus() ?? [];
     return lines.length > 0 ? lines.join("; ") : undefined;
   };
+  lastBoardNote = () => {
+    if (runtime?.deliveryHeldReason) return runtime.deliveryHeldReason;
+    const d = runtime?.delivery;
+    if (!d) return undefined;
+    const s = d.statusSnapshot();
+    const err = d.lastErrorFingerprint();
+    return `state=${s.runState} unread=${s.unread} consumer=${s.consumerId}${
+      err ? ` lastError=${err}` : ""
+    }`;
+  };
 
   const get = (ctx: ExtensionContext): SessionRuntime | undefined => {
     if (runtime) return runtime;
@@ -658,11 +752,17 @@ export function registerSessionHandlers(
         adapter: rt.retrieval.adapter,
         outbox: rt.store,
         boardEnabled: effectiveFeatures(config).board,
+        ...(rt.delivery ? { delivery: rt.delivery } : {}),
       };
     };
     return {
       getRuntime: getBoardRuntime,
-      getHeldReason,
+      // Board tools carry the delivery hold reason too: an unconfigured
+      // backend credential must surface its real cause, not a generic hold.
+      getHeldReason: () =>
+        runtime?.retrievalHeldReason ??
+        runtime?.deliveryHeldReason ??
+        runtimeError,
       privateMode: () => config.privateMode,
       redact: createRedactor(),
     };
@@ -670,6 +770,10 @@ export function registerSessionHandlers(
   pi.registerTool(buildBoardSendTool(boardDeps));
   pi.registerTool(buildBoardListTool(boardDeps));
   pi.registerTool(buildBoardReadTool(boardDeps));
+  // T17: delivery surface — bounded bounded-buffer inbox + LOCAL-ONLY ack
+  // (no remote mutation; same private-mode/hold gates as the other tools).
+  pi.registerTool(buildBoardInboxTool(boardDeps));
+  pi.registerTool(buildBoardAckTool(boardDeps));
 
   // No-UI access: handlers only read ctx.sessionManager / ctx.cwd.
   pi.on("session_start", async (event, ctx) => {
@@ -690,6 +794,10 @@ export function registerSessionHandlers(
       rt.coordinator.sessionId ?? "pending",
       rt.coordinator.branchId ?? undefined,
     );
+    // T17: start bounded board delivery for the current generation (a
+    // stop() at switch/fork/tree/shutdown is undone here by a fresh poller
+    // over the same durable state file; dedupe absorbs anything handled).
+    rt?.delivery?.start();
   });
   // T12: per-input retrieval. `input` handlers are awaited by Pi BEFORE the
   // first LLM call — including queued (steer/followUp) inputs — so the
@@ -765,12 +873,18 @@ export function registerSessionHandlers(
   pi.on("session_before_fork", async () => {
     // No ctx needed: fork snapshot point; generation re-mints at session_start.
     runtime?.coordinator.onBeforeFork();
+    // T17: stop board polling for the old generation (§133, best-effort).
+    runtime?.delivery?.stop();
   });
   pi.on("session_before_switch", async () => {
     runtime?.coordinator.onBeforeSwitch();
+    // T17: stop board polling for the old generation (§133, best-effort).
+    runtime?.delivery?.stop();
   });
   pi.on("session_before_tree", async (event) => {
     runtime?.coordinator.onBeforeTree(event.preparation, event.signal);
+    // T17: stop board polling for the old generation (§133, best-effort).
+    runtime?.delivery?.stop();
   });
   pi.on("session_tree", async (event, ctx) => {
     runtime?.coordinator.onTree(ctx, event.oldLeafId, event.newLeafId);
@@ -799,6 +913,11 @@ export function registerSessionHandlers(
     }
     runtime?.observer?.dispose();
     runtime?.coordinator.onShutdown();
+    // T17: session teardown stops delivery and all background board work
+    // (PRD T17: private mode and teardown stop delivery + background
+    // resources; the durable state file makes the next session's restart
+    // replay-safe with no repeated logical notifications).
+    runtime?.delivery?.stop();
   });
 }
 

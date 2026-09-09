@@ -21,11 +21,13 @@
  */
 
 import {
+  CancelledError,
   ConflictError,
   OpIdNotPersistedError,
   PrivacyGateError,
 } from "../backend/errors.ts";
-import type { KiwiFSAdapter } from "../backend/adapter.ts";
+import { isRetryable } from "../backend/errors.ts";
+import type { ChangesResult, KiwiFSAdapter } from "../backend/adapter.ts";
 import {
   pathWithinBoardChannel,
   validateId,
@@ -90,7 +92,8 @@ export type ReadResult =
         | "future-version"
         | "unsupported-version"
         | "out-of-channel"
-        | "bad-request";
+        | "bad-request"
+        | "unavailable";
       detail: string;
     };
 
@@ -121,6 +124,19 @@ export class BoardRepository {
   constructor(adapter: KiwiFSAdapter, opts: BoardRepositoryOptions = {}) {
     this.adapter = adapter;
     this.opts = { now: opts.now ?? (() => new Date()), ...opts };
+  }
+
+  /**
+   * Raw `kiwi_changes` feed for cursor consumers (T17 delivery). A typed
+   * narrow seam instead of reaching into the private adapter field. Contains
+   * NO channel containment (that is the read path's job) — the delivery
+   * layer filters board paths itself and never executes change payloads.
+   */
+  changes(
+    since: string,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<ChangesResult> {
+    return this.adapter.changes(since, opts);
   }
 
   /**
@@ -179,6 +195,16 @@ export class BoardRepository {
    * Lists message paths in a channel via `kiwi_query_meta`, post-filtered by
    * strict `board/{channel}/` containment (query results are advisory on a
    * shared-key backend, so the client re-checks every path).
+   *
+   * Because the containment post-filter may drop paths the server returned,
+   * a single page can UNDERFILL the requested limit while more matching
+   * paths exist. This method therefore keeps fetching subsequent pages
+   * (bounded by `maxPages`) until the limit is filled or a page yields no
+   * new matching paths. It never assumes more than the observed evidence.
+   *
+   * Ordering: the server-side `sort` parameter is NOT relied upon (its
+   * behavior has not been verified against the live backend); callers must
+   * not depend on the order of the returned paths.
    */
   async list(
     channel: string,
@@ -187,6 +213,8 @@ export class BoardRepository {
       to?: string;
       limit?: number;
       offset?: number;
+      /** Page-fetch bound for containment-underfill recovery. */
+      maxPages?: number;
       signal?: AbortSignal;
     } = {},
   ): Promise<ListResult> {
@@ -207,19 +235,38 @@ export class BoardRepository {
       opts.limit !== undefined
         ? Math.min(Math.max(1, opts.limit), BOARD_LIST_MAX)
         : BOARD_LIST_MAX;
-    const res = await this.adapter.queryMeta(filters, {
-      ...(opts.offset !== undefined ? { offset: opts.offset } : {}),
-      limit,
-      signal: opts.signal,
-    });
-    const paths: string[] = [];
-    for (const line of res.text.split("\n")) {
-      const m = /^path:\s*(\S+)/.exec(line);
-      if (!m) continue;
-      const p = m[1] as string;
-      if (pathWithinBoardChannel(p, channel)) paths.push(p);
+    const maxPages = opts.maxPages ?? 10;
+    const seen = new Set<string>();
+    let offset = opts.offset ?? 0;
+    let exhausted = false;
+    for (let page = 0; page < maxPages && !exhausted; page++) {
+      const res = await this.adapter.queryMeta(filters, {
+        ...(offset !== 0 ? { offset } : {}),
+        limit,
+        signal: opts.signal,
+      });
+      let rawCount = 0;
+      let newKept = 0;
+      for (const line of res.text.split("\n")) {
+        const m = /^path:\s*(\S+)/.exec(line);
+        if (!m) continue;
+        rawCount++;
+        const p = m[1] as string;
+        if (!pathWithinBoardChannel(p, channel)) continue;
+        if (seen.has(p)) continue;
+        seen.add(p);
+        newKept++;
+      }
+      // Fill the limit by paging past containment-filter drops. A page with
+      // no newly kept paths means the listing is exhausted (also guards
+      // against backends that ignore `offset` — the loop is bounded anyway).
+      if (seen.size >= limit || rawCount === 0 || newKept === 0) {
+        exhausted = true;
+      } else {
+        offset += limit;
+      }
     }
-    return { ok: true, paths };
+    return { ok: true, paths: [...seen].slice(0, limit) };
   }
 
   /**
@@ -244,7 +291,18 @@ export class BoardRepository {
     let raw;
     try {
       raw = await this.adapter.read(path, { signal: opts.signal });
-    } catch {
+    } catch (err) {
+      // Distinguish transient availability from a genuinely absent message:
+      // mapping a backend outage to "missing" would mask that the message
+      // may still exist and must be retried later (T16 follow-up).
+      if (isRetryable(err)) {
+        return {
+          ok: false,
+          reason: "unavailable",
+          detail: "backend availability fault; message state unknown",
+        };
+      }
+      if (err instanceof CancelledError) throw err;
       return { ok: false, reason: "missing", detail: "backend read failed" };
     }
     if (raw.state === "missing") {
