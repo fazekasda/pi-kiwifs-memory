@@ -843,7 +843,9 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
           return;
         }
         await adapter.connect();
-        const result = await verifyRemoteBackup(adapter, projectId, sessionId);
+        const result = await verifyRemoteBackup(adapter, projectId, sessionId, {
+          expectedScope: scope,
+        });
         if (result.state === "missing") {
           if (ctx.hasUI) ctx.ui.notify(`backup: ${result.detail}`, "info");
           return;

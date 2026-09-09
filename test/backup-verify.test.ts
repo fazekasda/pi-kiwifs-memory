@@ -15,7 +15,15 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { toBackupViews } from "../src/backup/exporter.ts";
@@ -119,6 +127,8 @@ test("T15 AC2/AC5: healthy backup verifies; fidelity is redaction-honest", () =>
     manifest: f.manifest,
     chunks: f.chunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, true, JSON.stringify(v.issues));
   assert.equal(v.coveredEntryIds.join(","), f.views.map((x) => x.id).join(","));
@@ -137,6 +147,8 @@ test("T15 AC1: missing chunk is detected", () => {
     manifest: f.manifest,
     chunks: reduced,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, false);
   assert.ok(issueCodes(v).has("missing-chunk"));
@@ -152,6 +164,8 @@ test("T15 AC1: duplicated/extra delivered chunk is detected", () => {
     manifest: f.manifest,
     chunks: extra,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, false);
   assert.ok(issueCodes(v).has("unexpected-chunk"));
@@ -168,6 +182,8 @@ test("T15 AC1: reordered chunks are detected (content seq ≠ manifest seq)", ()
     manifest: f.manifest,
     chunks: swapped,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, false);
   assert.ok(issueCodes(v).has("seq-mismatch"));
@@ -184,6 +200,8 @@ test("T15 AC1: corrupted chunk bytes fail the checksum", () => {
     manifest: f.manifest,
     chunks: corrupted,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, false);
   assert.ok(issueCodes(v).has("checksum-mismatch"));
@@ -200,6 +218,8 @@ test("T15 AC1: manifest completeness — count/range/duplicate-coverage gaps det
     manifest: badCount,
     chunks: f.chunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.ok(issueCodes(vCount).has("entry-count-mismatch"));
   // first entry id mismatch.
@@ -211,6 +231,8 @@ test("T15 AC1: manifest completeness — count/range/duplicate-coverage gaps det
     manifest: badRange,
     chunks: f.chunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.ok(issueCodes(vRange).has("range-mismatch"));
   // duplicate coverage: the same entries delivered in two chunks (content).
@@ -243,6 +265,8 @@ test("T15 AC1: manifest completeness — count/range/duplicate-coverage gaps det
     manifest: dupManifest,
     chunks: dupChunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.ok(issueCodes(vDup).has("duplicate-coverage"));
 });
@@ -297,7 +321,13 @@ test("T15 AC1: unlinked parent (branch link into uncovered/later entry) is detec
     [0, serializeChunk({ sessionId: SESSION, seq: 0, entries: [parentView] })],
     [1, serializeChunk({ sessionId: SESSION, seq: 1, entries: [childView] })],
   ]);
-  const v = verifyBackup({ manifest, chunks, sessionId: SESSION });
+  const v = verifyBackup({
+    manifest,
+    chunks,
+    sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
+  });
   assert.equal(v.ok, false);
   assert.ok(issueCodes(v).has("unlinked-parent"));
 });
@@ -323,6 +353,8 @@ test("T15 AC4: foreign/newer schema versions fail closed (manifest and chunk)", 
     manifest: newer as typeof f.manifest,
     chunks: f.chunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, false);
   assert.ok(issueCodes(v).has("schema-unsupported"));
@@ -347,6 +379,8 @@ test("T15 AC2/AC3: round-trip export recovers promised fields with redaction/omi
     manifest: f.manifest,
     chunks: f.chunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.equal(v.ok, true);
   const dest = join(mkdtempSync(join(tmpdir(), "kiwifs-t15-")), "export-new");
@@ -394,6 +428,8 @@ test("T15 AC3: export refuses existing destination, unverified backups and unsaf
     manifest: f.manifest,
     chunks: f.chunks,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   const dest = mkdtempSync(join(tmpdir(), "kiwifs-t15-"));
   assert.throws(
@@ -412,6 +448,8 @@ test("T15 AC3: export refuses existing destination, unverified backups and unsaf
     manifest: f.manifest,
     chunks: broken,
     sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
   });
   assert.throws(
     () =>
@@ -429,4 +467,111 @@ test("T15 AC3: export refuses existing destination, unverified backups and unsaf
     ExportRefusedError,
   );
   rmSync(dest, { recursive: true, force: true });
+});
+
+test("T15 hardening: identity gate refuses wrong projectId and wrong scope", () => {
+  const f = buildFixture();
+  const base = {
+    manifest: f.manifest,
+    chunks: f.chunks,
+    sessionId: SESSION,
+  };
+  const wrongProject = verifyBackup({ ...base, projectId: "other-proj" });
+  assert.equal(wrongProject.ok, false);
+  assert.ok(issueCodes(wrongProject).has("identity-mismatch"));
+  const wrongScope = verifyBackup({
+    ...base,
+    projectId: "demo-proj",
+    scope: "project/other-proj",
+  });
+  assert.equal(wrongScope.ok, false);
+  assert.ok(issueCodes(wrongScope).has("identity-mismatch"));
+  // Matching identity still verifies.
+  const ok = verifyBackup({ ...base, projectId: "demo-proj", scope: SCOPE });
+  assert.equal(ok.ok, true, JSON.stringify(ok.issues));
+});
+
+test("T15 hardening: null endpoints on a nonempty manifest cannot bypass range validation", () => {
+  const f = buildFixture();
+  const sneaky = {
+    ...f.manifest,
+    coveredRange: {
+      ...f.manifest.coveredRange,
+      firstEntryId: null,
+      lastEntryId: null,
+    },
+  };
+  const v = verifyBackup({
+    manifest: sneaky,
+    chunks: f.chunks,
+    sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
+  });
+  assert.equal(v.ok, false);
+  assert.ok(issueCodes(v).has("range-mismatch"));
+  // Export is gated on verification: an unverified backup is never exported.
+  assert.throws(
+    () =>
+      exportBackup({
+        verification: v,
+        chunks: f.chunks,
+        destination: join(mkdtempSync(join(tmpdir(), "kiwifs-t15-")), "x"),
+      }),
+    ExportRefusedError,
+  );
+});
+
+test("T15 hardening: export atomically claims a fresh dir (EEXIST, symlink refusal) and enforces 0700/0600", () => {
+  const f = buildFixture();
+  const v = verifyBackup({
+    manifest: f.manifest,
+    chunks: f.chunks,
+    sessionId: SESSION,
+    projectId: "demo-proj",
+    scope: SCOPE,
+  });
+  assert.equal(v.ok, true);
+  const parent = mkdtempSync(join(tmpdir(), "kiwifs-t15-"));
+  const dest = join(parent, "export-new");
+  const ex = exportBackup({
+    verification: v,
+    chunks: f.chunks,
+    destination: dest,
+  });
+  // Fresh-claim mode is absolute regardless of umask.
+  const st = statSync(dest);
+  assert.equal(st.mode & 0o777, 0o700, `dest mode ${st.mode.toString(8)}`);
+  for (const file of ex.files) {
+    const fst = statSync(file);
+    assert.equal(
+      fst.mode & 0o777,
+      0o600,
+      `file mode ${file}: ${fst.mode.toString(8)}`,
+    );
+  }
+  // Second export to the now-existing destination is refused (EEXIST path),
+  // and nothing is written into it.
+  assert.throws(
+    () =>
+      exportBackup({ verification: v, chunks: f.chunks, destination: dest }),
+    ExportRefusedError,
+  );
+  // +1 for the chunks directory entry itself (ex.files lists files only).
+  const onDisk =
+    readdirSync(dest).length + readdirSync(join(dest, "chunks")).length;
+  assert.equal(
+    onDisk,
+    ex.files.length + 1,
+    "refusal wrote nothing into the existing destination",
+  );
+  // A symlink at the destination is refused, never followed or replaced.
+  const link = join(parent, "link-dest");
+  symlinkSync(join(parent, "export-new"), link);
+  assert.throws(
+    () =>
+      exportBackup({ verification: v, chunks: f.chunks, destination: link }),
+    ExportRefusedError,
+  );
+  rmSync(parent, { recursive: true, force: true });
 });

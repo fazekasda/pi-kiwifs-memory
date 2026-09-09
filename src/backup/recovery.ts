@@ -6,7 +6,14 @@
  * Detection of duplicated/extra deliveries probes one seq beyond the
  * manifest's maximum declared seq; any content found there is included in
  * the chunk map and flagged, so `verifyBackup` reports it as an
- * "unexpected-chunk" issue (never silently ignored).
+ * "unexpected-chunk" issue (never silently ignored). The probe is strictly
+ * bounded: a single read at `maxSeq + 1`, gated by the same 999999 seq
+ * ceiling the path helper enforces — no unbounded enumeration.
+ *
+ * All issue details are sanitized by construction: IDs, seqs, counts and
+ * paths only — never chunk or transcript content (privacy.md §redaction).
+ * The manifest's projectId/scope are verified against the requested
+ * identity (T15-hardening) before verification/export trusts them.
  */
 
 import type { KiwiFSAdapter } from "../backend/adapter.ts";
@@ -97,7 +104,7 @@ export async function verifyRemoteBackup(
   adapter: KiwiFSAdapter,
   projectId: string,
   sessionId: string,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; expectedScope?: string } = {},
 ): Promise<
   | { state: "missing"; detail: string }
   | { state: "invalid"; issue: VerifyIssue }
@@ -114,6 +121,8 @@ export async function verifyRemoteBackup(
     manifest: fetched.manifest,
     chunks: fetched.chunks,
     sessionId,
+    projectId,
+    ...(opts.expectedScope !== undefined ? { scope: opts.expectedScope } : {}),
   });
   return {
     state: "verified",

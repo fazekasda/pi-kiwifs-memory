@@ -1122,3 +1122,71 @@ fail-closed then recovers (AC4); backup paths cannot pass ordinary retrieval gua
   `src/backup/verify.ts` (new), `src/backup/recovery.ts` (new),
   `test/backup-verify.test.ts` (new), `test/extension.test.ts`,
   `tasks/prd-kiwifs-memory.md`, `tasks/execution-log.md`.
+
+## T15 hardening fixes — fix_hardening session (2026-09-09, no commit)
+
+Follow-up to the T15 hardening diff (uncommitted on top of b703c26), fixing the
+three typecheck errors found in review and closing the hardening coverage gap.
+
+### Changes
+
+- `src/backup/verify.ts`: `writePrivateFile` now writes via
+  `Buffer.from(content, "utf8")` — the previous `writeSync(fd, str, "utf8")`
+  call did not match any @types/node overload (TS2769).
+- `test/backup-verify.test.ts`: removed duplicated `projectId`/`scope` keys in
+  `buildBackupManifest` fixture (TS1117) and extraneous `projectId`/`scope`
+  props in the `serializeChunk` call (TS2353).
+- `test/backup-verify.test.ts`: three new hardening tests (14 total in file):
+  - identity gate: wrong `projectId` and wrong `scope` both produce
+    `identity-mismatch` and `ok: false`; matching identity still verifies.
+  - null-endpoint regression: nonempty manifest with `firstEntryId`/`lastEntryId`
+    forced to `null` fails with `range-mismatch`; export of that unverified
+    result throws `ExportRefusedError`.
+  - atomic claim + modes: `exportBackup` creates the destination with mode
+    0700 and every file at 0600 (umask-independent); a second export to the
+    now-existing destination is refused (EEXIST) writing nothing; a symlink at
+    the destination is refused, never followed.
+
+### Checks actually run
+
+- `npx tsc --noEmit`: clean (was 3 errors before this session).
+- `node --test test/backup-verify.test.ts`: 14 pass / 0 fail.
+- `npm run check`: tsc + prettier clean, 332 pass / 0 fail (one prettier
+  reformat of the new test block applied via `prettier --write`).
+- `npm run pack:check`: package OK; backup sources included; packed extension
+  loads in Pi RPC.
+- `devenv test`: "Tests passed :)" (full suite + pack smoke inside devenv).
+
+### Limits / honest notes
+
+- No commit made (per task instructions).
+
+## T15 hardening — final independent review + commit (commit_hardening)
+
+Independent re-inspection of the full hardening diff found two remaining flaws;
+both fixed in `src/backup/verify.ts` and verified by the full gate suite.
+
+### Fixes
+
+1. **Partial-write leak**: file paths were pushed onto the cleanup ledger only
+   AFTER `writePrivateFile` returned, so a mid-write failure (ENOSPC/EIO) left
+   an orphan 0600 file that cleanup never removed — and the non-recursive
+   `rmdirSync` then failed too, leaving the claimed directory behind.
+   Fix: `writePrivateFile` now takes the ledger and records the path
+   immediately after the exclusive 'wx' open succeeds — a failed write is
+   cleaned up, while a path planted between claim and write (EEXIST on 'wx')
+   never lands on the ledger and is never deleted (non-owned artifacts stay
+   untouched).
+2. **EEXIST race**: the `lstatSync(dest)` inside the EEXIST handler could
+   itself throw if the entry vanished in the mkdir→lstat window, escaping as a
+   raw error instead of an `ExportRefusedError`. Fix: best-effort `tryLstat`;
+   a missing entry is still a refusal, never a fallback write.
+
+### Checks actually run (final tree, all green)
+
+- `npm run check`: tsc + prettier clean, 332 pass / 0 fail.
+- `npm run pack:check`: package OK, backup sources in tarball, packed
+  extension loads in Pi RPC.
+- `devenv test`: "Tests passed :)".
+- Diff secret-scanned before staging; only the five reviewed task files
+  staged; commit created fresh (no amend of b703c26).

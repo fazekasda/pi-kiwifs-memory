@@ -24,7 +24,18 @@
  * explicitly deferred (architecture.md §13 row 20) and is not attempted here.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  rmSync,
+  rmdirSync,
+  writeSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { BACKUP_SCHEMA_VERSION, type BackupView } from "./exporter.ts";
 import { chunkChecksum } from "./chunker.ts";
@@ -43,6 +54,7 @@ export type VerifyIssueCode =
   | "duplicate-coverage"
   | "entry-count-mismatch"
   | "range-mismatch"
+  | "identity-mismatch"
   | "unlinked-parent";
 
 export interface VerifyIssue {
@@ -278,6 +290,10 @@ export interface VerifyInput {
   chunks: Map<number, string>;
   /** Session id the manifest must describe. */
   sessionId: string;
+  /** Project id the manifest must claim — never trusted blindly (T15-hardening). */
+  projectId: string;
+  /** When provided, the manifest scope must match it exactly. */
+  scope?: string;
 }
 
 /**
@@ -300,6 +316,21 @@ export function verifyBackup(input: VerifyInput): BackupVerification {
     issues.push({
       code: "session-mismatch",
       detail: `manifest sessionId ${manifest.sessionId} does not match requested ${input.sessionId}`,
+    });
+  }
+  // Identity gate: a manifest is only trusted for the project/scope it was
+  // requested for — a manifest from another project (or claiming a different
+  // scope) must never verify or export (T15-hardening).
+  if (manifest.projectId !== input.projectId) {
+    issues.push({
+      code: "identity-mismatch",
+      detail: `manifest projectId ${manifest.projectId} does not match requested ${input.projectId}`,
+    });
+  }
+  if (input.scope !== undefined && manifest.scope !== input.scope) {
+    issues.push({
+      code: "identity-mismatch",
+      detail: `manifest scope ${manifest.scope} does not match requested ${input.scope}`,
     });
   }
 
@@ -387,6 +418,23 @@ export function verifyBackup(input: VerifyInput): BackupVerification {
       detail: `manifest declares ${count} covered entries, chunks deliver ${coveredEntryIds.length}`,
     });
   }
+  // Null endpoints must mean an EMPTY backup. A nonempty backup (manifest
+  // entryCount > 0 OR delivered coverage) can never bypass range validation
+  // by claiming null endpoints (T15-hardening regression fix).
+  if (manifest.coveredRange.entryCount > 0) {
+    if (manifest.coveredRange.firstEntryId === null) {
+      issues.push({
+        code: "range-mismatch",
+        detail: `manifest declares ${manifest.coveredRange.entryCount} covered entries but a null firstEntryId — range endpoints are mandatory for a nonempty backup`,
+      });
+    }
+    if (manifest.coveredRange.lastEntryId === null) {
+      issues.push({
+        code: "range-mismatch",
+        detail: `manifest declares ${manifest.coveredRange.entryCount} covered entries but a null lastEntryId — range endpoints are mandatory for a nonempty backup`,
+      });
+    }
+  }
   if (
     manifest.coveredRange.firstEntryId !== null &&
     coveredEntryIds.length > 0 &&
@@ -448,11 +496,59 @@ export function verifyBackup(input: VerifyInput): BackupVerification {
 
 export class ExportRefusedError extends Error {}
 
+function tryLstat(path: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Writes a file with exclusive creation ('wx' — fails if the path exists,
+ * including as a symlink) and forces 0600 independent of the umask.
+ *
+ * `owned` is the cleanup ledger: the path is added ONLY after the exclusive
+ * open succeeded, so (a) a mid-write failure (ENOSPC/EIO) still leaves the
+ * partially-written file on the ledger for cleanup, while (b) a path planted
+ * between claim and write (EEXIST on 'wx') never lands on the ledger and is
+ * therefore never deleted — cleanup removes only what this call created.
+ */
+function writePrivateFile(
+  path: string,
+  content: string,
+  owned: string[],
+): void {
+  const fd = openSync(path, "wx", 0o600);
+  owned.push(path);
+  try {
+    writeSync(fd, Buffer.from(content, "utf8"));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  // mode in openSync is masked by the umask; chmod makes 0600 absolute.
+  chmodSync(path, 0o600);
+}
+
 /**
  * Non-destructive export of a VERIFIED backup to an explicit new
  * destination directory. Refuses to write when the destination exists,
  * when verification reported issues, or when the schema is unsupported —
  * recovery never implicitly overwrites anything (PRD T15).
+ *
+ * T15-hardening:
+ * - The destination is claimed ATOMICALLY with a non-recursive mkdir +
+ *   EEXIST refusal (no existsSync-then-mkdir TOCTOU race, no recursive
+ *   parent creation that could follow an attacker-planted symlink).
+ * - Dangling or pre-existing symlinks at the destination fail the mkdir or
+ *   are rejected via lstat; every file is written with O_EXCL ('wx') so a
+ *   path planted between claim and write is refused, never overwritten.
+ * - Modes are absolute: 0700 for directories and 0600 for files, enforced
+ *   with chmod independent of a permissive umask.
+ * - On any failure, ONLY artifacts this call created are removed (recorded
+ *   file paths + the claimed directories, non-recursively); preexisting or
+ *   non-owned content is never deleted.
  */
 export function exportBackup(input: {
   verification: BackupVerification;
@@ -475,30 +571,85 @@ export function exportBackup(input: {
   if (!dest || dest === "/" || dest.length < 2) {
     throw new ExportRefusedError("refusing to export to an unsafe destination");
   }
-  if (existsSync(dest)) {
+  // Atomic claim: create the destination with a SINGLE non-recursive mkdir.
+  // Any pre-existing entry (including symlinks, dangling or not) yields EEXIST
+  // and is refused — there is no stat-then-create race window.
+  try {
+    mkdirSync(dest, { mode: 0o700 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      // lstat is best-effort (the entry can vanish between mkdir and here in
+      // a race); a missing entry is still a refusal, never a fallback write.
+      const st = tryLstat(dest);
+      throw new ExportRefusedError(
+        `destination already exists${st?.isSymbolicLink() ? " (a symbolic link)" : ""}: ${dest} — export only writes to a NEW explicit destination`,
+      );
+    }
+    if (code === "ENOENT") {
+      throw new ExportRefusedError(
+        `destination parent directory does not exist: ${dest} — create it first (no recursive parent creation)`,
+      );
+    }
+    throw err;
+  }
+  // Defense in depth: if something swapped the path between mkdir and this
+  // check, refuse (the fresh directory would have been replaced).
+  const claimed = lstatSync(dest);
+  if (claimed.isSymbolicLink() || !claimed.isDirectory()) {
     throw new ExportRefusedError(
-      `destination already exists: ${dest} — export only writes to a NEW explicit destination`,
+      `destination was replaced after claim: ${dest} — refusing to export`,
     );
   }
-  mkdirSync(dest, { recursive: true });
+  chmodSync(dest, 0o700);
+
+  /** Artifacts created by THIS call — the only things cleanup may remove. */
   const files: string[] = [];
+  const cleanupOwned = (err: unknown): never => {
+    for (const p of files) {
+      try {
+        rmSync(p, { force: false });
+      } catch {
+        /* best-effort: never mask the original error */
+      }
+    }
+    for (const dir of [join(dest, "chunks"), dest]) {
+      try {
+        rmdirSync(dir); // non-recursive: fails if anything else remains
+      } catch {
+        /* never delete content we did not create */
+      }
+    }
+    throw err;
+  };
 
   const manifestPath = join(dest, "manifest.md");
-  writeFileSync(
-    manifestPath,
-    JSON.stringify(v.manifest, null, 2) + "\n",
-    "utf8",
-  );
-  files.push(manifestPath);
+  try {
+    writePrivateFile(
+      manifestPath,
+      JSON.stringify(v.manifest, null, 2) + "\n",
+      files,
+    );
+  } catch (err) {
+    cleanupOwned(err);
+  }
 
   const chunksDir = join(dest, "chunks");
-  mkdirSync(chunksDir);
+  try {
+    mkdirSync(chunksDir, { mode: 0o700 });
+    chmodSync(chunksDir, 0o700);
+  } catch (err) {
+    cleanupOwned(err);
+  }
   for (const record of v.manifest.chunks) {
     const content = input.chunks.get(record.seq);
     if (content === undefined) continue;
     const p = join(chunksDir, `${String(record.seq).padStart(6, "0")}.md`);
-    writeFileSync(p, content, "utf8");
-    files.push(p);
+    try {
+      writePrivateFile(p, content, files);
+    } catch (err) {
+      cleanupOwned(err);
+    }
   }
 
   // Human-readable recovery summary: redaction/omissions are represented
@@ -531,8 +682,15 @@ export function exportBackup(input: {
     "",
   ];
   const summaryPath = join(dest, "export-summary.md");
-  writeFileSync(summaryPath, lines.filter((l) => l !== "").join("\n"), "utf8");
-  files.push(summaryPath);
+  try {
+    writePrivateFile(
+      summaryPath,
+      lines.filter((l) => l !== "").join("\n"),
+      files,
+    );
+  } catch (err) {
+    cleanupOwned(err);
+  }
 
   return { destination: dest, files };
 }
