@@ -897,3 +897,123 @@ display, details }` CustomMessage (`buildEvidenceMessage`), matching
   is closed by Pi's event ordering in practice (steers are accepted only
   while streaming, i.e. after call 1's context fire), noted as timing- not
   structurally-guaranteed.
+
+## T14 — Transcript backup capture (implement_T14, 2026-09-09)
+
+Worker: implement_T14, runtime model OpenRouter `z-ai/glm-5.3-flash` (default, no
+fallback). Dependencies verified from Git/log: T06 (privacy gate: `createRedactor`,
+`compileExclusions`, `looksSecretBearing`), T08 (`SessionCoordinator` consumed-entry
+registry and lifecycle hooks) — both present at `ed80f1df0505db016b7be1ba7b06e233cbead506`,
+tree clean before work started.
+
+### What was built (src/backup/)
+
+- `src/backup/exporter.ts` — `toBackupViews()`: converts Pi session entries into
+  backup views preserving `id`/`parentId` (tree relationships; lineage is Pi entry
+  IDs, never a content hash), roles including `toolResult`, compaction/branch-summary
+  summaries; non-text content blocks → `binary-omitted`; `kiwifs.`-prefixed custom
+  entries → `extension-internal` (no recursive capture of our own injections). Raw
+  text stays local capture state — redaction happens at the chunk edge, before any
+  serialization.
+- `src/backup/chunker.ts` — deterministic chunker: ≤64 KiB per chunk (§13 row 11);
+  a single oversized entry forms its own disclosed `oversized` chunk (never
+  truncated/dropped); `serializeChunk` is byte-deterministic (no opId/wall-clock
+  inside chunk content) so crash re-derivation reproduces identical bytes;
+  `chunkChecksum` = SHA-256 of the exact bytes (content-addressed, never branch
+  identity).
+- `src/backup/manifest.ts` — `buildBackupManifest`: schemaVersion, covered source
+  range (first/last entry id + count), chunk list with paths/checksums/byteLengths,
+  redaction summary (counts by type, never values), omission list, `redacted: true`
+  (completeness is always "complete with recorded redactions and omissions", never
+  byte-identical — decisions.md #2).
+- `src/backup/capture.ts` — `BackupCapture` engine + delivery: durable coverage
+  cursor (`backup-state.json`, tmp+rename+fsync like the other state files;
+  newer-schema state fails closed), incremental capture on the uncovered entry set,
+  per-entry privacy policy (private mode → no jobs; exclusion-pattern matches and
+  extension-internal → recorded omissions; redaction failure → entry held
+  UNCOVERED, fail-closed, visibly reported, never sent raw), outbox enqueue of one
+  `backup-chunk` job per chunk (idempotency key = kind/scope/sources(session,
+  branch, chunk entry ids)+seq token) plus a manifest job after any chunk flush.
+  Coverage cursor advances ONLY after every chunk job is durably persisted
+  (decisions.md #8); the outbox mints/persists the opId itself before enqueue
+  returns. `parseBackupPayload` re-validates at delivery (shape + content/header
+  cross-check + checksum re-verification); `sendBackupJob` writes chunks via
+  `writeImmutable` at the deterministic `backup/{project-id}/{session-id}/{seq}.md`
+  path (B2 read-before-write: identical replay = no-op, divergence = fail closed).
+- Delivery policy note (architecture §7 concretization, recorded here): chunk files
+  are immutable; the manifest path `backup/{project-id}/{session-id}/manifest.md` is
+  the SINGLE MUTABLE path of a backup tree — it is rewritten (never merged) as
+  capture progresses and carries only checksums/counts/IDs, never transcript
+  content (content is redacted at the chunk edge before it can reach a chunk, so an
+  unredactable entry can never reach the manifest via one either). Delivered via the
+  adapter's plain `write`; the optional `write` capability on `ObservationBackend`
+  means a backend without manifest support holds backup delivery as a retryable gap.
+- `src/observation/sender.ts` — dispatches `backup-chunk` jobs (project scope
+  required for the `backup/{project-id}/` namespace; personal-only scope → retryable
+  `SenderNotWiredError`, jobs stay pending, never dropped/quarantined).
+- `src/index.ts` — wiring: backup capture built at session_start when
+  `features.backup` + resolved project scope (held visibly otherwise, mirroring the
+  observer's T18 scope hold); identity refresh at `session_start`/`session_tree`;
+  bounded capture flushes at `agent_settled`, `session_before_compact` (uses
+  `event.branchEntries`, never cancels compaction) and `session_shutdown` (best
+  effort; the cursor guarantees resume without loss/duplication); private mode is
+  re-checked inside every capture; status surfacing via `setBackupNoteProbe` /
+  `lastBackupNote` (metadata only).
+
+### RAG exclusion (AC 5)
+
+Backup chunks live under `backup/…`, structurally outside every `{scope}/memory/`
+namespace; the T04 guard pipeline's step 4 (`guardCandidate` path-prefix check)
+rejects any hit outside `{scope}/memory/` — pinned by a new test (a backup path with
+authorized scope + active status still fails at `path-prefix`; a memory path passes
+as control). Ordinary retrieval therefore can never surface raw transcript chunks;
+they remain reachable only via explicit backup-read tooling (T15/T18).
+
+### Tests (test/backup.test.ts, synthetic fixtures only)
+
+All five T14 acceptance criteria covered: branched-tree export preserves entries +
+parent links + roles/tool results (AC1); interrupted capture resumes with no
+missing/duplicated accepted entries, including the crash-window property (cursor
+lost → re-derivation is byte-identical per seq, backend replay = no-op) (AC2);
+manifest declares schema/covered range/redaction summary (counts, no values —
+asserted)/omissions, chunk checksums match delivered bytes, manifest delivered to
+`manifest.md` (AC3); private mode skips capture, excluded + extension-internal +
+binary content absent with recorded omissions, redaction failure holds entries
+fail-closed then recovers (AC4); backup paths cannot pass ordinary retrieval guards
+(AC5). Plus: delivery-side tamper rejection (session/entry-id/checksum mutation),
+64 KiB cap with oversized-entry disclosure, payload validation.
+
+### Checks actually run (final tree)
+
+- `npm run check`: tsc clean, prettier clean, **316 pass / 0 fail** (30 previous
+  suites + 10 new backup tests), runtime Node v24.19.0 (satisfies engines >=22.19).
+- `npm run pack:check`: package OK (41 files, includes all four `src/backup/`
+  runtime modules under the `src/` allowlist; no test/secret files — allowlist is
+  `src/*.ts` + README/LICENSE only), packed extension loads in Pi RPC.
+- `devenv test`: "Tests passed :)" (full suite + pack smoke inside devenv).
+- Node 22 compatibility evidence: T14 suite 10 pass / 0 fail under
+  nodejs-slim-22.22.3 (nearest available ≥22.19 build; exact 22.19.0 not
+  installed on this machine). Full-suite Node 22 run: 266 pass / 0 fail /
+  50 cancelled — reproduced identically on the clean T13 baseline tree via
+  `git stash` (pre-existing Node-22 runner quirk in `observation-model.test.ts`
+  et al: `cancelledByParent` "event loop already resolved" cascade), NOT
+  introduced by T14; T14's own tests are unaffected.
+
+### Limits / honest notes (non-blocking)
+
+- The capture engine re-checks private mode and exclusions per flush; the
+  index-level wiring also holds capture entirely when no project scope resolves
+  (T18 git-remote discovery pending) — same discipline as observation.
+- Manifest jobs re-enqueue per flush and rewrite the manifest path; ordered
+  per-scope outbox delivery (§6) prevents an older manifest regressing a newer
+  one; replay of the same job rewrites identical content (effect-idempotent).
+- `coveredEntryIds` grows per session without local GC (bounded by session
+  lifetime); chunk/manifest growth is bounded by transcript size. Local state GC
+  is an operator/UX follow-up (T18), consistent with the outbox retention design.
+- T15 (verification + export/restore) is the follow-up task that consumes these
+  manifests; restore-into-Pi remains explicitly out of scope/architecture-deferred.
+- No live service contact, no `kiwifs-test.local.json` reads, no deployments; the
+  only secret-shaped string in tests is the synthetic AWS-pattern fixture, which
+  the suite proves is redacted before any chunk/manifest byte is produced
+  (asserted absent from serialized manifest and outbox-accepted payloads via the
+  outbox's own `looksSecretBearing` gate).

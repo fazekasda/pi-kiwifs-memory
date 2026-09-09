@@ -22,6 +22,7 @@ import {
 } from "./observation/reflection.ts";
 import { ProposalLifecycle, ProposalOpLog } from "./observation/proposals.ts";
 import { SessionCoordinator, StateSchemaError } from "./pi/coordinator.ts";
+import { BackupCapture } from "./backup/capture.ts";
 import { RetrievalCoordinator } from "./retrieval/coordinator.ts";
 import { EvidenceInjector } from "./inject/injector.ts";
 import {
@@ -52,6 +53,8 @@ let lastObserverError: (() => string | undefined) | undefined;
 let lastRetrievalNote: (() => string | undefined) | undefined;
 /** Last tokenizer load/attach note, surfaced via status (fail-visible, T13). */
 let lastTokenizerNote: (() => string | undefined) | undefined;
+/** Last backup capture error/note, surfaced via status (fail-visible, T14). */
+let lastBackupNote: (() => string | undefined) | undefined;
 
 /** Test/inspection hook for the coordinator error probe. */
 export function setCoordinatorErrorProbe(
@@ -79,6 +82,13 @@ export function setTokenizerNoteProbe(
   probe: (() => string | undefined) | undefined,
 ): void {
   lastTokenizerNote = probe;
+}
+
+/** Test/inspection hook for the backup note probe (T14). */
+export function setBackupNoteProbe(
+  probe: (() => string | undefined) | undefined,
+): void {
+  lastBackupNote = probe;
 }
 
 /**
@@ -112,6 +122,8 @@ export function resolveStatusText(): string {
   if (retrievalNote) text += `\nretrieval: degraded — ${retrievalNote}`;
   const tokenizerNote = lastTokenizerNote?.();
   if (tokenizerNote) text += `\ntokenizer: ${tokenizerNote}`;
+  const backupNote = lastBackupNote?.();
+  if (backupNote) text += `\nbackup: ${backupNote}`;
   if (result.ok && result.config.enabled) {
     const features = effectiveFeatures(result.config);
     if (features.observation && !result.config.model.auth) {
@@ -207,6 +219,9 @@ interface SessionRuntime {
   tombstoneCache: QueryMetaTombstoneCache | undefined;
   /** T13: tokenizer attach/load note (sanitized, status-only). */
   tokenizerNote: string | undefined;
+  /** T14: incremental transcript backup capture (may be undefined). */
+  backup: BackupCapture | undefined;
+  backupHeldReason: string | undefined;
 }
 
 /**
@@ -471,6 +486,32 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       lastTokenizerNote = () => tokenizerNote;
     });
   }
+  // T14: incremental transcript backup capture (features.backup). Requires
+  // a resolved project scope (the `backup/{project-id}/` namespace needs a
+  // project id); like the observer, capture is held until scope resolution
+  // (T18 git-remote discovery) rather than queuing undeliverable jobs.
+  // Private mode is re-checked inside every capture (no new backup jobs).
+  let backup: BackupCapture | undefined;
+  let backupHeldReason: string | undefined;
+  if (store && config && config.enabled && scope?.startsWith("project/")) {
+    const features = effectiveFeatures(config);
+    if (features.backup) {
+      try {
+        backup = new BackupCapture({
+          stateDir,
+          outbox: store,
+          scope,
+          projectId: scope.slice("project/".length),
+          sessionId: coordinator.sessionId ?? "pending",
+          ...(coordinator.branchId ? { branchId: coordinator.branchId } : {}),
+          privateMode: () => config.privateMode,
+          exclusions: config.privacy.exclusions,
+        });
+      } catch (err) {
+        backupHeldReason = `backup init failed: ${(err as Error).message}`;
+      }
+    }
+  }
   return {
     coordinator,
     observer,
@@ -482,6 +523,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     store,
     tombstoneCache,
     tokenizerNote,
+    backup,
+    backupHeldReason,
   };
 }
 
@@ -539,6 +582,11 @@ export function registerSessionHandlers(
     return runtime?.retrieval?.lastDegradedNote;
   };
   lastTokenizerNote = () => runtime?.tokenizerNote;
+  lastBackupNote = () => {
+    if (runtime?.backupHeldReason) return runtime.backupHeldReason;
+    const lines = runtime?.backup?.pendingStatus() ?? [];
+    return lines.length > 0 ? lines.join("; ") : undefined;
+  };
 
   const get = (ctx: ExtensionContext): SessionRuntime | undefined => {
     if (runtime) return runtime;
@@ -596,6 +644,11 @@ export function registerSessionHandlers(
         entries: () => toSourceViews(ctx.sessionManager.getEntries()),
       });
     }
+    // T14: backup identity tracks the session/branch like the observer.
+    rt?.backup?.refreshIdentity(
+      rt.coordinator.sessionId ?? "pending",
+      rt.coordinator.branchId ?? undefined,
+    );
   });
   // T12: per-input retrieval. `input` handlers are awaited by Pi BEFORE the
   // first LLM call — including queued (steer/followUp) inputs — so the
@@ -636,7 +689,7 @@ export function registerSessionHandlers(
     const injector = new EvidenceInjector(rt.retrieval.registry);
     return injector.onContext(event.messages) ?? undefined;
   });
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (event, ctx) => {
     // Fail closed: unmatched pending packs are dropped at run settle with a
     // visible degraded note — never carried into a later unrelated turn.
     const dropped = runtime?.retrieval?.registry.dropUnmatched() ?? [];
@@ -645,11 +698,27 @@ export function registerSessionHandlers(
         ? `unmatched evidence pack(s) dropped at run settle: ${dropped.length}`
         : undefined;
     runtime?.observer?.onAgentSettled();
+    // T14: incremental backup flush over the full session tree (the capture
+    // engine's coverage cursor decides what is new — private mode and
+    // exclusions re-checked inside).
+    try {
+      runtime?.backup?.capture(ctx.sessionManager.getEntries());
+    } catch (err) {
+      if (runtime?.backup) runtime.backup.lastError = (err as Error).name;
+    }
   });
   pi.on("session_before_compact", async (event) => {
     // Bounded flush; NEVER returns cancel — compaction always proceeds
     // (decisions.md #6). Unprocessed ranges stay durably pending.
     await runtime?.observer?.onBeforeCompact(event.signal);
+    // T14: capture is a bounded local enqueue (no network, no model call);
+    // failures never cancel compaction — the coverage cursor stays put and
+    // the next flush re-derives.
+    try {
+      runtime?.backup?.capture(event.branchEntries);
+    } catch {
+      // visible via backup pendingStatus
+    }
     return {};
   });
   pi.on("session_before_fork", async () => {
@@ -672,8 +741,21 @@ export function registerSessionHandlers(
         runtime.coordinator.branchId ?? undefined,
       );
     }
+    // T14: branch navigation re-derives uncovered entries on the new branch;
+    // shared-ancestor coverage lives in the coordinator's durable registry.
+    runtime?.backup?.refreshIdentity(
+      runtime.coordinator.sessionId ?? "pending",
+      runtime.coordinator.branchId ?? undefined,
+    );
   });
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event, ctx) => {
+    // T14: final backup flush before teardown (best-effort; the coverage
+    // cursor guarantees a later resume never misses or duplicates entries).
+    try {
+      runtime?.backup?.capture(ctx.sessionManager.getEntries());
+    } catch {
+      // visible via backup pendingStatus
+    }
     runtime?.observer?.dispose();
     runtime?.coordinator.onShutdown();
   });

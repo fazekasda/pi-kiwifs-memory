@@ -360,11 +360,11 @@ For Pi UI changes, verify TUI behavior manually and automate RPC/headless checks
 
 **Acceptance criteria:**
 
-- [ ] Synthetic branched session export preserves all included entries and tree relationships.
-- [ ] Interrupted capture resumes without missing or duplicating accepted entries.
-- [ ] Manifest declares schema, covered source range, redaction and omitted content.
-- [ ] Private/excluded content is absent according to policy.
-- [ ] Raw transcript records are not automatically eligible for ordinary memory retrieval.
+- [x] Synthetic branched session export preserves all included entries and tree relationships. _T14: `test/backup.test.ts` "branched export preserves entries and tree relationships" — parent links (`e-root→e-a→e-b→e-b-tool`, `e-root→e-c`), roles incl. `toolResult`, and all included entry ids asserted in the delivered chunk JSON (`src/backup/exporter.ts` keeps Pi `id`/`parentId`; lineage is entry IDs, never a content hash)._
+- [x] Interrupted capture resumes without missing or duplicating accepted entries. _T14: `test/backup.test.ts` "interrupted capture resumes without missing or duplicating" (fresh engine from durable state enqueues only uncovered entries; union of both lives covers the tree exactly once) and "crash-window re-derivation is byte-identical (replay no-op)" (cursor lost → same seq + identical bytes → `writeImmutable` replay no-op, B2). Coverage cursor advances only after every chunk job is durably queued (decisions.md #8)._
+- [x] Manifest declares schema, covered source range, redaction and omitted content. _T14: `test/backup.test.ts` "manifest declares schema, covered range, redaction and omissions" — schemaVersion/kind/sessionId, coveredRange (first/last/count), chunk checksums recomputed against delivered bytes, redaction summary counts by type with the fixture secret asserted ABSENT from the serialized manifest, binary omission recorded, `redacted: true` (never claims byte-identical, decisions.md #2); manifest delivered to `backup/{project-id}/{session-id}/manifest.md`._
+- [x] Private/excluded content is absent according to policy. _T14: `test/backup.test.ts` "private mode skips capture" (no jobs, cursor untouched), "excluded and extension-internal content is absent per policy" (pattern exclusion + `kiwifs.` prefix → recorded omissions, text absent from all delivered bytes), "redaction failure holds entries fail-closed" (held entries stay UNCOVERED, nothing enqueued, recovery re-captures; `src/backup/capture.ts` redacts at the chunk edge before serialization)._
+- [x] Raw transcript records are not automatically eligible for ordinary memory retrieval. _T14: `test/backup.test.ts` "raw transcript records cannot pass ordinary retrieval guards" — `guardCandidate` step 4 rejects a `backup/…` hit even with authorized scope + active status (structural split: chunks live outside every `{scope}/memory/` namespace; retrieval queries filter to `memory/` paths, architecture §7); control asserts memory paths still pass._
 
 ### T15 — Implement backup verification and export/restore path
 

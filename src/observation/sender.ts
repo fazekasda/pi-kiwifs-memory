@@ -37,6 +37,7 @@ import {
 } from "../domain/records.ts";
 import { DATA_FENCE_END } from "./model.ts";
 import { sendProposalJob, sendReflectionJob } from "./reflection.ts";
+import { sendBackupJob } from "../backup/capture.ts";
 
 /**
  * Retryable availability gap: the observation delivery backend is not
@@ -57,6 +58,16 @@ export interface ObservationBackend {
     content: string,
     opts: { opId: string; signal?: AbortSignal },
   ): Promise<{ replayed: boolean }>;
+  /**
+   * T14: mutable write — used ONLY for the backup manifest path (the single
+   * mutable path of a backup tree). Optional: backends without it cannot
+   * deliver backup manifest jobs (held as a retryable gap).
+   */
+  write?(
+    path: string,
+    content: string,
+    opts: { opId: string; signal?: AbortSignal },
+  ): Promise<unknown>;
 }
 
 /** Inert data fence for the record body. */
@@ -256,6 +267,28 @@ export function createObservationSender(
     }
     if (job.kind === "proposal") {
       await sendProposalJob(job, scope, backend);
+      return;
+    }
+    if (job.kind === "backup-chunk") {
+      // T14: backup delivery requires a project id for the
+      // `backup/{project-id}/` namespace; a personal-only scope cannot
+      // address one — held as a retryable gap (never quarantined, never
+      // dropped), consistent with record delivery on an unresolved scope.
+      if (!scope.startsWith("project/")) {
+        throw new SenderNotWiredError(
+          "backup delivery requires a project scope — held (retryable)",
+        );
+      }
+      const manifestWriter = backend.write;
+      if (!manifestWriter) {
+        throw new SenderNotWiredError(
+          "backend lacks manifest write support — backup delivery held",
+        );
+      }
+      await sendBackupJob(job, scope, scope.slice("project/".length), {
+        writeImmutable: backend.writeImmutable.bind(backend),
+        write: manifestWriter.bind(backend),
+      });
       return;
     }
     await sendObservationJob(job, scope, backend);
