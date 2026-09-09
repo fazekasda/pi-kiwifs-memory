@@ -57,6 +57,13 @@ export interface MemoryConfig {
     ragDeadlineMs: number;
     /** Evidence token cap (decisions.md #7, confirmed default 3000). */
     evidenceTokenCap: number;
+    /**
+     * User-supplied model-compatible tokenizer module (T13, §13 row 5).
+     * Without one, automatic injection is skipped visibly — never enforced
+     * by character estimation. The resolved secret-free module path is the
+     * user's own config value; the module's code never enters logs.
+     */
+    tokenizer?: { module: string; export?: string };
   };
   features: {
     observation: boolean;
@@ -396,6 +403,35 @@ export function validateConfig(raw: unknown): ValidationResult {
           issues,
         );
         if (v !== undefined) budgets.evidenceTokenCap = v;
+      }
+      if (rawBudgets["tokenizer"] !== undefined) {
+        const t = rawBudgets["tokenizer"];
+        if (
+          !isPlainObject(t) ||
+          typeof t["module"] !== "string" ||
+          t["module"].trim() === ""
+        ) {
+          issues.push({
+            path: "budgets.tokenizer",
+            message:
+              "tokenizer must be an object { module: string, export?: string }",
+          });
+        } else {
+          const spec: { module: string; export?: string } = {
+            module: t["module"] as string,
+          };
+          if (t["export"] !== undefined) {
+            if (typeof t["export"] !== "string" || t["export"].trim() === "") {
+              issues.push({
+                path: "budgets.tokenizer.export",
+                message: "tokenizer.export must be a non-empty string",
+              });
+            } else {
+              spec.export = t["export"] as string;
+            }
+          }
+          budgets.tokenizer = spec;
+        }
       }
     }
   }

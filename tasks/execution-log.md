@@ -663,3 +663,71 @@ pack is registered while held — nothing is "held, not deleted").
   deliverable); no T12 code covers it.
 - Cosmetic (deferred): brief items (score 0) outrank hybrid hits; status
   renders a hold reason under "retrieval: degraded".
+
+## T13 — Bounded context injection and recall tools (injection chunk, 2026-09-08)
+
+### What landed
+
+- `test/inject.test.ts` (new, 16 tests): real `RetrievalCoordinator` +
+  `PendingPackRegistry` + `EvidenceInjector` + packer end-to-end on synthetic
+  fixtures — fresh consume-once; queued steer/followUp consumption with
+  tool-loop dedupe; repeated identical inputs (occurrence-unique packs, FIFO);
+  unmatched/ambiguous fail-closed + settle drop; zero-item packs consumed
+  without an empty framing block; tokenizer-less packs never injected (visible
+  skip); `rawText` containment with redaction-active fingerprinting (outbound
+  FTS queries redacted, secret never in the injected message); token-count
+  consistency (`pack.tokenCount` === recount of `frameEvidence(pack.items)`,
+  lowest-ranked trimming under a tiny cap); conflict labels rendered bounded
+  (≤200 chars, informational, source ids); `/`-prefixed expansion boundary;
+  generation minting + settle isolation; tokenizer module loading (valid /
+  missing / malformed / throwing counts fail closed); recall tools refuse in
+  private mode with zero backend reads and pass the full guard pipeline
+  (cross-scope + missing read-back rejected).
+- Source fix proven necessary by the tests (`src/retrieval/coordinator.ts`):
+  `PendingPackRegistry.consumeMatching` now records the (matchKey,
+  user-message-count) barrier BEFORE the pending-pack lookup. Previously the
+  barrier was only recorded on the no-pending branch, so a queued pack whose
+  text equaled a fresh run's input could be consumed by the fresh run's
+  baseline context call (count 1) before the queued input ever appended to
+  history — stale-occurrence injection. Every (key, count) pair is now
+  single-use; all prior behaviors preserved and covered by tests.
+- Pre-existing T13 partial sources (src/inject/{injector,packer,tools}.ts,
+  src/index.ts wiring, src/retrieval/tokenizer.ts loader, src/config/schema.ts
+  `budgets.tokenizer`) completed/formatted and committed with this chunk.
+
+### Checks (actual outcomes)
+
+- `npx tsx --test test/inject.test.ts` — 16 pass / 0 fail (bounded, <1 s).
+- `npx tsc --noEmit` — clean.
+- `npm run check` — 279 tests pass / 0 fail, prettier clean.
+- `npm run pack:check` — "Packed extension loads in Pi RPC and reports
+  scaffold status."
+- `devenv test` — "Tests passed :)" (13.4 s).
+- Secret scan: synthetic fixtures only; `config/kiwifs-test.local.json` never
+  opened; no live-service contact; no pushes/tags; no deployment edits.
+
+### Acceptance coverage (PRD T13)
+
+- Token cap with model-compatible tokenizer + deterministic truncation +
+  recount after framing: `inject.test.ts` framing/token-accounting tests
+  (character estimates never substitute — tokenizer-less pack visibly skipped).
+- Steered/followUp injection on the consuming provider call, never duplicated
+  on later context fires; unmatched fail-closed: queued/tool-loop/repeat tests.
+- No duplicate persistent entries on repeated LLM calls: consume-once +
+  same-occurrence barrier tests (context path is transient by Pi's clone
+  semantics; fresh path consumes the pack exactly once).
+- Prompt-injection framing as untrusted data with source ids + conflict
+  labels: packer tests.
+- Tools cannot bypass private mode/scope/tombstones: recall-tool tests
+  (private mode zero reads; guard read-back gate; tombstone cache advisory
+  only, wired in src/index.ts).
+- RPC retrieve → inject → source recall: extension-level wiring covered by
+  `test/extension.test.ts` (T13 fakes chunk: tools registered, events wired);
+  end-to-end Pi-runtime proof remains manual/RPC-level (pack:check loads the
+  extension in Pi RPC).
+
+### Blockers / follow-ups
+
+- None blocking. Note: `consumeMatching` ambiguity policy is FIFO-oldest per
+  matchKey (one injection per occurrence); a second identical pending pack
+  fails closed to settle drop rather than double-injecting.

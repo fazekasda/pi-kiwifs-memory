@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -23,6 +23,16 @@ import {
 import { ProposalLifecycle, ProposalOpLog } from "./observation/proposals.ts";
 import { SessionCoordinator, StateSchemaError } from "./pi/coordinator.ts";
 import { RetrievalCoordinator } from "./retrieval/coordinator.ts";
+import { EvidenceInjector } from "./inject/injector.ts";
+import {
+  buildMemoryReadTool,
+  buildMemorySearchTool,
+  type RecallRuntime,
+  type RecallToolsDeps,
+} from "./inject/tools.ts";
+import { QueryMetaTombstoneCache } from "./backend/guard.ts";
+import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
+import { validateProjectId } from "./domain/paths.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
 import {
@@ -40,6 +50,8 @@ let lastCoordinatorError: (() => string | undefined) | undefined;
 let lastObserverError: (() => string | undefined) | undefined;
 /** Last retrieval degradation note, surfaced via status (fail-visible, T12). */
 let lastRetrievalNote: (() => string | undefined) | undefined;
+/** Last tokenizer load/attach note, surfaced via status (fail-visible, T13). */
+let lastTokenizerNote: (() => string | undefined) | undefined;
 
 /** Test/inspection hook for the coordinator error probe. */
 export function setCoordinatorErrorProbe(
@@ -60,6 +72,13 @@ export function setRetrievalNoteProbe(
   probe: (() => string | undefined) | undefined,
 ): void {
   lastRetrievalNote = probe;
+}
+
+/** Test/inspection hook for the tokenizer note probe (T13). */
+export function setTokenizerNoteProbe(
+  probe: (() => string | undefined) | undefined,
+): void {
+  lastTokenizerNote = probe;
 }
 
 /**
@@ -91,6 +110,8 @@ export function resolveStatusText(): string {
   if (obsErr) text += `\nobserver: DISABLED — ${obsErr}`;
   const retrievalNote = lastRetrievalNote?.();
   if (retrievalNote) text += `\nretrieval: degraded — ${retrievalNote}`;
+  const tokenizerNote = lastTokenizerNote?.();
+  if (tokenizerNote) text += `\ntokenizer: ${tokenizerNote}`;
   if (result.ok && result.config.enabled) {
     const features = effectiveFeatures(result.config);
     if (features.observation && !result.config.model.auth) {
@@ -182,6 +203,10 @@ interface SessionRuntime {
   retrievalHeldReason: string | undefined;
   observerError: string | undefined;
   store: DurableOutbox | undefined;
+  /** T13: advisory tombstone cache over the retrieval backend (may be undefined). */
+  tombstoneCache: QueryMetaTombstoneCache | undefined;
+  /** T13: tokenizer attach/load note (sanitized, status-only). */
+  tokenizerNote: string | undefined;
 }
 
 /**
@@ -366,14 +391,16 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       observerError = `observer init failed: ${(err as Error).name}`;
     }
   }
-  // T12: per-user-input RAG retrieval. The authorized scope set is the
-  // resolved project scope plus personal (config); crossProjectOptIn values
-  // are deliberately NOT auto-included — cross-project recall requires
-  // explicit per-session opt-in (architecture.md §9), wired in T13.
+  // T12 + T13: per-user-input RAG retrieval and its recall surface. The
+  // authorized scope set is the resolved project scope plus personal
+  // (config) plus the explicitly opted-in cross-project scopes
+  // (scopes.crossProjectOptIn — per-session opt-in declarators wired to
+  // their owner scopes; empty list = denied by default, decisions.md #5).
   // Retrieval requires a configured, credential-resolvable backend; without
   // one it is held visibly, never silently skipped.
   let retrieval: RetrievalCoordinator | undefined;
   let retrievalHeldReason: string | undefined;
+  let tombstoneCache: QueryMetaTombstoneCache | undefined;
   if (
     store &&
     config &&
@@ -384,8 +411,15 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     const retrievalScopes: string[] = [];
     if (scope !== undefined) retrievalScopes.push(scope);
     if (config.scopes.allowPersonalGlobal) retrievalScopes.push("personal");
+    const cross = crossOptInToScopes(config.scopes.crossProjectOptIn);
+    if (cross.invalid.length > 0) {
+      retrievalHeldReason =
+        "cross-project opt-in contains invalid project id(s) — those entries authorize nothing";
+    }
+    retrievalScopes.push(...cross.scopes);
     if (retrievalScopes.length === 0) {
       retrievalHeldReason =
+        retrievalHeldReason ??
         "no authorized scope resolves (projectIdentity unset and personal scope disabled)";
     } else if (!resolveAuthSecret(config.mcp.auth)) {
       retrievalHeldReason =
@@ -393,21 +427,49 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     } else {
       const mcpAuth: AuthRef = config.mcp.auth;
       const mcpUrl = config.mcp.url;
+      const adapter = new KiwiFSAdapter({
+        url: mcpUrl,
+        headers: {
+          Authorization: `Bearer ${resolveAuthSecret(mcpAuth) ?? ""}`,
+        },
+        ledger: store.ledger(),
+      });
       retrieval = new RetrievalCoordinator({
-        adapter: new KiwiFSAdapter({
-          url: mcpUrl,
-          headers: {
-            Authorization: `Bearer ${resolveAuthSecret(mcpAuth) ?? ""}`,
-          },
-          ledger: store.ledger(),
-        }),
+        adapter,
         authorizedScopes: retrievalScopes,
         deadlineMs: config.budgets.ragDeadlineMs,
         tokenCap: config.budgets.evidenceTokenCap,
         generation: coordinator.generation,
         privateMode: () => config.privateMode,
       });
+      // T13: advisory tombstone cache for the recall tools (§13 row 7 —
+      // TTL 5 min inside the cache; a stale/missing cache never permits a
+      // forgotten record through: the read-back is the gate).
+      tombstoneCache = new QueryMetaTombstoneCache(
+        adapter,
+        retrieval.scopeSet(),
+      );
     }
+  }
+  // T13: user-configured tokenizer (§13 row 5). The module loads
+  // asynchronously; until it attaches, inputs visibly skip automatic
+  // injection (TOKENIZER_UNAVAILABLE_NOTE via the coordinator). A failed
+  // load never becomes a character-estimate fallback: injection stays
+  // skipped and the reason is visible.
+  let tokenizerNote: string | undefined;
+  if (retrieval && config?.budgets.tokenizer) {
+    const spec = config.budgets.tokenizer;
+    const baseDir =
+      configResult.ok && configResult.file ? dirname(configResult.file) : cwd;
+    void loadConfiguredTokenizer(spec, baseDir).then((result) => {
+      if (result.ok) {
+        retrieval?.setTokenizer(result.tokenizer);
+        tokenizerNote = `model-compatible tokenizer attached (${result.tokenizer.id})`;
+      } else {
+        tokenizerNote = `automatic injection stays skipped — ${result.reason}`;
+      }
+      lastTokenizerNote = () => tokenizerNote;
+    });
   }
   return {
     coordinator,
@@ -418,7 +480,35 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     retrievalHeldReason,
     observerError,
     store,
+    tombstoneCache,
+    tokenizerNote,
   };
+}
+
+/**
+ * T13: map configured cross-project opt-in values (`cross/{project-id}`) to
+ * authorized scope values (`project/{project-id}`). Record scope is a single
+ * owner value (§2) — records never carry a `cross/...` scope — so the opt-in
+ * DECLARATOR authorizes the target project's owner scope for this session's
+ * retrieval and recall tools. Entries failing the project-id grammar are
+ * reported (never silently ignored); they authorize nothing.
+ */
+export function crossOptInToScopes(values: readonly string[]): {
+  scopes: string[];
+  invalid: string[];
+} {
+  const scopes: string[] = [];
+  const invalid: string[] = [];
+  for (const v of values) {
+    const id = v.slice("cross/".length);
+    try {
+      const normalized = validateProjectId(id);
+      scopes.push(`project/${normalized}`);
+    } catch {
+      invalid.push(v);
+    }
+  }
+  return { scopes, invalid };
 }
 
 /**
@@ -448,6 +538,7 @@ export function registerSessionHandlers(
     if (runtime?.retrievalHeldReason) return runtime.retrievalHeldReason;
     return runtime?.retrieval?.lastDegradedNote;
   };
+  lastTokenizerNote = () => runtime?.tokenizerNote;
 
   const get = (ctx: ExtensionContext): SessionRuntime | undefined => {
     if (runtime) return runtime;
@@ -462,6 +553,34 @@ export function registerSessionHandlers(
     }
     return runtime;
   };
+
+  /** T13 runtime source for the recall tools (lazy, same as event handlers). */
+  const getRecallRuntime = (): RecallRuntime | undefined => {
+    const rt = runtime;
+    if (!rt?.retrieval) return undefined;
+    return { coordinator: rt.retrieval, adapter: rt.retrieval.adapter };
+  };
+  const getHeldReason = (): string | undefined =>
+    runtime?.retrievalHeldReason ?? runtimeError;
+  const recallDeps = (): RecallToolsDeps | undefined => {
+    const configResult = loadConfig();
+    if (!configResult.ok) return undefined;
+    const config = configResult.config;
+    const rt = runtime;
+    return {
+      getRuntime: getRecallRuntime,
+      getHeldReason,
+      privateMode: () => config.privateMode,
+      ...(rt?.tombstoneCache ? { tombstoneCache: rt.tombstoneCache } : {}),
+      deadlineMs: config.budgets.ragDeadlineMs,
+    };
+  };
+
+  // T13: explicit recall tools — same scope/privacy/guard pipeline as the
+  // automatic injection, never a bypass (private mode, tombstones, scope).
+  // Deps resolve lazily per call (runtime is built at first session event).
+  pi.registerTool(buildMemorySearchTool(recallDeps));
+  pi.registerTool(buildMemoryReadTool(recallDeps));
 
   // No-UI access: handlers only read ctx.sessionManager / ctx.cwd.
   pi.on("session_start", async (event, ctx) => {
@@ -493,6 +612,29 @@ export function registerSessionHandlers(
       event.streamingBehavior,
       event.source,
     );
+  });
+  // T13: fresh-turn injection. The awaited `input` handler above has already
+  // completed the retrieval cycle (Pi ordering: input → expansion →
+  // before_agent_start), so the fresh pack for THIS prompt is pending and is
+  // consumed here; the single custom message is appended persistently by Pi
+  // exactly once per pack. No matching fresh pack → undefined (fail closed:
+  // no injection, pack fails closed at settle if it exists at all).
+  pi.on("before_agent_start", (event, ctx) => {
+    const rt = get(ctx);
+    if (!rt?.retrieval) return undefined;
+    const injector = new EvidenceInjector(rt.retrieval.registry);
+    return injector.onBeforeAgentStart(event.prompt) ?? undefined;
+  });
+  // T13: queued steer/followUp injection. The context event fires per
+  // provider call (including tool loops) with a cloned message list; the
+  // registry matches the CONSUMED input (last user message + new-occurrence
+  // barrier) and dedupes by inputId, so tool-loop replays never re-inject
+  // and the returned replacement is transient (no persistent duplicates).
+  pi.on("context", (event, ctx) => {
+    const rt = get(ctx);
+    if (!rt?.retrieval) return undefined;
+    const injector = new EvidenceInjector(rt.retrieval.registry);
+    return injector.onContext(event.messages) ?? undefined;
   });
   pi.on("agent_settled", async () => {
     // Fail closed: unmatched pending packs are dropped at run settle with a
