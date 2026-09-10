@@ -38,6 +38,15 @@ import { buildBoardMessage } from "../src/board/messages.ts";
 import { createFakeServer } from "./fake-mcp-server.ts";
 
 const URL_ = "https://kiwifs.test/mcp";
+/** Bounded event wait: polls observable runtime state, never a fixed sleep. */
+const until = async (cond: () => boolean, ms = 5000): Promise<void> => {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("bounded wait expired");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+};
+/** Bounded time window for ABSENCE proofs (no events may occur). */
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type ToolResult = { content: { type: string; text: string }[] };
@@ -190,7 +199,7 @@ test("start() delivers on the timer path; stop() halts all background work", asy
     ts: "2026-09-07T01:00:00Z",
   });
   runtime.start();
-  await sleep(150);
+  await until(() => runtime.inbox(10).unread === 1);
   assert.equal(runtime.statusSnapshot().unread, 1);
   assert.ok(
     ["idle", "backoff"].includes(runtime.statusSnapshot().runState),
@@ -223,14 +232,14 @@ test("restart over the same durable state does not repeat notifications", async 
     ts: "2026-09-07T01:00:00Z",
   });
   first.runtime.start();
-  await sleep(150);
+  await until(() => first.runtime.inbox(10).unread === 1);
   first.runtime.stop();
   // Simulated process restart: a NEW runtime over the SAME state dir and the
   // same backend feed (the feed still contains the message — remote never
   // deletes). Dedupe must suppress the repeat.
   const second = makeRuntime({ server: first.server, dir: first.dir });
   second.runtime.start();
-  await sleep(150);
+  await until(() => second.runtime.statusSnapshot().runState !== "idle", 3000);
   second.runtime.stop();
   const inbox = second.runtime.inbox(10);
   assert.equal(inbox.unread, 1, "still exactly one unread (no repeat)");
@@ -260,7 +269,7 @@ test("same state dir, different consumer ids → independent durable state", asy
   });
   a.runtime.start();
   b.runtime.start();
-  await sleep(150);
+  await until(() => b.runtime.inbox(10).unread === 1, 3000);
   a.runtime.stop();
   b.runtime.stop();
   // beta's recipient filter delivers; alpha skips the message visibly.
@@ -284,14 +293,14 @@ test("live private gate: zero reads while private; resumes after flip back", asy
     ts: "2026-09-07T01:00:00Z",
   });
   runtime.start();
-  await sleep(120);
+  await until(() => runtime.inbox(10).unread === 1);
   assert.equal(runtime.inbox(10).unread, 1);
   const before = requestCount();
   privateMode = true;
   await sleep(120);
   assert.equal(requestCount(), before, "no backend reads while private");
   privateMode = false;
-  await sleep(120);
+  await until(() => requestCount() > before, 3000);
   runtime.stop();
   assert.ok(requestCount() > before, "reads resume after flip back");
 });
@@ -310,7 +319,7 @@ test("buffer cap: older delivered-unread entries stay durable, listed path-only"
     });
   }
   runtime.start();
-  await sleep(600);
+  await until(() => runtime.inbox(10).unread === total, 10_000);
   runtime.stop();
   const inbox = runtime.inbox(DELIVERY_BUFFER_CAP + 5);
   assert.equal(inbox.unread, total);
@@ -336,7 +345,7 @@ test("ack via runtime is local-only and reduces unread", async () => {
     ts: "2026-09-07T01:00:00Z",
   });
   runtime.start();
-  await sleep(150);
+  await until(() => runtime.inbox(10).unread === 1);
   runtime.stop();
   const before = requestCount();
   assert.equal(runtime.ack(id), true);
@@ -379,7 +388,7 @@ test("inbox tool frames bodies as untrusted and discloses routing limits", async
     ts: "2026-09-07T01:00:00Z",
   });
   runtime.start();
-  await sleep(150);
+  await until(() => runtime.inbox(10).unread === 1);
   runtime.stop();
   const res = await run(buildBoardInboxTool(() => deps));
   const text = res;
@@ -403,7 +412,7 @@ test("inbox tool lists previous-session deliveries path-only (never loss)", asyn
     ts: "2026-09-07T01:00:00Z",
   });
   first.runtime.start();
-  await sleep(150);
+  await until(() => first.runtime.inbox(10).unread === 1);
   first.runtime.stop();
   // A fresh runtime over the same durable state (fresh process): memory
   // buffer empty, entry durable → path-only listing.
@@ -423,7 +432,7 @@ test("inbox tool lists previous-session deliveries path-only (never loss)", asyn
     privateMode: () => false,
   };
   second.runtime.start();
-  await sleep(120);
+  await until(() => second.runtime.inbox(10).unread === 1);
   second.runtime.stop();
   const res = await run(buildBoardInboxTool(() => deps));
   const text = res;
@@ -477,7 +486,7 @@ test("ack tool acknowledges locally and reports safe status", async () => {
     ts: "2026-09-07T01:00:00Z",
   });
   runtime.start();
-  await sleep(150);
+  await until(() => runtime.inbox(10).unread === 1);
   runtime.stop();
   const before = requestCount();
   const res = await run(
@@ -593,7 +602,11 @@ test("board delivery starts at session_start and stops at teardown", async () =>
     // Offline startup against an unreachable endpoint must not crash; the
     // bounded poller starts and surfaces sanitized state.
     await onStart({}, wiringCtx());
-    await sleep(40);
+    await until(() =>
+      /board delivery: state=\w+ unread=\d+ consumer=agent-alpha/.test(
+        index.resolveStatusText(),
+      ),
+    );
     const text = index.resolveStatusText();
     assert.match(
       text,

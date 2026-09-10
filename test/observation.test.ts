@@ -165,7 +165,13 @@ function track(f: Fixture): Fixture {
   return f;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const until = async (cond: () => boolean, ms = 5000): Promise<void> => {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("bounded wait expired");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+};
 
 // ---- AC 1: an interval is processed once logically -----------------------
 
@@ -176,7 +182,7 @@ test("repeated triggers over the same coverage never re-extract", async () => {
   const first = f.scheduler.onAgentSettled();
   assert.equal(first.deferred, false);
   assert.equal(first.scheduled, 1);
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.extractCalls.length, 1);
   assert.equal(f.coordinator.isConsumed("e1"), true);
   assert.equal(
@@ -188,7 +194,7 @@ test("repeated triggers over the same coverage never re-extract", async () => {
   const second = f.scheduler.onAgentSettled();
   assert.equal(second.scheduled, 0);
   assert.equal(second.deferred, false);
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.extractCalls.length, 1);
   assert.equal(f.store.pending().length, 1);
 });
@@ -204,7 +210,7 @@ test("content arriving during an extraction schedules a later disjoint batch", a
   const first = f.scheduler.onAgentSettled();
   assert.equal(first.scheduled, 1);
   // Extraction is in flight (manual, unreleased).
-  await sleep(5);
+  await until(() => f.extractCalls.length >= 1);
   assert.equal(f.extractCalls.length, 1);
 
   // New content arrives while the first extraction is still running: a later
@@ -221,14 +227,12 @@ test("content arriving during an extraction schedules a later disjoint batch", a
   // Both complete without duplication (second batch runs after the first
   // settles — serialization keeps pending-state mutations single-threaded).
   f.release[0]!();
-  await sleep(20);
+  await until(() => f.extractCalls.length >= 2);
   assert.equal(f.extractCalls.length, 2);
   for (const r of f.release) r();
-  await sleep(20);
-
-  // Both complete and consume without duplication.
-  for (const r of f.release) r();
-  await sleep(20);
+  await until(
+    () => f.coordinator.isConsumed("e1") && f.coordinator.isConsumed("e2"),
+  );
   assert.equal(f.coordinator.isConsumed("e1"), true);
   assert.equal(f.coordinator.isConsumed("e2"), true);
   assert.equal(f.scheduler.pendingBatches.length, 0);
@@ -249,7 +253,7 @@ test("empty or irrelevant coverage does not invoke the model", async () => {
   f.sources.push(entry("excl", "INTERNAL-ONLY rotation key"));
   const summary = f.scheduler.onAgentSettled();
   assert.equal(summary.scheduled, 0);
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.extractCalls.length, 0);
   assert.equal(f.scheduler.pendingBatches.length, 0);
 });
@@ -335,7 +339,7 @@ test("pre-compaction flush times out, never cancels compaction, keeps pending vi
 
   // The extraction eventually resolves; the release is a no-op for compaction.
   for (const r of f.release) r();
-  await sleep(20);
+  await f.scheduler.quiesce();
 });
 
 test("pre-compaction flush honors an already-aborted signal and a mid-flight abort", async () => {
@@ -360,7 +364,7 @@ test("pre-compaction flush honors an already-aborted signal and a mid-flight abo
   // Mid-flight abort: flush returns promptly, batch stays pending.
   const controller = new AbortController();
   const pending = f.scheduler.onBeforeCompact(controller.signal);
-  await sleep(5); // batch persisted, extract invoked
+  await until(() => f.extractCalls.length >= 1);
   controller.abort();
   const result = await pending;
   assert.equal(result.flushed, false);
@@ -394,7 +398,7 @@ test("failed outbox acceptance leaves entries unconsumed and pending", async () 
   // Force the enqueue to fail (persist fault → OutboxPersistError).
   f.store.persistFault = new Error("ENOSPC");
   f.scheduler.onAgentSettled();
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.extractCalls.length, 1); // model ran
   assert.equal(f.coordinator.isConsumed("e1"), false); // cursor NOT advanced
   assert.equal(f.scheduler.pendingBatches.length, 1);
@@ -404,7 +408,7 @@ test("failed outbox acceptance leaves entries unconsumed and pending", async () 
   // and the cursor advances only after the new enqueue is durable.
   f.store.persistFault = null;
   await f.scheduler.retryPending();
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.coordinator.isConsumed("e1"), true);
   assert.equal(f.store.pending().length, 1);
   assert.equal(f.scheduler.pendingBatches.length, 0);
@@ -421,7 +425,7 @@ test("batch is durably persisted with opId/entries/params before the model call"
   f.scheduler.onAgentSettled();
   // The model call has been invoked; the batch record with the SAME opId was
   // already on disk BEFORE the extract call resolved (extract is unreleased).
-  await sleep(5);
+  await until(() => f.extractCalls.length >= 1);
   assert.equal(f.extractCalls.length, 1);
   const stateFile = join(f.dir, STATE_FILE);
   assert.equal(existsSync2(stateFile), true);
@@ -442,7 +446,7 @@ test("batch is durably persisted with opId/entries/params before the model call"
   // Acceptance: the durable outbox job carries the same opId plus a
   // deterministic idempotency key derived from the sources.
   f.release[0]!();
-  await sleep(20);
+  await f.scheduler.quiesce();
   const job = f.store.pending().find((j) => j.kind === "observation")!;
   assert.ok(job);
   assert.equal((job.payload as { opId: string }).opId, f.extractCalls[0]!.opId);
@@ -500,7 +504,7 @@ test("crash and restart re-derives the pending batch under the same opId", async
   scheduler.setProvider({ entries: () => sources });
 
   scheduler.onAgentSettled();
-  await sleep(20);
+  await scheduler.quiesce();
   const firstOpId = extractCalls[0]!.opId;
 
   // "Crash": rebuild everything from the same state dir. The pending batch
@@ -532,7 +536,7 @@ test("crash and restart re-derives the pending batch under the same opId", async
   // restart must NOT re-extract it.
   assert.equal(coordinator2.isConsumed("e1"), true);
   scheduler2.onAgentSettled();
-  await sleep(20);
+  await scheduler.quiesce();
   assert.equal(extractCalls.length, 1);
   assert.equal(store2.pending().length, 1);
   store2.close();
@@ -584,7 +588,7 @@ test("crash and restart re-derives the pending batch under the same opId", async
     true,
   );
   await scheduler4.retryPending();
-  await sleep(20);
+  await scheduler.quiesce();
   assert.equal(
     extractCalls.some((c) => c.opId === "crashed-op-id"),
     true,
@@ -608,12 +612,16 @@ test("queue cap merges excess into the oldest pending batch, never drops", async
   f.scheduler.onAgentSettled();
   f.sources.push(entry("e2", "b"));
   f.scheduler.onAgentSettled();
-  await sleep(10);
+  await until(() => f.scheduler.pendingBatches.length >= 2);
   assert.equal(f.scheduler.pendingBatches.length, 2);
 
   f.sources.push(entry("e3", "c"));
   f.scheduler.onAgentSettled();
-  await sleep(10);
+  await until(
+    () =>
+      f.scheduler.pendingBatches.length >= 2 &&
+      f.scheduler.pendingBatches[0]!.entryIds.includes("e3"),
+  );
   // Still two pending batches: the new entries merged into the oldest.
   assert.equal(f.scheduler.pendingBatches.length, 2);
   const oldest = f.scheduler.pendingBatches[0]!;
@@ -639,10 +647,10 @@ test("below-threshold coverage is flushed by the idle timer, never dropped", asy
   const summary = f.scheduler.onAgentSettled();
   assert.equal(summary.deferred, true);
   assert.equal(f.extractCalls.length, 0); // not yet
-  await sleep(80);
+  await until(() => f.extractCalls.length >= 1);
   assert.equal(f.extractCalls.length, 1); // idle flush fired
   assert.equal(f.extractCalls[0]!.trigger, "idle");
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.coordinator.isConsumed("e1"), true);
 });
 
@@ -657,7 +665,7 @@ test("threshold trigger respects the input budget across batches", async () => {
     f.sources.push(entry(`e${i}`, "x".repeat(2_000)));
   }
   f.scheduler.onAgentSettled();
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.extractCalls.length, 1);
   const batchTokenTotal = f.extractCalls[0]!.sources.reduce(
     (s, e) => s + estimateTokens(e.text),
@@ -686,7 +694,7 @@ test("a result from a stale generation never advances the cursor", async () => {
   );
   f.sources.push(entry("e1", "content"));
   f.scheduler.onAgentSettled();
-  await sleep(5);
+  await until(() => f.extractCalls.length >= 1);
   // Generation changes while the extraction is in flight (fork to a new
   // session identity).
   f.coordinator.onSessionStart(
@@ -697,7 +705,7 @@ test("a result from a stale generation never advances the cursor", async () => {
     { reason: "new" },
   );
   f.release[0]!();
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.coordinator.isConsumed("e1"), false);
   assert.equal(f.store.pending().length, 0); // never accepted
   assert.equal(f.scheduler.pendingBatches.length, 1); // re-derivable
@@ -710,7 +718,7 @@ test("manual extraction flushes below-threshold coverage immediately", async () 
   f.sources.push(entry("e1", "small"));
   const summary = f.scheduler.extractNow();
   assert.equal(summary.scheduled, 1);
-  await sleep(20);
+  await f.scheduler.quiesce();
   assert.equal(f.extractCalls.length, 1);
   assert.equal(f.extractCalls[0]!.trigger, "manual");
 });
@@ -757,7 +765,7 @@ test("source text is redacted before reaching the model call", async () => {
     ],
   });
   scheduler.onAgentSettled();
-  await sleep(20);
+  await scheduler.quiesce();
   assert.equal(seen.length, 1);
   assert.match(seen[0] ?? "", /REDACTED/);
   assert.doesNotMatch(seen[0] ?? "", /sk-proj-aaaa/);

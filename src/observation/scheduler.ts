@@ -707,8 +707,26 @@ export class ObserverScheduler {
     return true;
   }
 
+  /**
+   * Q08A: opIds with a run queued or in flight. Every trigger path
+   * (settled/idle/manual/compact) may coexist with `retryPending`'s crash
+   * recovery re-run on the SAME batch record; without a single-flight guard
+   * a second trigger re-enqueues the in-flight batch and duplicates the
+   * model call plus its outbox job. A batch is run at most once per record.
+   */
+  private readonly running = new Set<string>();
+
   private enqueueRun(batch: PendingBatchRecord): Promise<boolean> {
-    const run = this.chain.then(() => this.runBatch(batch));
+    // Single-flight per opId: an in-flight (queued or running) batch is never
+    // re-enqueued; the existing run's outcome governs (crash recovery and
+    // retry cooldown still cover a FAILED run via noteExtractionFailure).
+    if (this.running.has(batch.opId)) return Promise.resolve(true);
+    this.running.add(batch.opId);
+    const run = this.chain
+      .then(() => this.runBatch(batch))
+      .finally(() => {
+        this.running.delete(batch.opId);
+      });
     // The chain must survive individual failures.
     this.chain = run.then(
       () => undefined,
@@ -995,6 +1013,19 @@ export class ObserverScheduler {
   /** Test/inspection: pending batch records (metadata only). */
   get pendingBatches(): readonly PendingBatchRecord[] {
     return this.state.pendingBatches;
+  }
+
+  /**
+   * Barrier: resolves when every run enqueued so far (settled, idle, manual,
+   * retry, compact) has finished its chain turn — success or failure. Lets
+   * callers and tests synchronize on the real scheduling chain instead of
+   * guessing with fixed sleeps. Never throws.
+   */
+  quiesce(): Promise<void> {
+    return this.chain.then(
+      () => undefined,
+      () => undefined,
+    );
   }
 
   dispose(): void {

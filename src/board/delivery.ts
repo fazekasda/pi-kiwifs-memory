@@ -109,6 +109,21 @@ export interface DeliveryState {
   entries: Record<string, DeliveryEntry>;
 }
 
+/**
+ * Q08B: corrupt delivery state fails CLOSED with a typed, actionable error.
+ * The file is never touched — the durable dedupe set and cursor are preserved
+ * for forensics; resetting would replay already-delivered messages or lose
+ * the unread backlog. Callers catch this type to hold visibly.
+ */
+export class DeliveryStateCorruptError extends Error {
+  constructor(file: string, detail: string) {
+    super(
+      `board delivery state corrupt (fail closed, file left intact): ${file} (${detail})`,
+    );
+    this.name = "DeliveryStateCorruptError";
+  }
+}
+
 /** Atomic durable per-consumer delivery state (no network, ever). */
 export class DeliveryStateFile {
   private state: DeliveryState;
@@ -120,9 +135,28 @@ export class DeliveryStateFile {
     this.tmp = `${this.file}.tmp`;
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (existsSync(this.file)) {
-      const parsed = JSON.parse(
-        readFileSync(this.file, "utf8"),
-      ) as DeliveryState;
+      let parsed: DeliveryState;
+      try {
+        parsed = JSON.parse(readFileSync(this.file, "utf8")) as DeliveryState;
+      } catch (err) {
+        // Q08B: fail closed — never silently reset dedupe/cursor state
+        // (a reset would replay delivered messages or drop the backlog).
+        // The file bytes stay untouched for forensics.
+        throw new DeliveryStateCorruptError(this.file, (err as Error).message);
+      }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        typeof parsed.schemaVersion !== "number" ||
+        parsed.consumerId !== consumerId ||
+        typeof parsed.entries !== "object" ||
+        parsed.entries === null
+      ) {
+        throw new DeliveryStateCorruptError(
+          this.file,
+          "not a delivery state object (schemaVersion/consumerId/entries missing)",
+        );
+      }
       if (parsed.schemaVersion > DELIVERY_SCHEMA_VERSION) {
         // Fail safe: keep the newer-format data unread-but-intact; the
         // delivery layer treats unknown versions as "dedupe unavailable"

@@ -144,10 +144,30 @@ export class OutboxWorker {
   }
 
   /**
+   * Single-flight serialization barrier: overlapping `tick()` callers (timer
+   * driver + gate release listener + command paths) queue behind the tick in
+   * progress instead of racing it. Two concurrent ticks would both read the
+   * same pending head and double-send one job while the first send is still
+   * in flight (at-least-once, but a same-process duplicate delivery is never
+   * necessary). Serialized callers each get their own real summary.
+   */
+  private chain: Promise<unknown> = Promise.resolve();
+
+  tick(): Promise<TickSummary> {
+    const run = this.chain.then(() => this.runTick());
+    // The chain must survive individual tick failures.
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
    * Processes at most one due job per scope, in seq order within each scope.
    * Never throws — failed jobs must never block ordinary Pi interaction.
    */
-  async tick(): Promise<TickSummary> {
+  private async runTick(): Promise<TickSummary> {
     const summary: TickSummary = {
       sent: [],
       pendingAck: [],
