@@ -19,6 +19,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 import {
   appendFileSync,
   closeSync,
@@ -215,6 +216,8 @@ export interface ManualOpsDeps {
   tombstoneCache?: { refresh(signal?: AbortSignal): Promise<void> };
   /** Pending evidence-pack registry (cleared after a successful forget). */
   registry?: { dropUnmatched(): { inputId: string; origin: string }[] };
+  /** Q04c: sanitized metadata-only audit sink (command events). */
+  audit?: AuditSinkLike;
   now?: () => Date;
 }
 
@@ -250,7 +253,22 @@ export async function forgetMemoryPath(
     ...(deps.actor !== undefined ? { actor: deps.actor } : {}),
     at,
   });
-  const store = await deps.openStore();
+  let store;
+  try {
+    store = await deps.openStore();
+  } catch (err) {
+    // Q04c: an openStore failure is audited, never silent.
+    deps.audit?.record({
+      kind: "command",
+      feature: "commands",
+      decision: `failed (forget: ${errorName(err)})`,
+      targetId: opId,
+    });
+    return {
+      ok: false,
+      reason: `forget failed: ${errorName(err)} (no content disclosed)`,
+    };
+  }
   if (!store) {
     return {
       ok: false,
@@ -268,12 +286,24 @@ export async function forgetMemoryPath(
     let dropped = 0;
     if (deps.registry) dropped = deps.registry.dropUnmatched().length;
     await deps.tombstoneCache?.refresh();
+    deps.audit?.record({
+      kind: "command",
+      feature: "commands",
+      decision: `ok (forget)${reasonHeld}`,
+      targetId: opId,
+    });
     return {
       ok: true,
       opId,
       detail: `forgotten (reversible): ${deps.path}${reasonHeld}${dropped > 0 ? `; ${dropped} cached evidence pack(s) dropped` : ""}; tombstone cache refreshed`,
     };
   } catch (err) {
+    deps.audit?.record({
+      kind: "command",
+      feature: "commands",
+      decision: `failed (forget: ${errorName(err)})`,
+      targetId: opId,
+    });
     return {
       ok: false,
       reason: `forget failed: ${errorName(err)} (no content disclosed)`,
@@ -307,7 +337,20 @@ export async function unforgetMemoryPath(
 ): Promise<ManualOpResult> {
   const now = deps.now ?? (() => new Date());
   const at = now().toISOString();
-  const store = await deps.openStore();
+  let store;
+  try {
+    store = await deps.openStore();
+  } catch (err) {
+    deps.audit?.record({
+      kind: "command",
+      feature: "commands",
+      decision: `failed (forget-undo: ${errorName(err)})`,
+    });
+    return {
+      ok: false,
+      reason: `forget-undo failed: ${errorName(err)} (no content disclosed)`,
+    };
+  }
   if (!store) {
     return {
       ok: false,
@@ -361,12 +404,23 @@ export async function unforgetMemoryPath(
       };
     }
     await deps.tombstoneCache?.refresh();
+    deps.audit?.record({
+      kind: "command",
+      feature: "commands",
+      decision: "ok (forget-undo)",
+      targetId: opId,
+    });
     return {
       ok: true,
       opId,
       detail: `restored to active: ${deps.path} (read-back verified)`,
     };
   } catch (err) {
+    deps.audit?.record({
+      kind: "command",
+      feature: "commands",
+      decision: `failed (forget-undo: ${errorName(err)})`,
+    });
     return {
       ok: false,
       reason: `forget-undo failed: ${errorName(err)} (no content disclosed)`,

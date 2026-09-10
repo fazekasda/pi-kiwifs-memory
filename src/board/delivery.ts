@@ -45,6 +45,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { isRetryable } from "../backend/errors.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 import {
   boardChannelOfPath,
   boardMsgIdOfPath,
@@ -345,6 +346,8 @@ export interface BoardDeliveryOptions {
   maxListingPages?: number;
   /** Test hook: skip scheduling, only runCycle is exercised. */
   schedule?: boolean;
+  /** Q04c: sanitized metadata-only audit sink (cycle outcome events). */
+  audit?: AuditSinkLike;
 }
 
 /**
@@ -366,6 +369,7 @@ export class BoardDelivery {
   private readonly maxChangesPages: number;
   private readonly maxListingPaths: number;
   private readonly maxListingPages: number;
+  private readonly audit: AuditSinkLike | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running = false;
   private stopped = false;
@@ -390,6 +394,7 @@ export class BoardDelivery {
     this.maxListingPaths = opts.maxListingPaths ?? MAX_LISTING_PATHS_PER_CYCLE;
     this.maxListingPages = opts.maxListingPages ?? MAX_LISTING_PAGES_PER_CYCLE;
     this.scheduling = opts.schedule ?? true;
+    this.audit = opts.audit;
   }
 
   /** Current backoff = min(cap, base * 2^(empty-3)) once past the empty cap. */
@@ -473,6 +478,36 @@ export class BoardDelivery {
    * pauses the cycle (cursor untouched, nothing marked, retried next cycle).
    */
   async runCycle(): Promise<CycleResult> {
+    const result = await this.runCycleInner();
+    // Q04c: sanitized per-cycle audit event — counters and pause reasons
+    // only, never message content, senders, channels' payload text or paths.
+    const decision = this.stopped
+      ? "held (stopped)"
+      : result.paused
+        ? `held (${result.pauseReason ?? "unknown"})`
+        : result.discoveryFallback !== undefined
+          ? "completed (listing fallback)"
+          : result.listingTruncated
+            ? "completed (listing truncated)"
+            : "completed";
+    this.audit?.record({
+      kind: "board",
+      feature: "board",
+      decision,
+      byteCounts: {
+        delivered: result.delivered.length,
+        skipped: result.skipped.length,
+        changes: result.changes,
+        pages: result.pages,
+      },
+      ...(result.paused || result.discoveryFallback !== undefined
+        ? { degraded: true }
+        : {}),
+    });
+    return result;
+  }
+
+  private async runCycleInner(): Promise<CycleResult> {
     const result: CycleResult = {
       pages: 0,
       changes: 0,

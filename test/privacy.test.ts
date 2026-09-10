@@ -202,9 +202,11 @@ test("unclassifiable snippet is withheld from the audit log", () => {
   assert.ok(event.decision.includes("snippet withheld"));
 });
 
-test("audit line failing the secret-free post-check is suppressed, never persisted", () => {
+test("unsafe identifier in audit record is redacted, never persisted (Q04a)", () => {
   // An attacker-crafted targetId that itself looks like a long token must not
-  // be able to smuggle opaque bytes into the audit log.
+  // be able to smuggle opaque bytes into the audit log. Q04a: fail closed per
+  // field — the raw value is replaced with a fixed marker and a content-free
+  // reason code, and the line is still secret-free-checked.
   const sink = new AuditSink();
   const rawTargetId = `${"A".repeat(40)}=${SECRET_SAMPLES.secrets[0]!.value}`;
   const event = sink.record({
@@ -213,12 +215,29 @@ test("audit line failing the secret-free post-check is suppressed, never persist
     targetId: rawTargetId,
   });
   const line = sink.lines_so_far()[0]!;
-  assert.equal(event.decision.startsWith("audit-suppressed"), true);
+  assert.ok(event.decision.includes("unsafe:targetId"));
+  assert.equal(event.targetId, "(redacted-unsafe)");
   assert.ok(
     !line.includes(rawTargetId),
     "suppressed line kept the raw targetId",
   );
   assertSecretFree(line, "suppressed audit line");
+});
+
+test("oversized audit identifiers are bounded to the line budget (Q04a)", () => {
+  const sink = new AuditSink();
+  const huge = "a".repeat(10_000);
+  const event = sink.record({
+    kind: "outbound-write",
+    decision: "allowed",
+    targetId: huge,
+  });
+  const line = sink.lines_so_far()[0]!;
+  assert.ok(event.targetId!.length <= 256);
+  assert.ok(
+    Buffer.byteLength(line, "utf8") <= 2048,
+    "serialized line must stay within the size bound",
+  );
 });
 
 test("private mode suppresses network reads/writes and new capture jobs", () => {

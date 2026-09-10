@@ -36,6 +36,7 @@ import { idempotencyKey } from "../domain/idempotency.ts";
 import { backupChunkPath, backupManifestPath } from "../domain/paths.ts";
 import { ValidationError } from "../backend/errors.ts";
 import { createRedactor } from "../privacy/redaction.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 import type { ExclusionRule } from "../privacy/exclusions.ts";
 import { compileExclusions } from "../privacy/exclusions.ts";
 import {
@@ -91,6 +92,8 @@ export interface BackupCaptureOptions {
   redact?: (
     content: string,
   ) => { ok: true; content: string } | { ok: false; reason: string };
+  /** Q04c: sanitized metadata-only audit sink (capture/hold events). */
+  audit?: AuditSinkLike;
   maxChunkBytes?: number;
   now?: () => number;
 }
@@ -323,6 +326,7 @@ export class BackupCapture {
   ) => { ok: true; content: string } | { ok: false; reason: string };
   private readonly maxChunkBytes: number | undefined;
   private readonly nowFn: () => number;
+  private readonly audit: AuditSinkLike | undefined;
   private state: BackupState;
   /** Last error (sanitized) for visible status. */
   lastError: string | undefined;
@@ -350,7 +354,27 @@ export class BackupCapture {
     this.redact = options.redact ?? createRedactor();
     this.maxChunkBytes = options.maxChunkBytes;
     this.nowFn = options.now ?? (() => Date.now());
+    this.audit = options.audit;
     this.state = this.loadState();
+  }
+
+  /**
+   * Q04c: sanitized metadata-only backup audit event. Best-effort — never
+   * throws, never authorizes or acknowledges work.
+   */
+  private auditEvent(
+    decision: string,
+    extra?: { byteCounts?: Record<string, number> },
+  ): void {
+    this.audit?.record({
+      kind: "backup",
+      feature: "backup",
+      scope: this.scope,
+      decision,
+      ...(extra?.byteCounts !== undefined
+        ? { byteCounts: extra.byteCounts }
+        : {}),
+    });
   }
 
   // ---- durable state ------------------------------------------------------
@@ -485,6 +509,7 @@ export class BackupCapture {
     if (this.privateMode()) {
       // Private mode: no new capture/backup jobs (§5). Pending jobs are held
       // by the outbox, never deleted.
+      this.auditEvent("held (private mode)");
       return {
         enqueuedChunks: 0,
         enqueuedManifest: false,
@@ -493,6 +518,7 @@ export class BackupCapture {
       };
     }
     if (!this.exclusionsValid) {
+      this.auditEvent("held (invalid exclusions)");
       return {
         enqueuedChunks: 0,
         enqueuedManifest: false,
@@ -512,6 +538,7 @@ export class BackupCapture {
       fresh.push(view);
     }
     if (fresh.length === 0) {
+      this.auditEvent("skipped (no candidates)");
       return {
         enqueuedChunks: 0,
         enqueuedManifest: false,
@@ -677,10 +704,19 @@ export class BackupCapture {
 
     this.persist();
     this.lastError = lastError;
+    // Q04c: sanitized capture event (counts only — never entry content).
+    const held = fresh.length - coveredNow.length;
+    this.auditEvent(held > 0 ? "captured (with held entries)" : "captured", {
+      byteCounts: {
+        chunks: enqueued,
+        held: held,
+        omissions: omissions.length,
+      },
+    });
     return {
       enqueuedChunks: enqueued,
       enqueuedManifest,
-      heldEntries: fresh.length - coveredNow.length,
+      heldEntries: held,
       ...(lastError !== undefined ? { lastError } : {}),
     };
   }

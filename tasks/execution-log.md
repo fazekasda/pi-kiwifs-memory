@@ -2386,3 +2386,23 @@ q02-closure-evidence.md` with prettier (whitespace only; content preserved)
   3 new), typecheck clean, prettier clean. Secret scan of `src/index.ts` and
   `test/t18-commands.test.ts`: clean (env-var names and synthetic refs only).
   No commits, no push — final worker owns the commit.
+
+## Q04 review-fix round (final worker)
+
+- Independent review accepted Q04's plan item but flagged findings needing
+  resolution before closure. All four addressed in this round:
+  1. Proposal change `targetId` no longer carries a user-typed path — only
+     the basename (`auditTargetForProposalPath`, src/observation/proposals.ts).
+  2. Lock takeover made pid-first: a live owner is never stolen regardless
+     of lock age (`acquireLock`, src/privacy/audit-store.ts); only a dead
+     owner, or an unreadable lock older than `staleLockMs`, is taken over.
+  3. Legacy rotated segments beyond `maxRotatedFiles` are removed at init
+     so the documented on-disk budget survives downward reconfiguration.
+  4. Reverted the regenerated `tasks/evidence/t19-budget-report.json`
+     timing artifact (belongs to the benchmark worker's domain, not Q04).
+- Regression tests added: q04a live-owner lock / legacy segment cleanup
+  (+2), q04c change targetId basename assertion (extended existing test).
+- docs/privacy.md and the audit-store header updated to state the actual
+  (pid-first) lock semantics honestly instead of an over-strong
+  "never a second writer" claim.
+- Gates: recorded after final edits in this round (see below).

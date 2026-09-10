@@ -72,6 +72,7 @@ import { PrivateModeActiveError } from "../privacy/private-mode.ts";
 import type { AuthRef } from "../config/schema.ts";
 import { resolveAuthSecret } from "./model.ts";
 import { createRedactor } from "../privacy/redaction.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 
 export const REFLECTION_SCHEMA_VERSION = 1;
 export const REFLECTION_STATE_FILE = "reflection-state.json";
@@ -848,6 +849,8 @@ export interface ReflectionEngineOptions {
   redact?: (
     content: string,
   ) => { ok: true; content: string } | { ok: false; reason: string };
+  /** Q04c: sanitized metadata-only audit sink (reflection run events). */
+  audit?: AuditSinkLike;
   minObservations?: number;
   inputBudgetTokens?: number;
   outputBudgetTokens?: number;
@@ -885,6 +888,7 @@ export class ReflectionEngine {
   private readonly maxSeenRecords: number;
   private readonly maxAttemptsPerSet: number;
   private readonly nowFn: () => number;
+  private readonly audit: AuditSinkLike | undefined;
   private state: ReflectionState;
   /** Serializes reflection runs (never interleave state mutations). */
   private chain: Promise<unknown> = Promise.resolve();
@@ -910,7 +914,28 @@ export class ReflectionEngine {
     this.maxAttemptsPerSet =
       options.maxAttemptsPerSet ?? DEFAULT_MAX_ATTEMPTS_PER_SET;
     this.nowFn = options.now ?? (() => Date.now());
+    this.audit = options.audit;
     this.state = this.loadState();
+  }
+
+  /**
+   * Q04c: sanitized metadata-only reflection audit event. Best-effort —
+   * never throws, never authorizes or acknowledges work.
+   */
+  private auditEvent(
+    decision: string,
+    extra?: { targetId?: string; byteCounts?: Record<string, number> },
+  ): void {
+    this.audit?.record({
+      kind: "reflection",
+      feature: "reflection",
+      scope: this.scope,
+      decision,
+      ...(extra?.targetId !== undefined ? { targetId: extra.targetId } : {}),
+      ...(extra?.byteCounts !== undefined
+        ? { byteCounts: extra.byteCounts }
+        : {}),
+    });
   }
 
   // ---- durable state ------------------------------------------------------
@@ -1056,6 +1081,26 @@ export class ReflectionEngine {
   private async runOnce(
     trigger: "auto" | "manual",
   ): Promise<ReflectionRunSummary> {
+    const summary = await this.runOnceInner(trigger);
+    // Q04c: sanitized reflection audit (run/skip; setHash is a content-free
+    // deterministic hash, safe as an identifier).
+    if (summary.ran) {
+      this.auditEvent("ran", {
+        // Short prefix of the content-free set hash: the full 64-hex hash
+        // would trip the sink's opaque-run secret post-check (fail closed).
+        ...(summary.setHash !== undefined
+          ? { targetId: summary.setHash.slice(0, 16) }
+          : {}),
+      });
+    } else {
+      this.auditEvent(`skipped (${summary.skippedReason ?? "unknown"})`);
+    }
+    return summary;
+  }
+
+  private async runOnceInner(
+    trigger: "auto" | "manual",
+  ): Promise<ReflectionRunSummary> {
     const now = this.nowFn();
     // Crash recovery / retry: a persisted in-flight run re-derives under its
     // original setHash/startedAt (byte-identical replay at send time).
@@ -1150,6 +1195,7 @@ export class ReflectionEngine {
         const res = this.redact(s);
         if (!res.ok) {
           this.lastError = `redaction-held (${res.reason})`;
+          this.auditEvent("held (redaction)");
           this.armRetry(item);
           return;
         }
@@ -1190,6 +1236,9 @@ export class ReflectionEngine {
         return;
       }
       this.lastError = modelErr.name;
+      this.auditEvent(`failed (${modelErr.name})`, {
+        targetId: item.setHash.slice(0, 16),
+      });
       this.armRetry(item);
       return;
     }

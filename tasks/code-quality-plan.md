@@ -149,7 +149,22 @@ Introduce a bounded, metadata-only audit sink wired into production
 composition (outbox worker per Q01; other domains as applicable). Cap, FIFO
 eviction, no user content, inspectable via status. Depends on Q06.
 
-Status: unchecked.
+Status: COMPLETE (pending final commit). The durable `FileAuditStore`
+(`src/privacy/audit-store.ts`) is wired through production composition
+(`buildSessionRuntime`) as the audit sink for the outbox worker and every
+other domain (observation, reflection, backup, retrieval, board, proposal
+change events, commands), via the existing typed `AuditSinkLike` seam.
+Metadata-only, allowlisted schema; cap + FIFO rotation (256 KiB × 3 files
+default); bounded 64-line memory fallback on failure — never an
+authorization or acknowledgement signal; degraded state surfaces as a
+content-free status note. Review-fix round closed the independent review
+findings: proposal change `targetId` reduced to basename (no user-typed
+path), pid-first lock takeover (live owner never stolen), legacy rotated
+segments beyond `maxRotatedFiles` removed at init, and the dirty
+t19 budget-report artifact reverted. Evidence:
+`tasks/evidence/q04a-audit-store.md`, `q04b-runtime-audit.md`,
+`q04c-domain-audit.md`. The `privacy.audit.file` config surface remains an
+explicitly documented, UNAPPROVED proposal (not wired).
 
 ## Q05 — personal-write / remote-GC scope reconciliation
 

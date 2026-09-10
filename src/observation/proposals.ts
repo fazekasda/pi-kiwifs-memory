@@ -47,10 +47,23 @@ import {
   appendFileSync,
   readFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { parseStoredRecord, serializeStoredRecord } from "../domain/records.ts";
 import { parseDataBlock, provenanceLine } from "./reflection.ts";
 import { createHash } from "node:crypto";
+import type { AuditSinkLike } from "../privacy/audit.ts";
+
+/**
+ * Q04 review fix: audit `targetId` for proposal change events. Reduces a
+ * user-typed proposal path to its basename so no directory components
+ * (home directory / username) are ever persisted. Falls back to a fixed
+ * content-free marker when the basename is empty or path-traversal-like.
+ */
+export function auditTargetForProposalPath(proposalPath: string): string {
+  const base = basename(proposalPath);
+  if (base.length === 0 || base === "." || base === "..") return "proposal";
+  return base;
+}
 
 /** A proposal/target is not in the expected pre-state (stale or raced). */
 export class StaleProposalError extends Error {
@@ -250,6 +263,7 @@ export class ProposalLifecycle {
   private readonly opLog: ProposalOpLog;
   private readonly openStore: () => Promise<ProposalStore | undefined>;
   private readonly nowFn: () => Date;
+  private readonly audit: AuditSinkLike | undefined;
   /** Serializes lifecycle transitions (local single-flight). */
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -257,10 +271,39 @@ export class ProposalLifecycle {
     opLog: ProposalOpLog;
     openStore: () => Promise<ProposalStore | undefined>;
     now?: () => Date;
+    /** Q04c: sanitized metadata-only audit sink (change events). */
+    audit?: AuditSinkLike;
   }) {
     this.opLog = options.opLog;
     this.openStore = options.openStore;
     this.nowFn = options.now ?? (() => new Date());
+    this.audit = options.audit;
+  }
+
+  /**
+   * Q04c: sanitized metadata-only change audit (approve/reject/undo).
+   * Best-effort — never throws, never authorizes or acknowledges a write.
+   */
+  private auditChange(decision: string, proposalPath: string): void {
+    this.audit?.record({
+      kind: "change",
+      feature: "proposal",
+      decision,
+      // Q04 review fix: never persist a user-typed path in `targetId` —
+      // an absolute path could carry a home directory/username. Only the
+      // basename is retained (content-free, no directory components).
+      targetId: auditTargetForProposalPath(proposalPath),
+    });
+  }
+
+  /** Sanitized failure fingerprint for audit decisions (name/code only). */
+  private auditFailName(err: unknown): string {
+    const name = err instanceof Error ? err.name : "unknown";
+    const code =
+      typeof err === "object" && err !== null && "code" in err
+        ? String((err as { code: unknown }).code)
+        : "";
+    return code ? `${name}:${code}` : name;
   }
 
   /**
@@ -361,7 +404,16 @@ export class ProposalLifecycle {
     proposalPath: string,
     opts: { actor: string; signal?: AbortSignal },
   ): Promise<ProposalTransitionResult> {
-    return this.serialized(() => this.approveInner(proposalPath, opts));
+    return this.serialized(async () => {
+      try {
+        const r = await this.approveInner(proposalPath, opts);
+        this.auditChange("approved", proposalPath);
+        return r;
+      } catch (err) {
+        this.auditChange(`failed (${this.auditFailName(err)})`, proposalPath);
+        throw err;
+      }
+    });
   }
 
   private async approveInner(
@@ -479,7 +531,16 @@ export class ProposalLifecycle {
     proposalPath: string,
     opts: { actor: string; reason?: string; signal?: AbortSignal },
   ): Promise<ProposalTransitionResult> {
-    return this.serialized(() => this.rejectInner(proposalPath, opts));
+    return this.serialized(async () => {
+      try {
+        const r = await this.rejectInner(proposalPath, opts);
+        this.auditChange("rejected", proposalPath);
+        return r;
+      } catch (err) {
+        this.auditChange(`failed (${this.auditFailName(err)})`, proposalPath);
+        throw err;
+      }
+    });
   }
 
   private async rejectInner(
@@ -541,7 +602,16 @@ export class ProposalLifecycle {
     proposalPath: string,
     opts: { actor: string; reason?: string; signal?: AbortSignal },
   ): Promise<ProposalTransitionResult> {
-    return this.serialized(() => this.undoInner(proposalPath, opts));
+    return this.serialized(async () => {
+      try {
+        const r = await this.undoInner(proposalPath, opts);
+        this.auditChange("undone", proposalPath);
+        return r;
+      } catch (err) {
+        this.auditChange(`failed (${this.auditFailName(err)})`, proposalPath);
+        throw err;
+      }
+    });
   }
 
   private async undoInner(

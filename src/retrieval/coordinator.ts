@@ -58,6 +58,7 @@ import {
   type Redactor,
 } from "../backend/guard.ts";
 import { createRedactor } from "../privacy/redaction.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 // T13: the framing moved to src/inject/packer.ts so the token-accounted
 // payload and the injected rendering cannot diverge. Type-only cycle is
 // erased at runtime.
@@ -372,6 +373,8 @@ export interface RetrievalCoordinatorOptions {
   generation: number;
   /** Private mode probe (T06): true → no network reads (fail visible). */
   privateMode?: () => boolean;
+  /** Q04c: sanitized metadata-only audit sink (retrieval outcome events). */
+  audit?: AuditSinkLike;
   now?: () => number;
 }
 
@@ -385,6 +388,7 @@ export class RetrievalCoordinator {
   private readonly redactField: Redactor;
   private generation: number;
   private readonly privateMode: () => boolean;
+  private readonly audit: AuditSinkLike | undefined;
   private readonly now: () => number;
   /** Latest sanitized degradation note, for status surfacing. */
   private lastNote: string | undefined;
@@ -400,7 +404,27 @@ export class RetrievalCoordinator {
     this.redactField = options.redact ?? createRedactor();
     this.generation = options.generation;
     this.privateMode = options.privateMode ?? (() => false);
+    this.audit = options.audit;
     this.now = options.now ?? (() => Date.now());
+  }
+
+  /**
+   * Q04c: sanitized metadata-only retrieval audit event. Best-effort —
+   * never throws, never authorizes or acknowledges a network read.
+   */
+  private auditEvent(
+    decision: string,
+    extra?: { byteCounts?: Record<string, number>; degraded?: boolean },
+  ): void {
+    this.audit?.record({
+      kind: "retrieval",
+      feature: "retrieval",
+      decision,
+      ...(extra?.byteCounts !== undefined
+        ? { byteCounts: extra.byteCounts }
+        : {}),
+      ...(extra?.degraded !== undefined ? { degraded: extra.degraded } : {}),
+    });
   }
 
   setGeneration(generation: number): void {
@@ -478,19 +502,22 @@ export class RetrievalCoordinator {
     source: string,
   ): Promise<RetrievalOutcome> {
     if (!this.eligible(rawText, source)) {
+      const reason = rawText.startsWith("/")
+        ? "slash-command"
+        : source === "extension"
+          ? "extension-source"
+          : "empty-text";
+      this.auditEvent(`skipped (ineligible: ${reason})`);
       return {
         kind: "ineligible",
-        reason: rawText.startsWith("/")
-          ? "slash-command"
-          : source === "extension"
-            ? "extension-source"
-            : "empty-text",
+        reason,
       };
     }
     if (this.privateMode()) {
       this.note(
         "retrieval held: private mode active — no network reads, no pack registered",
       );
+      this.auditEvent("held (private mode)");
       return {
         kind: "degraded",
         reason:
@@ -499,6 +526,7 @@ export class RetrievalCoordinator {
     }
     if (this.authorizedScopes.length === 0) {
       this.note("retrieval held: authorized scope set is empty");
+      this.auditEvent("held (no authorized scopes)");
       return {
         kind: "degraded",
         reason: "retrieval held: authorized scope set is empty",
@@ -512,6 +540,7 @@ export class RetrievalCoordinator {
       const redacted = this.redact(rawText);
       if (!redacted.ok) {
         this.note("retrieval skipped: query failed privacy classification");
+        this.auditEvent("skipped (privacy classification)");
         return {
           kind: "degraded",
           reason: "retrieval skipped: query failed privacy classification",
@@ -520,6 +549,7 @@ export class RetrievalCoordinator {
       query = redacted.content;
     } catch (err) {
       this.note(`retrieval skipped: redaction error (${(err as Error).name})`);
+      this.auditEvent(`failed (${(err as Error).name})`);
       return {
         kind: "degraded",
         reason: `retrieval skipped: redaction error (${(err as Error).name})`,
@@ -695,6 +725,7 @@ export class RetrievalCoordinator {
 
       if (signal.aborted) {
         this.note("retrieval degraded: deadline exceeded before completion");
+        this.auditEvent("degraded (deadline exceeded)", { degraded: true });
         return {
           kind: "degraded",
           reason: "retrieval degraded: deadline exceeded before completion",
@@ -721,6 +752,20 @@ export class RetrievalCoordinator {
         pack.degraded.push(reason);
         this.note(reason);
       }
+      // Q04c: sanitized completion event — counts/token totals only, never
+      // query text or evidence content.
+      this.auditEvent(
+        pack.degraded.length > 0 ? "completed (degraded)" : "completed",
+        {
+          byteCounts: {
+            items: pack.items.length,
+            ...(pack.tokenCount !== undefined
+              ? { tokens: pack.tokenCount }
+              : {}),
+          },
+          degraded: pack.degraded.length > 0,
+        },
+      );
       return { kind: "pack", pack };
     } finally {
       clearTimeout(timer);

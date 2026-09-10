@@ -56,7 +56,9 @@ import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
 import { validateProjectId } from "./domain/paths.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
-import { AuditSink } from "./privacy/audit.ts";
+import { FileAuditStore } from "./privacy/audit-store.ts";
+import { buildAuditLine } from "./privacy/audit.ts";
+import type { AuditSinkLike } from "./privacy/audit.ts";
 import { LiveConfigPrivateModeGate } from "./privacy/live-gate.ts";
 import {
   DEFAULT_INPUT_BUDGET_TOKENS,
@@ -95,6 +97,8 @@ let lastBoardNote: (() => string | undefined) | undefined;
 let lastQueueNote: (() => string | undefined) | undefined;
 /** Quarantined-job count probe for the overall state line (T18). */
 let lastQueueQuarantined: (() => number) | undefined;
+/** Q04b: sanitized audit-sink health note, surfaced via status (fail-visible). */
+let lastAuditNote: (() => string | undefined) | undefined;
 
 /** Test/inspection hook for the coordinator error probe. */
 export function setCoordinatorErrorProbe(
@@ -233,6 +237,8 @@ export function resolveStatusText(): string {
   if (backupNote) text += `\nbackup: ${backupNote}`;
   const boardNote = lastBoardNote?.();
   if (boardNote) text += `\nboard delivery: ${boardNote}`;
+  const auditNote = lastAuditNote?.();
+  if (auditNote) text += `\n${auditNote}`;
   const queueNote = lastQueueNote?.();
   if (queueNote) text += `\n${queueNote}`;
   // T18: overall state line — healthy / degraded / disabled / private.
@@ -259,6 +265,8 @@ export function resolveStatusText(): string {
       lastCapturePaused?.() === true
         ? "capture paused (coverage gap)"
         : undefined,
+      // Q04b: an audit-sink failure degrades the overall state visibly.
+      auditNote,
     ].filter((n): n is string => n !== undefined),
     quarantined: result.config.enabled ? queueQuarantinedCount() : 0,
   });
@@ -394,6 +402,8 @@ interface SessionRuntime {
   /** T17: bounded board delivery + local ack state (may be undefined). */
   delivery: BoardDeliveryRuntime | undefined;
   deliveryHeldReason: string | undefined;
+  /** Q04b: the production durable audit sink (exposed for status/tests). */
+  audit: FileAuditStore;
 }
 
 /**
@@ -432,7 +442,13 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   // setPrivateModeInFile hold NEW sends/retries at the next tick and resume
   // releases preexisting pending work (never dropped, never duplicated).
   const outboxGate = new LiveConfigPrivateModeGate();
-  const outboxAudit = new AuditSink();
+  // Q04b: durable bounded audit sink in PRODUCTION composition. The store is
+  // instantiated in the shipped runtime (never test-only assembly): JSONL
+  // under the state dir, bounded rotation (256 KiB x 3 files), private
+  // permissions, single-owner lock, never-throwing record. Q04a defaults are
+  // the approved proposal values; no config surface is parsed here.
+  const auditStore = new FileAuditStore({ path: join(stateDir, "audit.log") });
+  const outboxAudit: AuditSinkLike = auditStore;
   const worker = store
     ? new OutboxWorker({
         store,
@@ -503,6 +519,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             scope,
             outbox: store,
             ...(reflect ? { reflect } : {}),
+            // Q04c: same production sink — reflection run/skip events.
+            audit: outboxAudit,
           });
           // Proposal lifecycle: own durable op log (opIds recorded BEFORE
           // any side effect) and its own backend instance — the lifecycle
@@ -513,6 +531,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             const mcpUrl = config.mcp.url;
             lifecycle = new ProposalLifecycle({
               opLog,
+              // Q04c: change events (approve/reject/undo) ride the same
+              // production sink.
+              audit: outboxAudit,
               openStore: (() => {
                 let cached: KiwiFSAdapter | undefined;
                 return async () => {
@@ -646,6 +667,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       retrieval = new RetrievalCoordinator({
         adapter,
         authorizedScopes: retrievalScopes,
+        // Q04c: sanitized retrieval outcome events (holds/degradations).
+        audit: outboxAudit,
         deadlineMs: config.budgets.ragDeadlineMs,
         tokenCap: config.budgets.evidenceTokenCap,
         generation: coordinator.generation,
@@ -714,6 +737,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             return !r.ok || r.config.privateMode;
           },
           exclusions: config.privacy.exclusions,
+          // Q04c: sanitized backup capture/hold events.
+          audit: outboxAudit,
         });
       } catch (err) {
         backupHeldReason = `backup init failed: ${(err as Error).message}`;
@@ -814,6 +839,7 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     backupHeldReason,
     delivery,
     deliveryHeldReason,
+    audit: auditStore,
   };
 }
 
@@ -958,6 +984,22 @@ export function registerSessionHandlers(
   lastQueueQuarantined = () => runtime?.store?.stats.quarantined ?? 0;
   // T18 review fix: capture paused (coverage gap) is a degraded condition.
   lastCapturePaused = () => runtime?.store?.stats.paused ?? false;
+  // Q04b: sanitized audit-sink health (content-free: counts + errno class
+  // only — never paths, identifiers, or error text). Degraded-only: a healthy
+  // sink is silent, like the other status probes.
+  lastAuditNote = () => {
+    const st = runtime?.audit?.status();
+    if (!st || !st.degraded) return undefined;
+    const parts = [
+      `buffered=${st.buffered}`,
+      `writeFailures=${st.writeFailures}`,
+    ];
+    if (st.lastError) parts.push(`lastError=${st.lastError}`);
+    if (st.lock === "unavailable") parts.push("lock=unavailable");
+    if (st.corruptSkippedBytes > 0)
+      parts.push(`corruptSkippedBytes=${st.corruptSkippedBytes}`);
+    return `audit: DEGRADED — ${parts.join(" ")}`;
+  };
 
   const get = (cwd: string): SessionRuntime | undefined => {
     if (runtime) return runtime;
@@ -1180,6 +1222,13 @@ export function registerSessionHandlers(
     }
     runtime?.observer?.dispose();
     runtime?.liveGate?.dispose();
+    // Q04b: release the audit lock at teardown so a next session's store is
+    // never a second writer against a stale live lock (single-owner cleanup).
+    try {
+      runtime?.audit?.close();
+    } catch {
+      /* best effort; close never throws today */
+    }
     runtime?.coordinator.onShutdown();
     // T17: session teardown stops delivery and all background board work
     // (PRD T17: private mode and teardown stop delivery + background
@@ -1667,6 +1716,8 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
         actor: "user-command",
         ...(rt?.tombstoneCache ? { tombstoneCache: rt.tombstoneCache } : {}),
         ...(rt?.retrieval ? { registry: rt.retrieval.registry } : {}),
+        // Q04c: sanitized command event via the production sink.
+        ...(rt?.audit ? { audit: rt.audit } : {}),
       });
       if (ctx.hasUI)
         ctx.ui.notify(
@@ -1719,6 +1770,8 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
         path,
         actor: "user-command",
         ...(rt?.tombstoneCache ? { tombstoneCache: rt.tombstoneCache } : {}),
+        // Q04c: sanitized command event via the production sink.
+        ...(rt?.audit ? { audit: rt.audit } : {}),
       });
       if (ctx.hasUI)
         ctx.ui.notify(

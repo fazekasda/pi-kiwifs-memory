@@ -31,6 +31,7 @@
  */
 
 import type { BoardRepository } from "./repository.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 import {
   acquireConsumerLock,
   ConsumerLockError,
@@ -65,6 +66,8 @@ export interface BoardDeliveryRuntimeOptions {
   backoffMs?: number;
   /** Unread backlog pause threshold override; default 500. */
   backlogPauseAt?: number;
+  /** Q04c: sanitized metadata-only audit sink (delivery/lock events). */
+  audit?: AuditSinkLike;
 }
 
 export interface InboxEntry {
@@ -91,6 +94,7 @@ export class BoardDeliveryRuntime {
   private readonly pollMs: number | undefined;
   private readonly backoffMs: number | undefined;
   private readonly backlogPauseAt: number | undefined;
+  private readonly audit: AuditSinkLike | undefined;
   private delivery: BoardDelivery | undefined;
   private readonly buffer: InboxEntry[] = [];
   private lastError: string | undefined;
@@ -108,6 +112,7 @@ export class BoardDeliveryRuntime {
     this.pollMs = opts.pollMs;
     this.backoffMs = opts.backoffMs;
     this.backlogPauseAt = opts.backlogPauseAt;
+    this.audit = opts.audit;
   }
 
   /** Visible hold reason (shared consumerId refusal, lock trouble), if any. */
@@ -157,6 +162,13 @@ export class BoardDeliveryRuntime {
         if (err instanceof ConsumerLockError) {
           this.lockHoldReason = err.message;
           this.lastError = err.name;
+          // Q04c: sanitized hold event (never authorizes a read).
+          this.audit?.record({
+            kind: "board",
+            feature: "board",
+            decision: "held (consumer lock)",
+            degraded: true,
+          });
           return; // HELD — never share the consumer
         }
         throw err;
@@ -185,6 +197,7 @@ export class BoardDeliveryRuntime {
       ...(this.backlogPauseAt !== undefined
         ? { backlogPauseAt: this.backlogPauseAt }
         : {}),
+      ...(this.audit !== undefined ? { audit: this.audit } : {}),
     });
     this.delivery.start();
   }

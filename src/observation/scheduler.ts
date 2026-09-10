@@ -50,6 +50,7 @@ import { deriveRecordId } from "../domain/idempotency.ts";
 import { memoryRecordPath } from "../domain/paths.ts";
 import type { ExclusionRule } from "../privacy/exclusions.ts";
 import { createRedactor } from "../privacy/redaction.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 
 /** Extension-owned custom entry prefix — never captured (no recursion). */
 export const KIWIFS_CUSTOM_PREFIX = "kiwifs.";
@@ -181,6 +182,8 @@ export interface ObserverSchedulerOptions {
    * batches are retained untouched and resume when normal mode returns.
    */
   isPrivate?: () => boolean;
+  /** Q04c: sanitized metadata-only audit sink (capture/hold events). */
+  audit?: AuditSinkLike;
   now?: () => number;
 }
 
@@ -294,6 +297,7 @@ export class ObserverScheduler {
   private readonly retryBaseMs: number;
   private readonly retryCapMs: number;
   private readonly isPrivateFn: (() => boolean) | undefined;
+  private readonly audit: AuditSinkLike | undefined;
   /** Entries classified private-session since startup (metadata count). */
   private privateSkipped = 0;
 
@@ -334,11 +338,35 @@ export class ObserverScheduler {
     this.retryBaseMs = options.retryBaseMs ?? 30_000;
     this.retryCapMs = options.retryCapMs ?? 10 * 60_000;
     this.isPrivateFn = options.isPrivate;
+    this.audit = options.audit;
     this.state = this.loadState();
   }
 
   private privateActive(): boolean {
     return this.isPrivateFn?.() ?? false;
+  }
+
+  /**
+   * Q04c: sanitized metadata-only audit event (capture/hold/fail). Never
+   * throws; audit is best-effort and never authorizes or acknowledges work.
+   */
+  private auditEvent(
+    decision: string,
+    extra?: {
+      targetId?: string;
+      byteCounts?: Record<string, number>;
+    },
+  ): void {
+    this.audit?.record({
+      kind: "observation",
+      feature: "capture",
+      scope: this.scope,
+      decision,
+      ...(extra?.targetId !== undefined ? { targetId: extra.targetId } : {}),
+      ...(extra?.byteCounts !== undefined
+        ? { byteCounts: extra.byteCounts }
+        : {}),
+    });
   }
 
   /**
@@ -349,6 +377,9 @@ export class ObserverScheduler {
   private classifyPrivateSession(candidates: SourceEntryView[]): void {
     this.coordinator.markConsumed(candidates.map((c) => c.id));
     this.privateSkipped += candidates.length;
+    this.auditEvent("held (private mode): entries classified private-session", {
+      byteCounts: { entries: candidates.length },
+    });
   }
 
   // ---- durable state ------------------------------------------------------
@@ -543,6 +574,8 @@ export class ObserverScheduler {
       });
     } catch (err) {
       this.lastError = (err as Error).name;
+      // Q04c: sanitized extraction-failure audit (error name only).
+      this.auditEvent(`failed (${(err as Error).name})`);
       this.noteExtractionFailure(batch);
       return false;
     }
@@ -611,6 +644,8 @@ export class ObserverScheduler {
       });
     } catch (err) {
       this.lastError = (err as Error).name;
+      // Q04c: sanitized capture-failure audit (error name only).
+      this.auditEvent(`failed (${(err as Error).name})`);
       // Local acceptance failures (outbox persist) do NOT arm the retry
       // cooldown: recovery should re-derive as soon as the local fault
       // clears. The cooldown protects the model provider only.
@@ -662,6 +697,13 @@ export class ObserverScheduler {
         this.lastError = `reflection-hook (${(err as Error).name})`;
       }
     }
+    // Q04c: sanitized capture event — AFTER durable acceptance, with a
+    // short content-free record id (the full path would trip the sink's
+    // opaque-run secret post-check; fail-closed by design).
+    this.auditEvent("captured", {
+      targetId: deriveRecordId("observation", batch.opId),
+      byteCounts: { entries: batch.entryIds.length },
+    });
     return true;
   }
 
@@ -806,6 +848,8 @@ export class ObserverScheduler {
     // settled/compact boundary classifies private-period content, and
     // pre-private entries remain available for extraction after resume.
     if (this.privateActive()) {
+      // Q04c: hold event even when no entries exist to classify.
+      this.auditEvent("held (private mode)");
       return {
         scheduled: 0,
         deferred: false,

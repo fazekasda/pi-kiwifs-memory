@@ -18,7 +18,7 @@
  */
 
 import { isRetryable } from "../backend/errors.ts";
-import type { AuditSink } from "../privacy/audit.ts";
+import type { AuditSinkLike } from "../privacy/audit.ts";
 import {
   PrivateModeActiveError,
   type PrivateModeGateAdapter,
@@ -38,7 +38,7 @@ export interface OutboxWorkerOptions {
   store: DurableOutbox;
   send: JobSender;
   gate?: PrivateModeGateAdapter;
-  audit?: AuditSink;
+  audit?: AuditSinkLike;
   maxAttempts?: number;
   baseDelayMs?: number;
   capDelayMs?: number;
@@ -72,7 +72,7 @@ export class OutboxWorker {
   private readonly store: DurableOutbox;
   private readonly send: JobSender;
   private readonly gate: PrivateModeGateAdapter | undefined;
-  private readonly audit: AuditSink | undefined;
+  private readonly audit: AuditSinkLike | undefined;
   private readonly maxAttempts: number;
   private readonly baseDelayMs: number;
   private readonly capDelayMs: number;
@@ -101,6 +101,12 @@ export class OutboxWorker {
     // before the gate can ever be enabled, so a resume always reaches us.
     if (this.gate) {
       this.gate.onRelease(() => {
+        // Q04b: sanitized transition audit — a release is a metadata-only
+        // event (no opIds, no reasons beyond the fixed code).
+        this.audit?.record({
+          kind: "outbox",
+          decision: "released (private mode)",
+        });
         void this.tick();
       });
       // Best-effort in-flight cancellation (Q02): a normal→private
@@ -152,6 +158,13 @@ export class OutboxWorker {
       // a second, independent check on the same gate before touching network.
       if (this.gate?.isPrivate) {
         this.gate.holdWhilePrivate({ opId: job.opId, kind: job.kind });
+        // Q04b: sanitized private-transition audit (metadata only).
+        this.audit?.record({
+          kind: "outbox",
+          feature: job.kind,
+          scope: job.scope,
+          decision: "held (private mode)",
+        });
         summary.held.push(job.opId);
         continue;
       }
@@ -193,11 +206,23 @@ export class OutboxWorker {
       // or any other failure): fail CLOSED — hold, never retry/quarantine.
       if (this.gate?.isPrivate) {
         this.gate.holdWhilePrivate({ opId: job.opId, kind: job.kind });
+        this.audit?.record({
+          kind: "outbox",
+          feature: job.kind,
+          scope: job.scope,
+          decision: "held (private mode)",
+        });
         summary.held.push(job.opId);
         return;
       }
       if (err instanceof PrivateModeActiveError) {
         this.gate?.holdWhilePrivate({ opId: job.opId, kind: job.kind });
+        this.audit?.record({
+          kind: "outbox",
+          feature: job.kind,
+          scope: job.scope,
+          decision: "held (private mode)",
+        });
         summary.held.push(job.opId);
         return;
       }
