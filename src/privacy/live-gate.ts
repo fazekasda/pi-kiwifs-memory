@@ -24,6 +24,7 @@
  */
 
 import { loadConfig } from "../config/loader.ts";
+import type { MemoryConfig } from "../config/schema.ts";
 import {
   PrivateModeActiveError,
   type FeatureDomain,
@@ -31,10 +32,84 @@ import {
   type PrivateModeGateAdapter,
 } from "./private-mode.ts";
 
-/** Fail-closed live private-mode read: invalid config counts as private. */
+/**
+ * Q07B1: the ONE fail-closed LIVE-config view, owned by this module.
+ *
+ * A single `loadConfig` read is classified into the LIVE safety fields:
+ * - `ok` — the config file was read and validated.
+ * - `privateMode` — the persisted private-mode flag; `true` whenever the
+ *   config is missing/unreadable/malformed/invalid (fail closed). It is a
+ *   PER-BOUNDARY read: the caller re-evaluates at the next boundary; this
+ *   module never caches a permit and never retries.
+ * - `enabled` — the persisted enablement flag; `false` whenever the config
+ *   fails (no authority can be derived from a config that cannot be read).
+ * - `invalidReason` — the first sanitized fatal/validation summary, for
+ *   status display only (same class of message `resolveStatusText` already
+ *   surfaces; never secret material).
+ * - `config`/`file` — present only when `ok`; the loaded object and the
+ *   resolved file path, so callers that need more than the safety fields do
+ *   not have to re-read the file.
+ */
+export interface ConfigLiveView {
+  readonly ok: boolean;
+  readonly privateMode: boolean;
+  readonly enabled: boolean;
+  readonly invalidReason?: string;
+  readonly config?: MemoryConfig;
+  readonly file?: string;
+}
+
+/**
+ * Single loadConfig wrapper — the config-owner read. Every LIVE privacy/
+ * validity gate in the runtime routes through this function; the predicate
+ * `!ok || privateMode` is implemented exactly ONCE, here (Q07B1 collapse).
+ */
+export function readConfigLive(): ConfigLiveView {
+  try {
+    const result = loadConfig();
+    if (!result.ok) {
+      const reason =
+        result.fatal !== undefined && result.fatal !== ""
+          ? result.fatal
+          : result.issues && result.issues.length > 0
+            ? `${result.issues.length} config validation issue(s): ${result.issues
+                .map((i) => `${i.path || "(root)"}: ${i.message}`)
+                .join("; ")}`
+            : undefined;
+      return {
+        ok: false,
+        privateMode: true, // fail closed: no valid authority
+        enabled: false,
+        ...(reason !== undefined ? { invalidReason: reason } : {}),
+        ...(result.file !== undefined ? { file: result.file } : {}),
+      };
+    }
+    return {
+      ok: true,
+      privateMode: result.config.privateMode,
+      enabled: result.config.enabled,
+      config: result.config,
+      ...(result.file !== undefined ? { file: result.file } : {}),
+    };
+  } catch (err) {
+    // loadConfig is written not to throw, but a regression must still fail
+    // closed (never crash a worker tick / scheduler boundary).
+    return {
+      ok: false,
+      privateMode: true,
+      enabled: false,
+      invalidReason: `config read failed: ${(err as Error).name}`,
+    };
+  }
+}
+
+/**
+ * Fail-closed live private-mode read: invalid config counts as private.
+ * Q07B1: now a thin projection of the single owner (`readConfigLive`) —
+ * the predicate is no longer duplicated here.
+ */
 export function liveConfigPrivateMode(): boolean {
-  const result = loadConfig();
-  return !result.ok || result.config.privateMode;
+  return readConfigLive().privateMode;
 }
 
 export class LiveConfigPrivateModeGate implements PrivateModeGateAdapter {

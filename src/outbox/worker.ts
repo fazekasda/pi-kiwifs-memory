@@ -38,6 +38,15 @@ export interface OutboxWorkerOptions {
   store: DurableOutbox;
   send: JobSender;
   gate?: PrivateModeGateAdapter;
+  /**
+   * Q07C: computes the CURRENT session snapshot's expected delivery-target
+   * fingerprint for a job. A pending job that carries its own (enqueue-time)
+   * `target` which differs ⇒ HELD before any network attempt (never rerouted
+   * to a changed endpoint/credential-ref/scope; never dropped, never
+   * quarantined, no attempts consumed). Legacy jobs without a `target`
+   * deliver as today (Q07A §3 contract, additive default).
+   */
+  expectedTarget?: (job: OutboxJob) => string | undefined;
   audit?: AuditSinkLike;
   maxAttempts?: number;
   baseDelayMs?: number;
@@ -72,6 +81,8 @@ export class OutboxWorker {
   private readonly store: DurableOutbox;
   private readonly send: JobSender;
   private readonly gate: PrivateModeGateAdapter | undefined;
+  private readonly expectedTarget:
+    ((job: OutboxJob) => string | undefined) | undefined;
   private readonly audit: AuditSinkLike | undefined;
   private readonly maxAttempts: number;
   private readonly baseDelayMs: number;
@@ -88,6 +99,7 @@ export class OutboxWorker {
     this.store = opts.store;
     this.send = opts.send;
     this.gate = opts.gate;
+    this.expectedTarget = opts.expectedTarget;
     this.audit = opts.audit;
     this.maxAttempts = opts.maxAttempts ?? 8;
     this.baseDelayMs = opts.baseDelayMs ?? 500;
@@ -164,6 +176,28 @@ export class OutboxWorker {
           feature: job.kind,
           scope: job.scope,
           decision: "held (private mode)",
+        });
+        summary.held.push(job.opId);
+        continue;
+      }
+      // Q07C: target pin — a job minted for a DIFFERENT delivery target
+      // (endpoint/credential-ref identity/record scope changed across a
+      // session rebuild) is HELD visibly, never rerouted. No attempt is
+      // consumed, no backoff scheduled: the hold is free and re-evaluated at
+      // every tick, so restoring the original config releases delivery
+      // exactly once under the original opId. Safety checks above keep
+      // precedence (private mode still holds first).
+      const expected = this.expectedTarget?.(job);
+      if (
+        job.target !== undefined &&
+        expected !== undefined &&
+        job.target !== expected
+      ) {
+        this.audit?.record({
+          kind: "outbox",
+          feature: job.kind,
+          scope: job.scope,
+          decision: "held (delivery target changed)",
         });
         summary.held.push(job.opId);
         continue;

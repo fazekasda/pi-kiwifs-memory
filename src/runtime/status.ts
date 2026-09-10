@@ -25,7 +25,7 @@
  * after the extraction (an orphan); it was deliberately removed rather than
  * registered, and the runtime-owned probe below is the single status path.
  */
-import { loadConfig } from "../config/loader.ts";
+import { readConfigLive } from "../privacy/live-gate.ts";
 import { resolvedStatusLines, statusIsSecretFree } from "../config/status.ts";
 import { effectiveFeatures } from "../config/schema.ts";
 import { resolveAuthSecret } from "../observation/model.ts";
@@ -194,22 +194,27 @@ export function computeOverallState(deps: {
  */
 export function resolveStatusText(): string {
   let text: string;
-  const result = loadConfig();
-  if (!result.ok) {
-    const detail =
-      "fatal" in result && result.fatal
-        ? result.fatal
-        : (result.issues ?? [])
-            .map((i) => `${i.path || "(root)"}: ${i.message}`)
-            .join("; ");
+  // Q07C: display reads route through the single live-config owner
+  // (readConfigLive) — same fail-closed classification as every runtime
+  // gate, sanitized invalidReason surfaced verbatim (it is already the
+  // status-safe message class).
+  const view = readConfigLive();
+  if (!view.ok || !view.config) {
+    const detail = view.invalidReason ?? "config could not be read";
     return `${STATUS_MESSAGE}\nconfig: INVALID — extension disabled\n${detail}`;
   }
+  const result = { ok: true as const, config: view.config };
   const lines = resolvedStatusLines(result.config);
   if (!statusIsSecretFree(lines)) {
     // Defensive: never display potentially secret-bearing output.
     return `${STATUS_MESSAGE}\nconfig: loaded (status suppressed — secret-free check failed)`;
   }
   text = `${STATUS_MESSAGE}\n${lines.join("\n")}`;
+  // Q07C lifecycle truthfulness: state exactly which settings are LIVE vs
+  // which are the session SNAPSHOT — status must never claim that snapshot
+  // fields (endpoint/credentials/scopes/budgets/features) apply live.
+  text +=
+    "\nlifecycle: private mode and command admission (enabled) are live; the running scheduler/delivery loop applies enabled at the next session; endpoint/credential refs/scopes/budgets/features are the session snapshot — changes apply at the next session";
   // Visible fail-closed surface for lifecycle-state problems (never secrets).
   const coordErr = lastCoordinatorError?.();
   if (coordErr) text += `\nsession coordinator: DISABLED — ${coordErr}`;

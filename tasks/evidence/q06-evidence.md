@@ -36,7 +36,7 @@ in the round. No live services, model calls, push, or publication.
   model-call boundary, audit injected uniformly) run green in the shared
   suite. No test-only factories: production composition path only.
 
-## Q06C — commands/status/controls extraction (this round, staged)
+## Q06C — commands/status/controls extraction (commit f0cea46)
 
 - `src/commands/{registration,board-commands,backup-commands,control-commands}.ts`:
   all 13 commands extracted; `src/index.ts` now 528 lines with **0**

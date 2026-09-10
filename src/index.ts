@@ -3,7 +3,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "./config/loader.ts";
+import { readConfigLive } from "./privacy/live-gate.ts";
 import type { AuthRef } from "./config/schema.ts";
 import { resolvedStatusLines, statusIsSecretFree } from "./config/status.ts";
 import { effectiveFeatures, type MemoryConfig } from "./config/schema.ts";
@@ -227,15 +227,20 @@ export function registerSessionHandlers(
   };
   const getHeldReason = (): string | undefined =>
     runtime?.retrievalHeldReason ?? runtimeError;
+  // Q07B1: deps resolve through the single live-config owner (readConfigLive)
+  // — one per-call read classifies validity/enablement; the per-check
+  // private-mode predicate is the owner's fail-closed read, so a config that
+  // turns invalid/unreadable mid-call fails closed instead of using a permit
+  // captured before the flip.
   const recallDeps = (): RecallToolsDeps | undefined => {
-    const configResult = loadConfig();
-    if (!configResult.ok) return undefined;
-    const config = configResult.config;
+    const view = readConfigLive();
+    if (!view.ok || !view.config) return undefined;
+    const config = view.config;
     const rt = runtime;
     return {
       getRuntime: getRecallRuntime,
       getHeldReason,
-      privateMode: () => config.privateMode,
+      privateMode: () => readConfigLive().privateMode,
       ...(rt?.tombstoneCache ? { tombstoneCache: rt.tombstoneCache } : {}),
       deadlineMs: config.budgets.ragDeadlineMs,
     };
@@ -255,9 +260,10 @@ export function registerSessionHandlers(
   // adapter (same MCP config gating: enabled + url + auth resolve); when
   // retrieval is held, the board is held with the same sanitized reason.
   const boardDeps = (): BoardToolsDeps | undefined => {
-    const configResult = loadConfig();
-    if (!configResult.ok) return undefined;
-    const config = configResult.config;
+    // Q07B1: same single-owner read as the recall tools (see recallDeps).
+    const view = readConfigLive();
+    if (!view.ok || !view.config) return undefined;
+    const config = view.config;
     const rt = runtime;
     const getBoardRuntime = (): BoardRuntime | undefined => {
       if (!rt?.retrieval?.adapter) return undefined;
@@ -276,7 +282,7 @@ export function registerSessionHandlers(
         runtime?.retrievalHeldReason ??
         runtime?.deliveryHeldReason ??
         runtimeError,
-      privateMode: () => config.privateMode,
+      privateMode: () => readConfigLive().privateMode,
       redact: createRedactor(),
     };
   };
@@ -466,27 +472,30 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
     buildSessionRuntime(cwd),
   );
 
-  /** Command-side gates: config must be valid, enabled and not private. */
+  /** Command-side gates: config must be valid, enabled and not private.
+   *  Q07B1: classified through the single live-config owner (readConfigLive)
+   *  — one read per command; the failing notices are unchanged. */
   const configGate = ():
     | { ok: false; notice: string }
     | { ok: true; config: MemoryConfig; configFile: string | undefined } => {
-    const result = loadConfig();
-    if (!result.ok) return { ok: false, notice: "config: INVALID" };
-    if (!result.config.enabled)
-      return { ok: false, notice: "extension disabled" };
-    if (result.config.privateMode)
+    const view = readConfigLive();
+    if (!view.ok || !view.config)
+      return { ok: false, notice: "config: INVALID" };
+    if (!view.enabled) return { ok: false, notice: "extension disabled" };
+    if (view.privateMode)
       return {
         ok: false,
         notice:
           "private mode active — all domains hold (zero reads/writes); use /kiwifs-private-mode off to resume",
       };
-    return { ok: true, config: result.config, configFile: result.file };
+    return { ok: true, config: view.config, configFile: view.file };
   };
 
   /** T18: control surface for the command's session (lazy runtime). */
   const controlSurface = (cwd: string): RuntimeControlSurface =>
     buildRuntimeControlSurface({
-      configFile: loadConfig().file,
+      // Q07B1: resolved path via the single live-config owner.
+      configFile: readConfigLive().file,
       getRetrieval: () => runtimeBox.getRuntime(cwd)?.retrieval,
       getGeneration: () =>
         runtimeBox.getRuntime(cwd)?.coordinator.generation ?? 0,

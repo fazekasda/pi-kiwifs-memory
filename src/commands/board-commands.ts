@@ -31,7 +31,7 @@
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { effectiveFeatures } from "../config/schema.ts";
-import { loadConfig } from "../config/loader.ts";
+import { readConfigLive } from "../privacy/live-gate.ts";
 import { openConfiguredBackend, resolveStateDir } from "../runtime/session.ts";
 import { BoardRepository } from "../board/repository.ts";
 import { validateId, PathEscapeError } from "../domain/paths.ts";
@@ -144,12 +144,12 @@ export function registerBoardCleanupCommand(
         return;
       }
       const ledger = opLog.ledger();
-      // Live private-mode gate re-reads config per check (same wiring as
-      // board delivery; a persisted flip takes effect without a restart).
+      // Live private-mode gate re-reads config per check via the single
+      // live-config owner (Q07B1/Q07C; same wiring as board delivery; a
+      // persisted flip or an invalid config fails closed without a restart).
       const repoGate = {
         get isPrivate() {
-          const r = loadConfig();
-          return !r.ok || r.config.privateMode;
+          return readConfigLive().privateMode;
         },
       };
       const adapter = openConfiguredBackend(gate.config, ledger);

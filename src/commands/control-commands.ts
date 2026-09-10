@@ -21,7 +21,7 @@
  * index (index imports this module; the direction is one-way).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "../config/loader.ts";
+import { readConfigLive } from "../privacy/live-gate.ts";
 import type { RuntimeControlSurface } from "../runtime/controls.ts";
 import { resolveStatusText } from "../runtime/status.ts";
 import { erasureReportLines } from "./manual-ops.ts";
@@ -76,14 +76,17 @@ export function registerPrivateModeCommand(
           ctx.ui.notify("usage: /kiwifs-private-mode on|off|status", "info");
         return;
       }
-      const result = loadConfig();
+      // Q07C: through the single live-config owner (fail-closed: an invalid
+      // config reads as private for the status view too).
+      const view = readConfigLive();
       if (mode === "status") {
         if (ctx.hasUI) {
-          if (!result.ok) ctx.ui.notify("config: INVALID", "error");
+          if (!view.ok || !view.config)
+            ctx.ui.notify("config: INVALID", "error");
           else
             ctx.ui.notify(
-              `private mode: ${result.config.privateMode ? "ON" : "OFF"}${
-                result.config.privateMode
+              `private mode: ${view.config.privateMode ? "ON" : "OFF"}${
+                view.config.privateMode
                   ? " — all domains hold (zero reads/writes)"
                   : ""
               }`,

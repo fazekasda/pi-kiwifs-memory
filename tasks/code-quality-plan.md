@@ -149,7 +149,7 @@ Introduce a bounded, metadata-only audit sink wired into production
 composition (outbox worker per Q01; other domains as applicable). Cap, FIFO
 eviction, no user content, inspectable via status. Depends on Q06.
 
-Status: COMPLETE (pending final commit). The durable `FileAuditStore`
+Status: COMPLETE (committed). The durable `FileAuditStore`
 (`src/privacy/audit-store.ts`) is wired through production composition
 (`buildSessionRuntime`) as the audit sink for the outbox worker and every
 other domain (observation, reflection, backup, retrieval, board, proposal
@@ -179,10 +179,9 @@ and audit are injected uniformly into worker/observer/reflection/delivery —
 closing the Q01 gaps structurally instead of per-callsite patches. The Q01
 failing tests become the acceptance regressions.
 
-Status: COMPLETE (pending final commit). Composed of behavior-preserving
-subtasks: Q06A backend factory (commit 62fb957), Q06B session runtime
-extraction (commit ba6975b), Q06C commands/status/controls extraction
-(staged) — `buildSessionRuntime` injects the private-mode gate, config
+Status: COMPLETE (committed). Composed of behavior-preserving subtasks:
+Q06A backend factory (commit 62fb957), Q06B session runtime extraction
+(commit ba6975b), Q06C commands/status/controls extraction (commit f0cea46) `buildSessionRuntime` injects the private-mode gate, config
 validity gate and the Q04 `FileAuditStore` audit sink uniformly into
 worker/observer/reflection/delivery; the Q01 failing tests run green as
 acceptance regressions. index.ts is composition/lifecycle only; no
@@ -193,7 +192,15 @@ tests. Evidence: `tasks/evidence/q06-evidence.md`.
 
 Config re-read/invalidation lifecycle: single owner for live gates, defined
 behavior on invalid config (fail closed), documented reload boundaries.
-Status: unchecked.
+Status: COMPLETE (this commit). Single live-config owner
+(`readConfigLive()` in src/privacy/live-gate.ts); every gate re-reads per
+boundary (no cached permits); invalid config fails closed with cancel-once
+transition and sanitized status; safe session-boundary rebuild is the only
+structural reload; delivery-target pin (src/outbox/target.ts) holds jobs
+whose endpoint/credential-ref/scope changed across a rebuild. Tests:
+q07b1-live-view (11), q07c-runtime-reload (8). Evidence:
+`tasks/evidence/q07b1-live-view.md`, `tasks/evidence/q07c-runtime-reload.md`;
+contract ratified in `tasks/plans/Q07A-lifecycle-contract-draft.md` §7.
 
 ## Q08 — Deterministic concurrency
 

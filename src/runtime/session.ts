@@ -55,7 +55,10 @@ import { BoardDeliveryRuntime } from "../board/runtime.ts";
 import { discoverProjectIdentity } from "../scope/discovery.ts";
 import { FileAuditStore } from "../privacy/audit-store.ts";
 import type { AuditSinkLike } from "../privacy/audit.ts";
-import { LiveConfigPrivateModeGate } from "../privacy/live-gate.ts";
+import {
+  LiveConfigPrivateModeGate,
+  readConfigLive,
+} from "../privacy/live-gate.ts";
 import {
   DEFAULT_INPUT_BUDGET_TOKENS,
   DEFAULT_OUTPUT_BUDGET_TOKENS,
@@ -63,6 +66,8 @@ import {
 } from "../observation/scheduler.ts";
 import { DurableOutbox, OutboxError } from "../outbox/store.ts";
 import { OutboxWorker } from "../outbox/worker.ts";
+import { targetFingerprint } from "../outbox/target.ts";
+import type { OutboxJob } from "../outbox/store.ts";
 import { loadConfiguredTokenizer } from "../retrieval/tokenizer.ts";
 import { validateProjectId } from "../domain/paths.ts";
 
@@ -197,7 +202,16 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   let store: DurableOutbox | undefined;
   let observerError: string | undefined;
   try {
-    store = DurableOutbox.open(join(stateDir, "outbox"));
+    store = DurableOutbox.open(join(stateDir, "outbox"), {
+      // Q07C: pin each job's delivery target at enqueue time from the
+      // session snapshot (endpoint + auth-ref identity + record scope).
+      ...(config
+        ? {
+            targetFor: (jobScope: string) =>
+              targetFingerprint(config.mcp.url, config.mcp.auth, jobScope),
+          }
+        : {}),
+    });
   } catch (err) {
     observerError =
       err instanceof OutboxError
@@ -213,6 +227,27 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   const scope = scopeResolution?.ok ? scopeResolution.scope : undefined;
   if (scopeResolution && !scopeResolution.ok)
     observerError = scopeResolution.reason;
+  // Q07C: the session SNAPSHOT's delivery-target identity. Jobs enqueued in
+  // this session pin the enqueue-time fingerprint (endpoint URL + auth-ref
+  // identity + record scope, sha-256 — src/outbox/target.ts); delivery time
+  // re-derives the expected fingerprint from THIS session's snapshot. A
+  // changed endpoint / credential-reference identity / record scope across a
+  // session rebuild therefore HELDS retained jobs (worker pre-send check):
+  // endpoint/credential/scope changes can never reroute persisted jobs.
+  // Credential VALUE rotation behind the same reference keeps the
+  // fingerprint (only ref identity enters the hash) — delivery proceeds.
+  // Personal jobs always deliver at their own `personal` scope (Q05P1),
+  // which is the sender's routing too — so the expected fingerprint uses the
+  // job's own scope for personal, the session scope otherwise (mirrors the
+  // sender's delivery-scope resolution below).
+  const expectedTarget = config
+    ? (job: OutboxJob) =>
+        targetFingerprint(
+          config.mcp.url,
+          config.mcp.auth,
+          job.scope === "personal" ? "personal" : (scope ?? job.scope),
+        )
+    : undefined;
   // Q02a: production privacy dependency for the outbox worker — a fail-closed
   // live-config gate (re-read per check, same semantics as retrieval/backup/
   // board) and a sanitized metadata-only audit sink. NOT test-only assembly:
@@ -245,6 +280,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
         // attempt cap; permanent failures (validation/conflict) quarantine
         // per the worker's own rules.
         maxAttempts: Number.MAX_SAFE_INTEGER,
+        // Q07C: target pin — see expectedTarget above. Undefined when the
+        // snapshot has no config (jobs then deliver as legacy-shaped).
+        ...(expectedTarget ? { expectedTarget } : {}),
       })
     : undefined;
   const coordinator = new SessionCoordinator({
@@ -452,13 +490,11 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
           deadlineMs: config.budgets.ragDeadlineMs,
           tokenCap: config.budgets.evidenceTokenCap,
           generation: coordinator.generation,
-          // Live gate: re-read per cycle; an INVALID config fails closed to
+          // Live gate: re-read per cycle via the single config owner
+          // (readConfigLive — Q07B1); an INVALID config fails closed to
           // private (zero reads). A stale snapshot would let a user's
           // private-mode flip leave retrieval running (T18 requirement).
-          privateMode: () => {
-            const r = loadConfig();
-            return !r.ok || r.config.privateMode;
-          },
+          privateMode: () => readConfigLive().privateMode,
         });
         // T13: advisory tombstone cache for the recall tools (§13 row 7 —
         // TTL 5 min inside the cache; a stale/missing cache never permits a
@@ -498,12 +534,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
           projectId: scope.slice("project/".length),
           sessionId: coordinator.sessionId ?? "pending",
           ...(coordinator.branchId ? { branchId: coordinator.branchId } : {}),
-          // Live gate (same rationale as retrieval above): re-read per
-          // capture; invalid config fails closed (no new backup jobs).
-          privateMode: () => {
-            const r = loadConfig();
-            return !r.ok || r.config.privateMode;
-          },
+          // Live gate (single owner, Q07B1): re-read per capture; invalid
+          // config fails closed (no new backup jobs).
+          privateMode: () => readConfigLive().privateMode,
           exclusions: config.privacy.exclusions,
           // Q04c: sanitized backup capture/hold events.
           audit: outboxAudit,
@@ -541,12 +574,10 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
         try {
           const mcpAuth: AuthRef = config.mcp.auth;
           const mcpUrl = config.mcp.url;
-          // Live gates: re-read config per cycle/call; an INVALID config
-          // fails closed to private (zero reads, zero writes).
-          const liveGate = () => {
-            const r = loadConfig();
-            return !r.ok || r.config.privateMode;
-          };
+          // Live gates via the single config owner (Q07B1): re-read config
+          // per cycle/call; an INVALID config fails closed to private (zero
+          // reads, zero writes).
+          const liveGate = () => readConfigLive().privateMode;
           const repoGate = {
             get isPrivate() {
               return liveGate();

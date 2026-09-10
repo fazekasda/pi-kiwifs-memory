@@ -60,6 +60,15 @@ export interface OutboxJob {
   readonly idempotencyKey: string;
   /** Already-redacted payload; screened again on enqueue (defense in depth). */
   readonly payload: unknown;
+  /**
+   * Q07C: enqueue-time delivery-target fingerprint (endpoint URL + auth-ref
+   * identity + record scope, sha-256 — see src/outbox/target.ts). Present on
+   * jobs enqueued after Q07C; LEGACY jobs without it deliver as today (the
+   * contract's additive default — no migration, no reinterpretation).
+   * A mismatch against the CURRENT session snapshot's target ⇒ HELD by the
+   * worker, never rerouted.
+   */
+  readonly target?: string;
   attempts: number;
   /** Epoch ms; the worker sends only jobs whose time has come. */
   nextAttemptAt: number;
@@ -153,11 +162,21 @@ export interface EnqueueInput {
    * effect either way. When omitted the store mints a fresh UUID.
    */
   opId?: string;
+  /** Q07C: caller override for the enqueue-time target fingerprint. */
+  target?: string;
 }
 
 export interface OutboxStoreOptions {
   limits?: OutboxLimits;
   now?: () => number;
+  /**
+   * Q07C: computes the enqueue-time delivery-target fingerprint for a job's
+   * scope. When set, every enqueued job carries `target` (unless the caller
+   * supplies one). Shipped composition passes the session SNAPSHOT's
+   * endpoint/auth-ref identity; test assemblies may omit it (those jobs are
+   * then legacy-shaped and the pin check never applies).
+   */
+  targetFor?: (scope: string) => string | undefined;
   /** Test hook: when set, persist throws this instead of writing. */
   persistFault?: Error | null;
 }
@@ -189,6 +208,8 @@ export class DurableOutbox {
   private readonly file: string;
   private readonly tmp: string;
   private readonly lockFile: string;
+  private readonly targetFor:
+    ((scope: string) => string | undefined) | undefined;
   private closed = false;
 
   private constructor(dir: string, opts: OutboxStoreOptions) {
@@ -198,6 +219,7 @@ export class DurableOutbox {
     this.lockFile = join(dir, "jobs.jsonl.lock");
     this.limits = opts.limits ?? DEFAULT_LIMITS;
     this.nowFn = opts.now ?? (() => Date.now());
+    this.targetFor = opts.targetFor;
     this.persistFault = opts.persistFault ?? null;
   }
 
@@ -373,6 +395,8 @@ export class DurableOutbox {
         "enqueue refused: idempotencyKey must be 16–64 hex chars",
       );
     }
+    // Q07C: pin the delivery target at enqueue time (session snapshot).
+    const target = input.target ?? this.targetFor?.(input.scope);
     const job: OutboxJob = {
       seq: this.nextSeq++,
       schemaVersion: OUTBOX_SCHEMA_VERSION,
@@ -381,6 +405,7 @@ export class DurableOutbox {
       opId: input.opId ?? randomUUID(),
       idempotencyKey: input.idempotencyKey,
       payload: input.payload,
+      ...(target !== undefined ? { target } : {}),
       attempts: 0,
       nextAttemptAt: this.nowFn(),
       createdAt: this.nowFn(),

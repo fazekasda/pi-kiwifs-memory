@@ -26,6 +26,58 @@ committed.
 Precedence, lowest to highest: built-in defaults, the config file, runtime
 overrides. The loader never resolves credential references to secret values.
 
+## Which settings are live and which apply at the next session
+
+Not every config field takes effect immediately. The extension reads the
+config file in two distinct ways (Q07 lifecycle contract):
+
+**Live — re-read at every gate/boundary, take effect without a restart:**
+
+- `privateMode` — every domain gate (outbox delivery, retrieval, backup,
+  board, model calls, scheduler boundaries, recall/board tools, mutating
+  commands) re-reads the config per check. An INVALID, unreadable or missing
+  config file fails CLOSED to private mode (zero network, zero reads/writes)
+  for that boundary only — there is no cached permit and no retry loop; the
+  next read re-evaluates. A private→normal resume is detected lazily on the
+  next gate read.
+- `enabled` — the command config gate refuses mutating commands immediately.
+
+**Session snapshot — frozen when the session runtime is built; mid-session
+edits are visible in `/kiwifs-status` but do NOT reconfigure the running
+runtime. They apply at the next session (session-boundary rebuild):**
+
+- `mcp.url` and `mcp.auth` (the delivery adapters hold the construction-time
+  endpoint and credential reference), `board.*`, `scopes.*`,
+  `privacy.exclusions`, `budgets.*` (including the tokenizer module),
+  `model.*`, `features.*`, and `enabled`/feature enablement for the RUNNING
+  scheduler and delivery loop.
+
+A safe session-boundary rebuild is deliberately preferred over invented live
+reconfiguration: adapters, delivery cursors, the outbox ledger and scope
+resolution are entangled with the snapshot, and hot-swapping any of them
+would be new, unapproved behavior.
+
+One documented exception: recallDeps and boardDeps re-read
+`budgets.ragDeadlineMs` and `features.board` from the live config per tool
+call (tool-adjacent, pre-existing behavior — the adapters themselves stay
+snapshot). A mid-session edit to those two fields therefore affects the next
+recall or board tool call; no other snapshot field does.
+
+**Delivery-target pin (queue safety):** every job enqueued since this
+contract records the enqueue-time delivery target — a sha-256 fingerprint of
+the endpoint URL, the credential-reference identity (never the secret value)
+and the record scope. If the config changes the endpoint, the credential
+reference or the project identity across a session rebuild, retained jobs
+are HELD visibly (pending, original opId, never delivered to the new target,
+never dropped, never quarantined) until the config matches the original
+target again. Rotating the secret VALUE behind the same reference does not
+change the fingerprint: delivery proceeds. Jobs persisted before this
+contract (without a fingerprint) deliver as before — this legacy default is
+additive and involves no migration; see
+`tasks/plans/Q07A-lifecycle-contract-draft.md` §7 for the open question of
+whether fingerprint-less pending jobs should instead surface a visible
+warning.
+
 ## Minimal opt-in config
 
 This example enables all three features (observation, backup, board) against

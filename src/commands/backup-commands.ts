@@ -12,7 +12,7 @@
  * runtime. No imports from index (index imports this module; one-way).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "../config/loader.ts";
+import { readConfigLive } from "../privacy/live-gate.ts";
 import { resolveRecordScope } from "../runtime/session.ts";
 import { openConfiguredBackend } from "../runtime/session.ts";
 import { exportBackup, ExportRefusedError } from "../backup/verify.ts";
@@ -27,13 +27,15 @@ export function registerBackupVerifyCommand(pi: ExtensionAPI): void {
       const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const sessionId = parts[0];
       const exportDir = parts[1];
-      const configResult = loadConfig();
-      if (!configResult.ok) {
+      // Q07C: single live-config owner (fail-closed classification shared
+      // with every runtime gate).
+      const view = readConfigLive();
+      if (!view.ok || !view.config) {
         if (ctx.hasUI)
           ctx.ui.notify("config: INVALID — cannot verify", "error");
         return;
       }
-      const config = configResult.config;
+      const config = view.config;
       if (!config.enabled) {
         if (ctx.hasUI)
           ctx.ui.notify("extension disabled — nothing to verify", "info");
