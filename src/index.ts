@@ -56,6 +56,8 @@ import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
 import { validateProjectId } from "./domain/paths.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
+import { AuditSink } from "./privacy/audit.ts";
+import { LiveConfigPrivateModeGate } from "./privacy/live-gate.ts";
 import {
   DEFAULT_INPUT_BUDGET_TOKENS,
   DEFAULT_OUTPUT_BUDGET_TOKENS,
@@ -371,6 +373,15 @@ interface SessionRuntime {
   retrievalHeldReason: string | undefined;
   observerError: string | undefined;
   store: DurableOutbox | undefined;
+  /** Q02a: the production outbox worker (exposed for status/tests; the tick driver is the coordinator). */
+  worker: OutboxWorker | undefined;
+  /**
+   * Q02c: the shared production live-config gate (same instance the outbox
+   * worker holds). Exposes the transition-notification subscription the
+   * command bridge pushes into after a persisted private-mode flip, and is
+   * disposed at session shutdown so subscriptions are released.
+   */
+  liveGate: LiveConfigPrivateModeGate | undefined;
   /** T13: advisory tombstone cache over the retrieval backend (may be undefined). */
   tombstoneCache: QueryMetaTombstoneCache | undefined;
   /** T13: tokenizer attach/load note (sanitized, status-only). */
@@ -414,6 +425,14 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   const scope = scopeResolution?.ok ? scopeResolution.scope : undefined;
   if (scopeResolution && !scopeResolution.ok)
     observerError = scopeResolution.reason;
+  // Q02a: production privacy dependency for the outbox worker — a fail-closed
+  // live-config gate (re-read per check, same semantics as retrieval/backup/
+  // board) and a sanitized metadata-only audit sink. NOT test-only assembly:
+  // this is the shipped construction, so private-mode flips persisted via
+  // setPrivateModeInFile hold NEW sends/retries at the next tick and resume
+  // releases preexisting pending work (never dropped, never duplicated).
+  const outboxGate = new LiveConfigPrivateModeGate();
+  const outboxAudit = new AuditSink();
   const worker = store
     ? new OutboxWorker({
         store,
@@ -426,6 +445,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             return backend;
           },
         }),
+        gate: outboxGate,
+        audit: outboxAudit,
         // Availability gaps (backend unconfigured/outage) retry without an
         // attempt cap; permanent failures (validation/conflict) quarantine
         // per the worker's own rules.
@@ -457,6 +478,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
               auth: config.model.auth,
               inputBudgetTokens: DEFAULT_INPUT_BUDGET_TOKENS,
               outputBudgetTokens: DEFAULT_OUTPUT_BUDGET_TOKENS,
+              // Q02: the shared production gate guards every model attempt
+              // (pull re-read + transition-time cancel for in-flight work).
+              gate: outboxGate,
             })
           : undefined;
       // No resolved scope → no observer at all: nothing can be extracted
@@ -470,6 +494,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             ? createModelReflector({
                 route: config.model.route,
                 auth: config.model.auth,
+                // Q02: same shared gate at the reflection model boundary.
+                gate: outboxGate,
               })
             : undefined;
           reflection = new ReflectionEngine({
@@ -528,6 +554,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
           scope,
           sessionId: "pending",
           ...(extract ? { extract } : {}),
+          // Q02: live private-mode check at every scheduler boundary
+          // (settled/idle/manual/precompact); fail-closed via the shared gate.
+          isPrivate: () => outboxGate.isPrivate,
           ...(reflection
             ? {
                 onAcceptedObservations: (info) => {
@@ -776,6 +805,8 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     retrievalHeldReason,
     observerError,
     store,
+    worker,
+    liveGate: outboxGate,
     tombstoneCache,
     tokenizerNote,
     tokenizerDegraded,
@@ -826,6 +857,14 @@ export function buildRuntimeControlSurface(deps: {
   configFile: string | undefined;
   getRetrieval: () => RetrievalCoordinator | undefined;
   getGeneration: () => number;
+  /**
+   * Q02c: called ONLY after a successful persisted private-mode flip, so the
+   * shared live gate can observe the transition immediately (push) instead
+   * of waiting for its next pull read — cancel subscribers fire at
+   * transition time, not at the next tick. The gate itself decides whether
+   * the observed state is a normal→private transition (fail-closed read).
+   */
+  notifyPrivateTransition?: (value: boolean) => void;
 }): RuntimeControlSurface {
   return {
     setPrivateMode: (value) => {
@@ -836,7 +875,9 @@ export function buildRuntimeControlSurface(deps: {
             "no config file is in effect (KIWIFS_MEMORY_CONFIG unset) — private mode cannot be persisted; set it in the config source you use",
         };
       }
-      return setPrivateModeInFile(deps.configFile, value);
+      const result = setPrivateModeInFile(deps.configFile, value);
+      if (result.ok) deps.notifyPrivateTransition?.(value);
+      return result;
     },
     cancelPendingRetrieval: () => {
       const r = deps.getRetrieval();
@@ -1138,6 +1179,7 @@ export function registerSessionHandlers(
       // visible via backup pendingStatus
     }
     runtime?.observer?.dispose();
+    runtime?.liveGate?.dispose();
     runtime?.coordinator.onShutdown();
     // T17: session teardown stops delivery and all background board work
     // (PRD T17: private mode and teardown stop delivery + background
@@ -1181,6 +1223,12 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
       getRetrieval: () => runtimeBox.getRuntime(cwd)?.retrieval,
       getGeneration: () =>
         runtimeBox.getRuntime(cwd)?.coordinator.generation ?? 0,
+      // Q02c: push the transition into the runtime's shared live gate so
+      // cancel subscribers (in-flight model/retrieval work) are notified at
+      // transition time; the gate fail-closed re-reads config itself.
+      notifyPrivateTransition: (value) => {
+        runtimeBox.getRuntime(cwd)?.liveGate?.notifyTransition();
+      },
     });
 
   pi.registerCommand("kiwifs-status", {

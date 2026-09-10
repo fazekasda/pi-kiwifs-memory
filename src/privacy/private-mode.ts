@@ -25,6 +25,24 @@ export interface PrivateModeEvent {
   heldJobs: number;
 }
 
+/**
+ * Structural private-mode seam consumed by long-lived workers (outbox).
+ *
+ * The stateful in-memory `PrivateModeGate` below satisfies this, and so does
+ * the fail-closed live-config adapter (`live-gate.ts`) that production
+ * composition (`buildSessionRuntime`) passes in: it re-reads the persisted
+ * config at every check, so a private-mode flip in the config file takes
+ * effect on the next worker tick without any in-process transition call.
+ */
+export interface PrivateModeGateAdapter {
+  readonly isPrivate: boolean;
+  holdWhilePrivate(job: PendingJobRef): { held: boolean };
+  assertNetworkAllowed(feature?: FeatureDomain | "network"): void;
+  /** Registration-only for the live adapter: see live-gate.ts. */
+  onRelease(listener: (jobs: PendingJobRef[]) => void): void;
+  heldJobs(): readonly PendingJobRef[];
+}
+
 /** Thrown when an operation is attempted while private mode is active. */
 export class PrivateModeActiveError extends Error {
   readonly feature: FeatureDomain | "network";

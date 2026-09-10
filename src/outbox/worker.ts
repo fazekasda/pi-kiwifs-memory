@@ -21,7 +21,7 @@ import { isRetryable } from "../backend/errors.ts";
 import type { AuditSink } from "../privacy/audit.ts";
 import {
   PrivateModeActiveError,
-  type PrivateModeGate,
+  type PrivateModeGateAdapter,
 } from "../privacy/private-mode.ts";
 import type { OutboxJob } from "./store.ts";
 import type { DurableOutbox } from "./store.ts";
@@ -32,7 +32,7 @@ export type JobSender = (job: OutboxJob) => Promise<void>;
 export interface OutboxWorkerOptions {
   store: DurableOutbox;
   send: JobSender;
-  gate?: PrivateModeGate;
+  gate?: PrivateModeGateAdapter;
   audit?: AuditSink;
   maxAttempts?: number;
   baseDelayMs?: number;
@@ -66,7 +66,7 @@ export function errorFingerprint(err: unknown): string {
 export class OutboxWorker {
   private readonly store: DurableOutbox;
   private readonly send: JobSender;
-  private readonly gate: PrivateModeGate | undefined;
+  private readonly gate: PrivateModeGateAdapter | undefined;
   private readonly audit: AuditSink | undefined;
   private readonly maxAttempts: number;
   private readonly baseDelayMs: number;

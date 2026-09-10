@@ -136,6 +136,13 @@ export class BoardRepository {
     since: string,
     opts: { limit?: number; signal?: AbortSignal } = {},
   ): Promise<ChangesResult> {
+    // Q02 chunk 3: the raw kiwi_changes feed was the ONE repository op that
+    // bypassed the per-operation private gate (send/list/read all assert).
+    // A transition mid-delivery-cycle could therefore keep paging the feed
+    // until the next boundary check. Failing closed here aborts the active
+    // cycle at the very next feed call (best-effort abort; the cursor stays
+    // untouched, so the segment replays on resume — no drops, no duplicates).
+    this.assertNotPrivate();
     return this.adapter.changes(since, opts);
   }
 

@@ -61,11 +61,14 @@ import { DATA_FENCE_END } from "./model.ts";
 import {
   type ModelChatRequest,
   type ModelChatResponse,
+  type ModelRequestGate,
   type ModelTransport,
+  assertGateAllows,
   openRouterModelTransport,
   reportedModelMatches,
   wireModelId,
 } from "./model.ts";
+import { PrivateModeActiveError } from "../privacy/private-mode.ts";
 import type { AuthRef } from "../config/schema.ts";
 import { resolveAuthSecret } from "./model.ts";
 import { createRedactor } from "../privacy/redaction.ts";
@@ -87,6 +90,7 @@ const RETRY_CAP_MS = 10 * 60_000;
 /** Typed reflection failure (name + reason only — never payload content). */
 export class ReflectionModelError extends Error {
   readonly reason:
+    | "private-mode"
     | "credentials"
     | "timeout"
     | "provider"
@@ -342,8 +346,11 @@ export interface ReflectionModelOptions {
   auth?: AuthRef;
   transport?: ModelTransport;
   timeoutMs?: number;
+  /** Budget defaults (same conventions as the extractor). */
   inputBudgetTokens?: number;
   outputBudgetTokens?: number;
+  /** Optional private-mode gate checked before the transport attempt. */
+  gate?: ModelRequestGate;
 }
 
 const DEFAULT_REFLECTION_TIMEOUT_MS = 45_000;
@@ -363,6 +370,13 @@ export function createModelReflector(
     options.inputBudgetTokens ?? DEFAULT_REFLECTION_INPUT_BUDGET_TOKENS;
   const outputBudget =
     options.outputBudgetTokens ?? DEFAULT_REFLECTION_OUTPUT_BUDGET_TOKENS;
+  const gate = options.gate;
+  let activeController: AbortController | undefined;
+  let cancelRequested = false;
+  gate?.onCancel(() => {
+    cancelRequested = true;
+    activeController?.abort();
+  });
   return async (input) => {
     const apiKey = options.auth ? resolveAuthSecret(options.auth) : undefined;
     if (apiKey === undefined) {
@@ -388,7 +402,14 @@ export function createModelReflector(
         "redacted observation set plus framing exceeds the input budget; not sent",
       );
     }
+    // Gate checked immediately before the transport call (no bytes sent
+    // while private).
+    assertGateAllows(gate, (reason, detail) => {
+      throw new ReflectionModelError(reason, detail);
+    });
     const controller = new AbortController();
+    activeController = controller;
+    cancelRequested = false;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
     let response: ModelChatResponse;
@@ -403,6 +424,12 @@ export function createModelReflector(
       });
     } catch (err) {
       if ((err as Error).name === "AbortError") {
+        if (cancelRequested) {
+          throw new ReflectionModelError(
+            "private-mode",
+            "reflection model call aborted on private-mode transition",
+          );
+        }
         throw new ReflectionModelError(
           "timeout",
           `reflection model call exceeded ${timeoutMs}ms`,

@@ -40,8 +40,23 @@ import {
   estimateTokens,
 } from "./scheduler.ts";
 import type { ExtractionBatch } from "./scheduler.ts";
+import { PrivateModeActiveError } from "../privacy/private-mode.ts";
+
+/**
+ * Model-request private-mode gate (Q02b). Checked at the model HTTP request
+ * boundary — immediately before EACH `transport(req)` attempt (including
+ * corrective retries), mirroring the `assertNetworkAllowed` re-check
+ * semantics elsewhere. Throwing `PrivateModeActiveError("observation")`
+ * before any bytes are sent; sent bytes cannot be recalled, so the
+ * `onCancel` hook is best-effort in-flight cancellation only.
+ */
+export interface ModelRequestGate {
+  assertModelCallAllowed(): void;
+  onCancel(listener: (reason: string) => void): void;
+}
 
 export type ExtractionModelFailureReason =
+  | "private-mode"
   | "credentials"
   | "timeout"
   | "provider"
@@ -370,6 +385,28 @@ export interface ModelExtractorOptions {
   inputBudgetTokens?: number;
   outputBudgetTokens?: number;
   now?: () => number;
+  /** Optional private-mode gate checked before every transport attempt. */
+  gate?: ModelRequestGate;
+}
+
+/**
+ * Throws a sanitized model error when the gate refuses the call.
+ * `PrivateModeActiveError` messages carry only the feature name, but we map
+ * to the model-failure fingerprint anyway for durable status surfacing.
+ */
+export function assertGateAllows(
+  gate: ModelRequestGate | undefined,
+  fail: (reason: "private-mode", detail: string) => never,
+): void {
+  if (gate === undefined) return;
+  try {
+    gate.assertModelCallAllowed();
+  } catch (err) {
+    if (err instanceof PrivateModeActiveError) {
+      fail("private-mode", "private mode active; model request refused");
+    }
+    throw err;
+  }
 }
 
 export const DEFAULT_EXTRACTION_TIMEOUT_MS = 45_000;
@@ -447,6 +484,17 @@ export function createModelExtractor(
   const inputBudget = options.inputBudgetTokens ?? DEFAULT_INPUT_BUDGET_TOKENS;
   const outputBudget =
     options.outputBudgetTokens ?? DEFAULT_OUTPUT_BUDGET_TOKENS;
+  const gate = options.gate;
+
+  // Best-effort in-flight cancellation on private transition: abort the
+  // live attempt's (timeout-armed) controller. Sent bytes cannot be
+  // recalled; this only stops further waiting/writes.
+  let activeController: AbortController | undefined;
+  let cancelRequested = false;
+  gate?.onCancel((_reason) => {
+    cancelRequested = true;
+    activeController?.abort();
+  });
 
   return async (batch: ExtractionBatch): Promise<ExtractionResult> => {
     const wire = wireModelId(options.route);
@@ -475,7 +523,13 @@ export function createModelExtractor(
       );
     }
     for (let attempt = 0; attempt <= maxValidationRetries; attempt++) {
+      // Gate re-checked immediately before EVERY attempt (initial + retry).
+      assertGateAllows(gate, (reason, detail) => {
+        throw new ExtractionModelError(reason, detail);
+      });
       const controller = new AbortController();
+      activeController = controller;
+      cancelRequested = false;
       // The extraction timeout is AUTHORITATIVE (T19 runtime fix): the timer
       // stays ref'd so the bounded abort is guaranteed to fire while the
       // hung model call is the only pending work. An unref'd timer can be
@@ -515,6 +569,12 @@ export function createModelExtractor(
           throw err;
         }
         if ((err as Error).name === "AbortError") {
+          if (cancelRequested) {
+            throw new ExtractionModelError(
+              "private-mode",
+              "model call aborted on private-mode transition",
+            );
+          }
           throw new ExtractionModelError(
             "timeout",
             `model call exceeded ${timeoutMs}ms`,

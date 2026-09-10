@@ -170,6 +170,17 @@ export interface ObserverSchedulerOptions {
   compactFlushTimeoutMs?: number;
   retryBaseMs?: number;
   retryCapMs?: number;
+  /**
+   * Q02: live private-mode read at every scheduler boundary (settled, idle,
+   * manual, precompact). Fail-closed semantics live in the injected gate
+   * (the production runtime passes its shared `LiveConfigPrivateModeGate`).
+   * While private: NEW batch creation is refused with a visible skip reason,
+   * and unprocessed entries present at a settled/idle/compact boundary are
+   * classified private-session (consumed WITHOUT extraction — private-period
+   * content is never replayed on resume). Preexisting durably pending
+   * batches are retained untouched and resume when normal mode returns.
+   */
+  isPrivate?: () => boolean;
   now?: () => number;
 }
 
@@ -201,7 +212,8 @@ export interface FlushResult {
     | "extract-failed"
     | "stale-generation"
     | "redaction-held"
-    | "accept-failed";
+    | "accept-failed"
+    | "private-mode";
   /** Entries left durably pending (visible coverage gap). */
   pendingEntries: number;
 }
@@ -281,6 +293,9 @@ export class ObserverScheduler {
   /** Per-batch retry cooldown bounds (T10): backoff between model attempts. */
   private readonly retryBaseMs: number;
   private readonly retryCapMs: number;
+  private readonly isPrivateFn: (() => boolean) | undefined;
+  /** Entries classified private-session since startup (metadata count). */
+  private privateSkipped = 0;
 
   private state: ObserverState;
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -318,7 +333,22 @@ export class ObserverScheduler {
     this.nowFn = options.now ?? (() => Date.now());
     this.retryBaseMs = options.retryBaseMs ?? 30_000;
     this.retryCapMs = options.retryCapMs ?? 10 * 60_000;
+    this.isPrivateFn = options.isPrivate;
     this.state = this.loadState();
+  }
+
+  private privateActive(): boolean {
+    return this.isPrivateFn?.() ?? false;
+  }
+
+  /**
+   * Q02: classifies unprocessed entries captured during private mode as
+   * private-session: consumed WITHOUT extraction so resume can never replay
+   * them. The dropped coverage is disclosed via pendingStatus — never silent.
+   */
+  private classifyPrivateSession(candidates: SourceEntryView[]): void {
+    this.coordinator.markConsumed(candidates.map((c) => c.id));
+    this.privateSkipped += candidates.length;
   }
 
   // ---- durable state ------------------------------------------------------
@@ -681,6 +711,13 @@ export class ObserverScheduler {
     if (this.idleTimer) return;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = undefined;
+      if (this.privateActive()) {
+        // Transition landed while idle-armed: entries accrued so far are
+        // private-period content — classify, never batch.
+        const candidates = this.selectUnprocessed();
+        if (candidates.length > 0) this.classifyPrivateSession(candidates);
+        return;
+      }
       const candidates = this.selectUnprocessed();
       if (candidates.length === 0) return;
       this.createAndRun(candidates, "idle");
@@ -716,6 +753,19 @@ export class ObserverScheduler {
    */
   onAgentSettled(): SettleSummary {
     this.clearIdleTimer();
+    // Q02: private mode refuses NEW extraction at the settled boundary and
+    // classifies unprocessed entries as private-session (never replayed on
+    // resume). Preexisting pending batches stay durably untouched.
+    if (this.privateActive()) {
+      const candidates = this.selectUnprocessed();
+      if (candidates.length > 0) this.classifyPrivateSession(candidates);
+      return {
+        scheduled: 0,
+        deferred: false,
+        retried: 0,
+        skippedReason: "private-mode",
+      };
+    }
     // Crash recovery first: due pending batches re-run under their original
     // opIds; batches inside their retry cooldown stay pending (T10).
     const now = this.nowFn();
@@ -751,6 +801,18 @@ export class ObserverScheduler {
   /** Manual extraction command (T18 wires the UI): flush now, thresholds ignored. */
   extractNow(): SettleSummary {
     this.clearIdleTimer();
+    // Q02: a manual flush is still a NEW model call — refused while private
+    // (fail closed, visible reason). Entries stay unprocessed; the next
+    // settled/compact boundary classifies private-period content, and
+    // pre-private entries remain available for extraction after resume.
+    if (this.privateActive()) {
+      return {
+        scheduled: 0,
+        deferred: false,
+        retried: 0,
+        skippedReason: "private-mode",
+      };
+    }
     const candidates = this.selectUnprocessed();
     if (candidates.length === 0 || !this.extract) {
       return {
@@ -773,6 +835,17 @@ export class ObserverScheduler {
    */
   async onBeforeCompact(signal?: AbortSignal): Promise<FlushResult> {
     const candidates = this.selectUnprocessed();
+    // Q02: no model call while private. Entries present at the compaction
+    // boundary are classified private-session (compaction may remove them —
+    // consuming here is the only way they can never be replayed later).
+    if (this.privateActive()) {
+      if (candidates.length > 0) this.classifyPrivateSession(candidates);
+      return {
+        flushed: false,
+        reason: "private-mode",
+        pendingEntries: this.countPendingBatchEntries(),
+      };
+    }
     const pendingEntries = candidates.length + this.countPendingBatchEntries();
     if (candidates.length === 0 || !this.extract) {
       return {
@@ -852,6 +925,11 @@ export class ObserverScheduler {
     if (this.outbox.capturePaused) {
       lines.push(
         "observer: outbox high-water reached — capture paused, pending work preserved (visible coverage gap)",
+      );
+    }
+    if (this.privateSkipped > 0) {
+      lines.push(
+        `observer: ${this.privateSkipped} entries captured during private mode classified private-session — never extracted (visible coverage gap)`,
       );
     }
     if (this.lastModelInfo) {
