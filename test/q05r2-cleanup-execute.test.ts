@@ -75,8 +75,12 @@ async function send(
   return { msgId: res.msgId, path: res.path };
 }
 
-/** Own + TTL-expired well beyond grace → eligible. */
+/** Own + TTL-expired well beyond grace → eligible (with an old local ack). */
 const OLD = new Date(Date.now() - GC_GRACE_MS - 40 * 24 * 60 * 60 * 1000);
+/** Ack instant far beyond the 30-day grace (§8 predicate is conjunctive). */
+const OLD_ACK = OLD.getTime();
+/** Ack lookup: every message locally acked long before the grace window. */
+const ackEverything = (): number => OLD_ACK;
 
 async function planOne(
   w: World,
@@ -86,7 +90,7 @@ async function planOne(
 > {
   const preview = await planBoardCleanup(w.repo, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     now: new Date(),
   });
   assert.ok(preview.ok, "preview must plan");
@@ -106,7 +110,7 @@ test("executor deletes an eligible confirmed candidate and removes it from the b
 
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });
@@ -159,7 +163,7 @@ test("executor mints and persists the opId BEFORE the delete side effect", async
   assert.ok(sent.ok);
   const preview = await planBoardCleanup(repo, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
   });
   assert.ok(preview.ok);
 
@@ -172,7 +176,7 @@ test("executor mints and persists the opId BEFORE the delete side effect", async
   };
   const res = await executeBoardCleanup(repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: wrapped as KiwiFSAdapter,
     ledger: spyLedger,
   });
@@ -210,7 +214,7 @@ test("executor never deletes an unpreviewed path — fabricated candidate is ref
   };
   const res = await executeBoardCleanup(w.repo, forged, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });
@@ -244,7 +248,7 @@ test("stale preview: message changed between preview and execute → visible ski
 
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });
@@ -266,7 +270,7 @@ test("stale preview: sender changed after preview → changed skip, no delete", 
 
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });
@@ -274,6 +278,105 @@ test("stale preview: sender changed after preview → changed skip, no delete", 
   assert.equal(res.deleted.length, 0);
   assert.equal(res.skipped[0]!.reason, "changed");
   assert.equal(w.state.store.has(path), true);
+});
+
+test("conservative hold: expired but never locally acked → missing-basis skip, no delete", async () => {
+  const w = makeWorld();
+  const { path } = await send(w, { created: OLD, ttlSeconds: 60 });
+  const preview = await planBoardCleanup(w.repo, {
+    ownFrom: OWN,
+    acked: () => undefined,
+    now: new Date(),
+  });
+  assert.ok(preview.ok);
+  // The expired-only record is NEVER a candidate (conjunctive §8 predicate).
+  assert.equal(preview.candidates.length, 0);
+  assert.equal(preview.skipped[0]!.reason, "missing-basis");
+
+  const res = await executeBoardCleanup(w.repo, preview, {
+    ownFrom: OWN,
+    acked: () => undefined,
+    adapter: w.adapter,
+    ledger: w.ledger,
+  });
+  assert.ok(res.ok);
+  assert.equal(res.deleted.length, 0);
+  assert.equal(w.state.store.has(path), true);
+});
+
+test("fresh content identity: preview-recorded etag that drifted → changed skip, no delete", async () => {
+  const w = makeWorld();
+  const { msgId, path } = await send(w, { created: OLD, ttlSeconds: 60 });
+  const preview = await planOne(w, path);
+  const item = preview.candidates.find((c) => c.path === path)!;
+  assert.ok(item.etag, "fake backend supplies etags on reads");
+
+  // Simulate a content change under the SAME stable id/created/from: the
+  // backend content identity (etag) moved. Same msgId, same created, same
+  // from — only the etag differs. The executor must skip, never delete.
+  w.state.etags.set(path, "etag-drifted-by-concurrent-write");
+
+  const res = await executeBoardCleanup(w.repo, preview, {
+    ownFrom: OWN,
+    acked: ackEverything,
+    adapter: w.adapter,
+    ledger: w.ledger,
+  });
+  assert.ok(res.ok);
+  assert.equal(res.deleted.length, 0);
+  assert.equal(res.skipped[0]!.reason, "changed");
+  assert.match(res.skipped[0]!.detail, /etag drift/);
+  assert.equal(w.state.store.has(path), true); // untouched
+  void msgId;
+});
+
+test("no etag at preview time (backend without content metadata) → binding stays on the exact tuple, no CAS invented", async () => {
+  const w = makeWorld();
+  const { path } = await send(w, { created: OLD, ttlSeconds: 60 });
+  const preview = await planOne(w, path);
+  // Strip the etag from the preview: simulates a backend whose reads carry
+  // no kiwi.etag. Binding must fall back to {msgId, path, created, from}.
+  const noEtag: typeof preview = {
+    ...preview,
+    candidates: preview.candidates.map((c) => ({
+      ...c,
+      etag: undefined,
+    })),
+  };
+  const res = await executeBoardCleanup(w.repo, noEtag, {
+    ownFrom: OWN,
+    acked: ackEverything,
+    adapter: w.adapter,
+    ledger: w.ledger,
+  });
+  assert.ok(res.ok);
+  assert.equal(res.deleted.length, preview.candidates.length);
+});
+
+test("executor proceeds when ONLY the recipient label changed — routing labels are not confidentiality and eligibility never reads `to`", async () => {
+  // Documented-by-test: `to` is a routing label (decisions.md #4), the
+  // ownership basis is `from`, and eligibility never reads the recipient.
+  // A `to` drift between preview and delete therefore does NOT make the
+  // message ineligible or changed — the delete proceeds, exactly bound to
+  // the unchanged {msgId, path, created} tuple.
+  const w = makeWorld();
+  const { path } = await send(w, { created: OLD, ttlSeconds: 60 });
+  const preview = await planOne(w, path);
+  const mutated = w.state.store
+    .get(path)!
+    .replace(/^to:.*$/m, "to: some-other-agent");
+  w.state.store.set(path, mutated);
+
+  const res = await executeBoardCleanup(w.repo, preview, {
+    ownFrom: OWN,
+    acked: ackEverything,
+    adapter: w.adapter,
+    ledger: w.ledger,
+  });
+  assert.ok(res.ok);
+  assert.equal(res.deleted.length, 1);
+  assert.equal(res.deleted[0]!.path, path);
+  assert.equal(w.state.store.has(path), false);
 });
 
 test("time drift: preview eligible, but at execution time still within grace → no delete", async () => {
@@ -287,7 +390,7 @@ test("time drift: preview eligible, but at execution time still within grace →
   const earlierNow = new Date(created.getTime() + 45 * 24 * 60 * 60 * 1000);
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
     now: earlierNow,
@@ -305,7 +408,7 @@ test("identity drift: executing under a different identity refuses with zero del
 
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: "agent-zzz",
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });
@@ -322,7 +425,7 @@ test("failed preview (ok:false) refuses without any delete", async () => {
     { ok: false, reason: "listing-failed", detail: "x" },
     {
       ownFrom: OWN,
-      acked: () => undefined,
+      acked: ackEverything,
       adapter: w.adapter,
       ledger: w.ledger,
     },
@@ -341,7 +444,7 @@ test("private mode before execution refuses with zero deletes", async () => {
   w.gate.enable();
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
     privateMode: w.gate,
@@ -370,7 +473,7 @@ test("private-mode TRANSITION mid-run aborts after partial deletes, reports the 
   };
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: wrappedAdapter as KiwiFSAdapter,
     ledger: w.ledger,
     privateMode: w.gate,
@@ -392,7 +495,7 @@ test("pre-aborted signal performs zero deletes and reports aborted", async () =>
   ac.abort();
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
     signal: ac.signal,
@@ -421,7 +524,7 @@ test("signal fires mid-run: remaining candidates are not examined", async () => 
   };
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: wrappedAdapter as KiwiFSAdapter,
     ledger: w.ledger,
     signal: ac.signal,
@@ -447,7 +550,7 @@ test("cancelled DELETE after ledger persist discloses the opId as UNKNOWN outcom
   };
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: wrappedAdapter as KiwiFSAdapter,
     ledger: w.ledger,
   });
@@ -473,7 +576,7 @@ test("maxDeletes bound: only N deleted, bound disclosed, extra candidate untouch
   const preview = await planOne(w, a.path);
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
     maxDeletes: 1,
@@ -503,7 +606,7 @@ test("delete fault on one candidate → visible delete-failed skip, remaining ca
   };
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: wrappedAdapter as KiwiFSAdapter,
     ledger: w.ledger,
   });
@@ -526,7 +629,7 @@ test("concurrently deleted message (recheck read → missing) → visible missin
   w.state.store.delete(path); // vanished after preview
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });
@@ -543,7 +646,7 @@ test("every execution result carries the no-CAS / no-purge disclosure", async ()
   const preview = await planOne(w, path);
   const res = await executeBoardCleanup(w.repo, preview, {
     ownFrom: OWN,
-    acked: () => undefined,
+    acked: ackEverything,
     adapter: w.adapter,
     ledger: w.ledger,
   });

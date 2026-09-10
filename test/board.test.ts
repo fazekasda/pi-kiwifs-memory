@@ -429,6 +429,7 @@ test("send/read results carry safe ids/status only — no credentials disclosed"
     "created",
     "ttlSeconds",
     "expired",
+    "etag",
     "body",
   ]);
   const all = JSON.stringify({ sent, msg });

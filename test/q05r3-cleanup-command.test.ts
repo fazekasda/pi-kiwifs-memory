@@ -24,7 +24,13 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -125,9 +131,28 @@ function stubFetch(server: ReturnType<typeof createFakeServer>): () => void {
 }
 
 /** Seeds eligible (own+expired+past grace) and ineligible board messages. */
+const ACK_MS = OLD.getTime(); // local ack far beyond the 30-day grace
+
+/** Writes THIS consumer's durable BOARD delivery state with old acks. */
+function seedDurableAcks(
+  stateDir: string,
+  consumerId: string,
+  msgIds: string[],
+): void {
+  const boardStateDir = join(stateDir, "board");
+  mkdirSync(boardStateDir, { recursive: true, mode: 0o700 });
+  const entries: Record<string, { msgId: string; ackedAt: number }> = {};
+  for (const msgId of msgIds) entries[msgId] = { msgId, ackedAt: ACK_MS };
+  writeFileSync(
+    join(boardStateDir, `delivery-${consumerId}.json`),
+    JSON.stringify({ schemaVersion: 1, consumerId, entries }, null, 2),
+  );
+}
+
 async function seed(
   server: ReturnType<typeof createFakeServer>,
   msgs: Array<{ from: string; created: Date; ttlSeconds?: number }>,
+  stateDir?: string,
 ): Promise<void> {
   const ledger = createMemoryLedger();
   const adapter = new KiwiFSAdapter({
@@ -137,6 +162,7 @@ async function seed(
     ledger,
   });
   const repo = new BoardRepository(adapter);
+  const own: string[] = [];
   for (const m of msgs) {
     const opId = mintOpId();
     ledger.record(opId);
@@ -152,8 +178,12 @@ async function seed(
       opId,
     );
     assert.ok(res.ok);
+    if (m.from === OWN) own.push(res.msgId);
   }
   // The command opens its own adapter; drop this one (no disconnect API).
+  if (stateDir !== undefined) {
+    seedDurableAcks(stateDir, "consumer-q05r3", own);
+  }
 }
 
 interface HeadlessCtx {
@@ -227,10 +257,14 @@ test("headless without --confirm is PREVIEW ONLY: token printed, zero backend wr
   const server = createFakeServer();
   const undo = stubFetch(server);
   try {
-    await seed(server, [
-      { from: OWN, created: OLD, ttlSeconds: 60 },
-      { from: "agent-b", created: OLD, ttlSeconds: 60 }, // not ours
-    ]);
+    await seed(
+      server,
+      [
+        { from: OWN, created: OLD, ttlSeconds: 60 },
+        { from: "agent-b", created: OLD, ttlSeconds: 60 }, // not ours
+      ],
+      env.stateDir,
+    );
     const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
     assert.ok(cmd);
     const { ctx, notes } = headlessCtx();
@@ -254,10 +288,14 @@ test("headless --confirm with the previewed token deletes exactly the candidates
   const server = createFakeServer();
   const undo = stubFetch(server);
   try {
-    await seed(server, [
-      { from: OWN, created: OLD, ttlSeconds: 60 },
-      { from: "agent-b", created: OLD, ttlSeconds: 60 },
-    ]);
+    await seed(
+      server,
+      [
+        { from: OWN, created: OLD, ttlSeconds: 60 },
+        { from: "agent-b", created: OLD, ttlSeconds: 60 },
+      ],
+      env.stateDir,
+    );
     const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
     assert.ok(cmd);
     const step1 = headlessCtx();
@@ -290,7 +328,11 @@ test("headless --confirm with a WRONG token refuses with zero deletes", async ()
   const server = createFakeServer();
   const undo = stubFetch(server);
   try {
-    await seed(server, [{ from: OWN, created: OLD, ttlSeconds: 60 }]);
+    await seed(
+      server,
+      [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+      env.stateDir,
+    );
     const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
     assert.ok(cmd);
     const { ctx, notes } = headlessCtx();
@@ -310,7 +352,11 @@ test("a candidate-set change between preview and confirm changes the token — o
   const server = createFakeServer();
   const undo = stubFetch(server);
   try {
-    await seed(server, [{ from: OWN, created: OLD, ttlSeconds: 60 }]);
+    await seed(
+      server,
+      [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+      env.stateDir,
+    );
     const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
     assert.ok(cmd);
     const step1 = headlessCtx();
@@ -320,7 +366,11 @@ test("a candidate-set change between preview and confirm changes the token — o
     )?.[1];
     assert.ok(token);
     // A NEW own eligible message appears after the user saw the preview.
-    await seed(server, [{ from: OWN, created: OLD, ttlSeconds: 60 }]);
+    await seed(
+      server,
+      [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+      env.stateDir,
+    );
     const { ctx, notes } = headlessCtx();
     await cmd.handler(`${OWN} --confirm ${token}`, ctx);
     assert.equal(deleteCount(server.state), 0);
@@ -338,7 +388,11 @@ test("headless --yes is REFUSED: that flag belongs to the LOCAL /kiwifs-board-gc
   const server = createFakeServer();
   const undo = stubFetch(server);
   try {
-    await seed(server, [{ from: OWN, created: OLD, ttlSeconds: 60 }]);
+    await seed(
+      server,
+      [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+      env.stateDir,
+    );
     const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
     assert.ok(cmd);
     const { ctx, notes } = headlessCtx();
@@ -364,7 +418,11 @@ test("TUI: ui.confirm binds the exact preview — accept deletes, decline does n
     assert.ok(cmd);
 
     // Decline path: nothing deleted, cancellation is explicit.
-    await seed(server, [{ from: OWN, created: OLD, ttlSeconds: 60 }]);
+    await seed(
+      server,
+      [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+      env.stateDir,
+    );
     const declined = uiCtx(false);
     await cmd.handler(`${OWN}`, declined.ctx);
     assert.equal(deleteCount(server.state), 0);
@@ -381,13 +439,145 @@ test("TUI: ui.confirm binds the exact preview — accept deletes, decline does n
     // Accept path: the exact previewed message is deleted.
     const accepted = uiCtx(true);
     await cmd.handler(`${OWN}`, accepted.ctx);
-    console.error("NOTES", JSON.stringify(accepted.notes));
     assert.equal(deleteCount(server.state), 1);
     const out = accepted.notes.map((n) => n.message).join("\n");
     assert.match(out, /deleted 1/);
     assert.match(out, /no history\/index\/backup purge/);
     assert.match(out, /no secure erasure/);
     assert.match(out, /no all-consumer-ack claim/);
+  } finally {
+    undo();
+    tearDown(env);
+  }
+});
+
+// ------------------------------------------------ headless delivery ----
+
+test("headless preview persists a DURABLE record: notify token === recorded token, exact candidate set, no body content", async () => {
+  const env = setUp();
+  const server = createFakeServer();
+  const undo = stubFetch(server);
+  try {
+    await seed(
+      server,
+      [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+      env.stateDir,
+    );
+    const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
+    assert.ok(cmd);
+    const { ctx, notes } = headlessCtx();
+    await cmd.handler(`${OWN}`, ctx);
+    const notified = notes.map((n) => n.message).join("\n");
+    const notifyToken = /confirmation token: (bc-[0-9a-f]{16})/.exec(
+      notified,
+    )?.[1];
+    assert.ok(notifyToken);
+    // ui.notify reaches stdout in print mode and rides extension_ui_request
+    // in RPC mode; in JSON output mode its delivery is NOT guaranteed — so
+    // the durable record must carry the SAME token and candidate set.
+    const recordPath = join(env.stateDir, "board-cleanup-preview.json");
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+      token: string;
+      kind: string;
+      ownFrom: string;
+      candidates: Array<{ msgId: string; path: string; created: string }>;
+    };
+    assert.equal(record.kind, "board-cleanup-preview");
+    assert.equal(record.token, notifyToken);
+    assert.equal(record.ownFrom, OWN);
+    assert.equal(record.candidates.length, 1);
+    assert.match(record.candidates[0]!.path, /^board\//);
+    assert.ok(record.candidates[0]!.msgId);
+    // Content-free record: never a message body.
+    assert.ok(!readFileSync(recordPath, "utf8").includes("body"));
+  } finally {
+    undo();
+    tearDown(env);
+  }
+});
+
+test("confirmation acts ONLY on the exact unchanged eligible candidate set persisted in the record", async () => {
+  const env = setUp();
+  const server = createFakeServer();
+  const undo = stubFetch(server);
+  try {
+    // One own eligible message + one OTHER sender's message (never ours).
+    await seed(
+      server,
+      [
+        { from: OWN, created: OLD, ttlSeconds: 60 },
+        { from: "agent-b", created: OLD, ttlSeconds: 60 },
+      ],
+      env.stateDir,
+    );
+    const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
+    assert.ok(cmd);
+    const step1 = headlessCtx();
+    await cmd.handler(`${OWN}`, step1.ctx);
+    const recordPath = join(env.stateDir, "board-cleanup-preview.json");
+    const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+      token: string;
+      candidates: Array<{ msgId: string; path: string }>;
+    };
+    assert.equal(record.candidates.length, 1); // only the OWN acked+expired one
+    await cmd.handler(`${OWN} --confirm ${record.token}`, headlessCtx().ctx);
+    // Exactly the persisted candidate set was deleted; nothing broader.
+    assert.equal(deleteCount(server.state), record.candidates.length);
+    for (const c of record.candidates) {
+      assert.equal(server.state.store.has(c.path), false);
+    }
+    // The other sender's message is untouched.
+    assert.equal(
+      [...server.state.store.values()].filter((c) =>
+        c.includes("from: agent-b"),
+      ).length,
+      1,
+    );
+  } finally {
+    undo();
+    tearDown(env);
+  }
+});
+
+test("conservative hold: no local ack evidence → NOTHING is eligible; corrupt delivery state is disclosed as unavailable", async () => {
+  const env = setUp();
+  const server = createFakeServer();
+  const undo = stubFetch(server);
+  try {
+    const cmd = loadCommandMap().commands.get("kiwifs-board-cleanup");
+    assert.ok(cmd);
+    // Own expired message, but NO delivery state file anywhere: with the
+    // conjunctive §8 predicate there is NO ack evidence, so nothing is
+    // eligible — a hold, never a delete.
+    await seed(server, [{ from: OWN, created: OLD, ttlSeconds: 60 }]);
+    const plain = headlessCtx();
+    await cmd.handler(`${OWN}`, plain.ctx);
+    assert.equal(deleteCount(server.state), 0);
+    const plainOut = plain.notes.map((n) => n.message).join("\n");
+    assert.match(plainOut, /0 candidate/);
+
+    // A CORRUPT durable delivery state file fails closed AND is disclosed.
+    const env2 = setUp();
+    try {
+      await seed(
+        server,
+        [{ from: OWN, created: OLD, ttlSeconds: 60 }],
+        env2.stateDir,
+      );
+      mkdirSync(join(env2.stateDir, "board"), { recursive: true, mode: 0o700 });
+      writeFileSync(
+        join(env2.stateDir, "board", "delivery-consumer-q05r3.json"),
+        "{not json",
+      );
+      const { ctx, notes } = headlessCtx();
+      await cmd.handler(`${OWN}`, ctx);
+      assert.equal(deleteCount(server.state), 0);
+      const out = notes.map((n) => n.message).join("\n");
+      assert.match(out, /0 candidate/);
+      assert.match(out, /delivery state unavailable.*NOTHING is eligible/s);
+    } finally {
+      tearDown(env2);
+    }
   } finally {
     undo();
     tearDown(env);

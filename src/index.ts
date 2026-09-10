@@ -66,6 +66,8 @@ import {
   cleanupPreviewToken,
   formatCleanupExecution,
   formatCleanupPreview,
+  readDurableAckState,
+  writePreviewRecord,
 } from "./commands/board-cleanup.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
@@ -2019,7 +2021,7 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
   // executeBoardCleanup (Q05R2) — this handler never deletes directly.
   pi.registerCommand("kiwifs-board-cleanup", {
     description:
-      "Preview and, after explicit confirmation, manually delete YOUR OWN expired/acked board messages on the REMOTE board (local delivery state untouched; /kiwifs-board-gc is the separate local-only prune): /kiwifs-board-cleanup <from> [--confirm bc-<token>]",
+      "Preview and, after explicit confirmation, manually delete YOUR OWN board messages that are BOTH client-TTL-expired AND locally acked on the REMOTE board (local delivery state untouched; /kiwifs-board-gc is the separate local-only prune): /kiwifs-board-cleanup <from> [--confirm bc-<token>]",
     handler: async (args, ctx) => {
       // ui.notify is part of every run mode (TUI/RPC/json/print); dialog
       // methods (confirm) are guarded by ctx.hasUI. The try/catch keeps a
@@ -2085,8 +2087,9 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
       // same rule as ManualOpLog (forget) and ProposalOpLog (lifecycle).
       // A corrupt log fails closed: no remote deletes.
       let opLog: BoardCleanupOpLog;
+      const stateDir = resolveStateDir(ctx.cwd);
       try {
-        opLog = new BoardCleanupOpLog(resolveStateDir(ctx.cwd));
+        opLog = new BoardCleanupOpLog(stateDir);
       } catch (err) {
         notify(
           `board cleanup unavailable: durable opId ledger failed to open (${errorName(err)})`,
@@ -2112,13 +2115,21 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
         return;
       }
       const repo = new BoardRepository(adapter, { privateMode: repoGate });
-      // Local ack evidence comes ONLY from THIS consumer's durable delivery
-      // state. When delivery is inactive there is NO ack evidence — the
-      // lookup returns nothing (conservative: only TTL-expired basis),
-      // never inferred from anywhere else.
-      const ackStateActive = rt?.delivery !== undefined;
+      // Local ack evidence comes ONLY from THIS consumer's own durable
+      // board delivery state file — the SAME state the delivery runtime
+      // persists to and reloads — read here FRESH, read-only and
+      // fail-closed (corrupt/newer schema → NO ack evidence; with the
+      // conjunctive §8 predicate that means nothing is eligible — a
+      // conservative hold). This also makes the durable acks visible in
+      // headless runs where the delivery runtime is not active in THIS
+      // process. Acks are never inferred from anything else.
+      const durableAcks = readDurableAckState(
+        join(stateDir, "board"),
+        gate.config.board?.consumerId,
+      );
+      const ackStateActive = durableAcks !== undefined;
       const acked = (msgId: string): number | undefined =>
-        rt?.delivery?.state.getEntry(msgId)?.ackedAt;
+        durableAcks?.get(msgId);
       try {
         await adapter.connect();
         const preview = await planBoardCleanup(repo, {
@@ -2174,10 +2185,26 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
         }
         // Headless/RPC: STEP 1 (no --confirm) is preview-only, zero deletes.
         if (confirmToken === undefined) {
+          // Durable preview record: ui.notify is guaranteed in TUI and RPC
+          // modes, and reaches stdout in print mode, but its delivery in
+          // JSON output mode is not guaranteed — so the preview + token are
+          // ALSO persisted durably (0600, content-free) and the notice
+          // names the file, keeping step 2 recoverable in EVERY mode.
+          const recordPath = writePreviewRecord(
+            stateDir,
+            token,
+            preview,
+            ackStateActive,
+            new Date(),
+          );
           notify(
             `${formatCleanupPreview(preview, {
               ...(ackStateActive ? {} : { ackStateInactive: true }),
-            })}\nconfirmation token: ${token}\nthis was PREVIEW ONLY — nothing was deleted. To delete exactly this candidate set, re-run: /kiwifs-board-cleanup ${ownFrom} --confirm ${token}`,
+            })}\nconfirmation token: ${token}` +
+              (recordPath !== undefined
+                ? `\ndurable record (token recoverable from here in every output mode, incl. JSON mode): ${recordPath}`
+                : "\nNOTE: the durable preview record could not be written; the token above is only recoverable from this notice (TUI/RPC/print modes)") +
+              `\nthis was PREVIEW ONLY — nothing was deleted. To delete exactly this candidate set, re-run: /kiwifs-board-cleanup ${ownFrom} --confirm ${token}`,
             "info",
           );
           return;

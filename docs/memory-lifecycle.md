@@ -124,24 +124,38 @@ command (decisions.md #14).
 ## Manual remote board cleanup (decisions.md #14, Q05R3)
 
 `/kiwifs-board-cleanup <from> [--confirm bc-<token>]` is the ONE remote
-board delete surface, user-approved and user-triggered only. Eligibility
-(decisions.md #14): messages SENT BY the given sender identity, that are
-client-TTL-expired or locally acked by this consumer, AND past the 30-day
-grace. Ownership is never guessed — the sender id is a required explicit
+board delete surface, user-approved and user-triggered only. Eligibility is
+CONJUNCTIVE (decisions.md #14, corrected to match the approved architecture
+§8 F8 / §13 row-13 contract): messages SENT BY the given sender identity,
+that are BOTH client-TTL-expired AND locally acked by this consumer, AND
+past the 30-day grace counted from the LATER of expiry and the local ack.
+Expired-but-unacked and acked-but-unexpired records are HELD, never
+proposed. Ownership is never guessed — the sender id is a required explicit
 argument validated against the strict id grammar. TUI mode previews and
 confirms via a dialog bound to the exact preview; headless mode is a two-
-step flow (preview-only run prints a candidate-set token; `--confirm <token>`
-deletes only if the token still binds a fresh re-plan — a changed board
-refuses rather than broadening). `--yes` is deliberately refused: it is the
-`/kiwifs-board-gc` local-prune flag, and accepting it here would let an old
-habit delete remote messages. Delete opIds persist in a dedicated durable
-`board-cleanup-oplog.jsonl` before each side effect; every delete re-runs
-fresh read/ownership/TTL/ack/grace/privacy checks and visibly skips anything
-that changed. Disclosed limits: the read-delete race over MCP is unavoidable
-(no compare-and-swap, no atomicity claim); deletion is MCP-level only (no
-history/index/backup purge); no secure-erasure and no all-consumer-ack claim
-is possible; local ack state is never modified; deletion is reversible only
-to the extent the backend supports. No automatic path exists anywhere.
+step flow (preview-only run prints a candidate-set token AND persists the
+preview + token durably at `<state>/board-cleanup-preview.json`, 0600 —
+the token is recoverable from that file in EVERY output mode, including
+JSON output mode where `ui.notify` delivery is not guaranteed; the token is
+ALSO delivered via `ui.notify`, which reaches stdout in print mode and
+rides the `extension_ui_request` RPC message); `--confirm <token>` deletes
+only if the token still binds a fresh re-plan — a changed board refuses
+rather than broadening. When the backend supplies a `kiwi.etag` on reads,
+the preview records it and the fresh recheck re-verifies it (content
+identity, not a CAS; no CAS is invented when the backend supplies none).
+Local ack evidence comes ONLY from this consumer's durable board delivery
+state file, read fresh and fail-closed: a corrupt or absent delivery state
+means NO ack evidence, so nothing is eligible (conservative hold). `--yes`
+is deliberately refused: it is the `/kiwifs-board-gc` local-prune flag, and
+accepting it here would let an old habit delete remote messages. Delete
+opIds persist in a dedicated durable `board-cleanup-oplog.jsonl` before
+each side effect; every delete re-runs fresh read/ownership/content/TTL/
+ack/grace/privacy checks and visibly skips anything that changed. Disclosed
+limits: the read-delete race over MCP is unavoidable (no compare-and-swap,
+no atomicity claim); deletion is MCP-level only (no history/index/backup
+purge); no secure-erasure and no all-consumer-ack claim is possible; local
+ack state is never modified; deletion is reversible only to the extent the
+backend supports. No automatic path exists anywhere.
 
 ## Forgetting and erasure (PRD T18, B6)
 

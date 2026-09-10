@@ -80,6 +80,12 @@ export type ReadResult =
       created: string;
       ttlSeconds: undefined | number;
       expired: boolean;
+      /**
+       * Backend content identity (`kiwi.etag` from read `_meta`) when the
+       * backend supplies one — a content drift signal, NOT a CAS (never
+       * used for optimistic writes).
+       */
+      etag?: string | undefined;
       /** Opaque message body — data only, never executed or parsed. */
       body: string;
     }
@@ -437,6 +443,7 @@ export class BoardRepository {
           ? ttlSeconds
           : undefined,
       expired,
+      ...(raw.etag !== undefined ? { etag: raw.etag } : {}),
       // Opaque data. Never executed, never parsed as commands (decisions.md
       // #4): the only thing downstream code may do with `body` is show it.
       body: parsed.message.body,

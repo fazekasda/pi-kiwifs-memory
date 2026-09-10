@@ -6,9 +6,10 @@
  * Scope of THIS module (read-only by construction — there is no delete
  * call anywhere in it):
  * - Decide which board messages THIS agent may propose for manual remote
- *   cleanup, per the §8 contract: sent by THIS agent's identity (`from`),
- *   client-TTL-expired (B5) OR locally acked by this agent, and older than
- *   the [P] 30-day grace window.
+ *   cleanup, per the §8 F8 contract (CONJUNCTIVE): sent by THIS agent's
+ *   identity (`from`), client-TTL-expired (B5) AND locally acked by this
+ *   agent, and older than the [P] 30-day grace window. Expired-but-unacked
+ *   and acked-but-unexpired records are HELD, never proposed.
  * - Produce a preview of candidates with STABLE ids (the deterministic
  *   msg_id — SHA-256 of `channel/from/opId`, src/backend/ids.ts) bound to
  *   the EXACT path + created instant observed at preview time.
@@ -61,8 +62,15 @@ export interface CleanupPreviewItem {
   basis: ("ttl-expired" | "locally-acked")[];
   /** True when created + ttl has passed (B5 client-side expiry). */
   expired: boolean;
-  /** Epoch ms of the local ack, when the ack basis applies. */
+  /** Epoch ms of the local ack (eligibility requires one). */
   ackedAt: number | undefined;
+  /**
+   * Backend content identity observed at preview time (`kiwi.etag`), when
+   * the backend supplies one. When present, the executor re-verifies it on
+   * the fresh recheck read; when absent, binding falls back to the exact
+   * {msgId, path, created, from} tuple (no CAS is invented).
+   */
+  etag?: string | undefined;
 }
 
 /** A record inspected but NOT proposed, with a visible reason. */
@@ -71,7 +79,7 @@ export interface CleanupSkip {
   msgId: string | undefined;
   reason:
     | "not-owner"
-    | "not-expired-and-not-acked"
+    | "missing-basis"
     | "within-grace"
     | "id-mismatch"
     | "expired"
@@ -251,6 +259,7 @@ export async function planBoardCleanup(
         basis: eligibility.basis,
         expired: eligibility.expired,
         ackedAt,
+        ...(read.etag !== undefined ? { etag: read.etag } : {}),
       });
     } else {
       skipped.push({

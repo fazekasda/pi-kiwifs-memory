@@ -380,6 +380,51 @@ executor) and the user-approved manual-cleanup decision (#14):
   re-checks idempotently. Final-worker addition, test-pinned.
 - `test/q05r2-cleanup-execute.test.ts` — 18 synthetic tests.
 
+## 2g. Q05 closure — conjunctive eligibility, headless token durability,
+
+content-identity recheck (fixes from the Q05 closure review)
+
+No-commit discipline kept. Three verified gaps fixed, nothing else widened:
+
+1. **Eligibility narrowed to the approved §8 conjunction.** The "expired OR
+   locally-acked" OR basis in §2d/decision #14 was a transcription drift
+   from the approved §8 F8 / §13 row-13 contract (both conjunctive) — no
+   user approval of the OR basis exists on record, so per the no-widening
+   rule `evaluateCleanupCandidate` now REQUIRES BOTH client-TTL-expiry and
+   a local ack; expired-only/acked-only records are held (tests pin both
+   holds). Grace counts from the LATER of expiry and ack (unchanged
+   semantics, now only reachable with both bases). Docs amended to match.
+2. **Headless delivery/eligibility closure.** The preview + token are
+   additionally persisted durably at `<state>/board-cleanup-preview.json`
+   (0600, content-free) on every headless preview run, and the notice names
+   the file — so the two-step flow works in JSON output mode too (where
+   `ui.notify` delivery is not guaranteed; notify is verified/documented
+   for print and RPC modes). The receipt's claim that the token is
+   "inaccessible when hasUI=false" was verified FALSE for print mode and
+   is now moot for JSON mode as well. Local ack evidence is read FRESH from
+   this consumer's durable board delivery state file
+   (`<state>/board/delivery-<consumerId>.json`), read-only and fail-closed
+   (absent/corrupt → no ack evidence → nothing eligible, disclosed).
+3. **Fresh content identity where backend metadata allows.** When the
+   backend supplies `kiwi.etag` on reads, the preview records it (bound
+   into the confirmation token too) and the executor re-verifies it on the
+   fresh recheck read; a drifted etag under a stable id/created/from is a
+   visible `changed` skip. No CAS is invented when the backend supplies no
+   etag (binding stays on the exact tuple).
+
+Also test-pinned: the executor proceeds when ONLY the recipient label
+(`to`) changed — routing labels are not confidentiality (decisions.md #4),
+eligibility never reads `to`, and the residual read-delete race is already
+disclosed by NO_CAS_DISCLOSURE. Channel drift remains bound via the path
+encoded in the token.
+
+- Tests: `test/q05r1-cleanup-preview.test.ts` (11),
+  `test/q05r2-cleanup-execute.test.ts` (22),
+  `test/q05r3-cleanup-command.test.ts` (15) — incl. the durable preview
+  record (notify token === record token, exact candidate set, no body
+  content), confirmation bounded to the persisted eligible set, and the
+  conservative-hold disclosures.
+
 ## 2f. Q05RF — final worker (acceptance, traceability closure)
 
 - Fixed review findings: UNKNOWN-outcome disclosure (above), portable

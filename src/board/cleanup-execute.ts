@@ -76,7 +76,7 @@ export interface CleanupExecuteSkip {
 
 type CleanupPreviewSkipReason =
   | "not-owner"
-  | "not-expired-and-not-acked"
+  | "missing-basis"
   | "within-grace"
   | "expired"
   | "missing"
@@ -269,8 +269,25 @@ export async function executeBoardCleanup(
       });
       continue;
     }
-    // Full eligibility recheck against FRESH state: TTL/ack basis and the
-    // 30-day grace are re-evaluated NOW, not inherited from the preview.
+    // Fresh CONTENT identity, where the backend metadata allows it: when the
+    // preview observed a `kiwi.etag`, the recheck read must still carry the
+    // SAME etag (present AND equal). A changed or vanished etag means the
+    // content moved under a stable id/created/from — skip, never delete.
+    // When the backend supplied NO etag at preview time, binding stays on
+    // the exact tuple above; no CAS is invented.
+    if (item.etag !== undefined && read.etag !== item.etag) {
+      skipped.push({
+        msgId: read.msgId,
+        path: item.path,
+        reason: "changed",
+        detail:
+          "content identity changed since the confirmed preview (etag drift); re-plan required",
+      });
+      continue;
+    }
+    // Full eligibility recheck against FRESH state: the §8 conjunction
+    // (expired AND locally-acked) and the 30-day grace are re-evaluated
+    // NOW, not inherited from the preview.
     const ackedAt = opts.acked(item.msgId);
     const view: CandidateReadView = {
       msgId: read.msgId,

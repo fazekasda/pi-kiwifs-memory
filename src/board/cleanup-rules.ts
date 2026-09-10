@@ -38,26 +38,26 @@ export type CleanupEligibility =
     }
   | {
       eligible: false;
-      reason:
-        | "not-owner"
-        | "not-expired-and-not-acked"
-        | "within-grace"
-        | "malformed";
+      reason: "not-owner" | "missing-basis" | "within-grace" | "malformed";
       detail: string;
     };
 
 /**
- * Decides eligibility of ONE candidate against the §8 contract:
- * own-sender AND (client-TTL-expired OR locally-acked) AND older than the
- * 30-day grace window. Fails closed on malformed timestamps or unknown
- * schemas — an uncertain timestamp is NEVER treated as "old enough".
+ * Decides eligibility of ONE candidate against the §8 F8 / §13 row 13
+ * contract, which is CONJUNCTIVE: own-sender AND client-TTL-expired AND
+ * locally-acked AND older than the 30-day grace window. An earlier draft
+ * of decisions.md #14 transcribed the middle conjuncts as "or" — that was
+ * a transcription drift from the approved §8 text, not a broader approval;
+ * this rule REQUIRES BOTH (expired-only and acked-only records are held,
+ * never deleted). Fails closed on malformed timestamps or unknown schemas
+ * — an uncertain timestamp is NEVER treated as "old enough".
  *
  * Grace semantics (documented, test-pinned):
- * - TTL-expired basis: the message must have EXPIRED at least GRACE ago
- *   (expiry instant = created + ttl; grace counts from expiry, because the
- *   message was deliverable until then).
- * - Locally-acked basis: grace counts from the LOCAL ack instant.
- * - Both bases present: the LATER settled instant governs (conservative).
+ * - TTL basis: the message must have EXPIRED at least GRACE ago (expiry
+ *   instant = created + ttl; the message was deliverable until then).
+ * - Ack basis: grace also counts from the LOCAL ack instant.
+ * - Both settled instants present (they must both be, for eligibility):
+ *   the LATER one governs (conservative).
  * Boundary: exactly at the grace instant is NOT yet older (strict >).
  */
 export function evaluateCleanupCandidate(
@@ -94,25 +94,27 @@ export function evaluateCleanupCandidate(
   const expiryMs = ttl !== undefined ? createdMs + ttl * 1000 : undefined;
   const expired = expiryMs !== undefined && expiryMs < now.getTime();
 
-  const basis: ("ttl-expired" | "locally-acked")[] = [];
-  let settledAt: number | undefined;
-  if (expired) {
-    basis.push("ttl-expired");
-    settledAt = expiryMs;
-  }
-  if (ack.ackedAt !== undefined) {
-    basis.push("locally-acked");
-    settledAt =
-      settledAt === undefined ? ack.ackedAt : Math.max(settledAt, ack.ackedAt);
-  }
-  if (basis.length === 0) {
+  // §8 F8 conjunction: BOTH the TTL-expiry AND a local ack by THIS agent
+  // are required. A message that is expired-but-never-acked, or acked-but-
+  // not-yet-expired, is HELD (conservative; deletion is never broadened
+  // past the approved contract).
+  if (!expired || ack.ackedAt === undefined) {
     return {
       eligible: false,
-      reason: "not-expired-and-not-acked",
-      detail: "message is neither client-TTL-expired nor locally acked",
+      reason: "missing-basis",
+      detail:
+        "eligibility requires BOTH client-TTL-expiry and a local ack by this agent " +
+        (expired
+          ? "(expired, but not acked by this consumer)"
+          : "(locally acked but not yet client-TTL-expired)"),
     };
   }
-  if (settledAt === undefined || now.getTime() - settledAt <= GC_GRACE_MS) {
+  const basis: ("ttl-expired" | "locally-acked")[] = [
+    "ttl-expired",
+    "locally-acked",
+  ];
+  const settledAt = Math.max(expiryMs!, ack.ackedAt);
+  if (now.getTime() - settledAt <= GC_GRACE_MS) {
     return {
       eligible: false,
       reason: "within-grace",

@@ -51,23 +51,34 @@ explicit confirmation: a UI confirm dialog interactively, or the literal
   untouched. Requires confirmation (`--yes` headless).
 - `/kiwifs-board-cleanup <from> [--confirm bc-<token>]` — manual REMOTE
   board cleanup of YOUR OWN messages (sender `from` is required and never
-  guessed): previews messages you sent that are client-TTL-expired or
-  locally acked AND past the 30-day grace, then — only after explicit
+  guessed): previews messages you sent that are client-TTL-expired AND
+  locally acked by this consumer AND past the 30-day grace (grace counts
+  from the LATER of expiry and the local ack — expired-but-unacked and
+  acked-but-unexpired messages are HELD), then — only after explicit
   confirmation — deletes exactly those from the remote board. Distinct from
   `/kiwifs-board-gc` (which stays local-only): `--yes` is refused here so
   the local-prune flag can never trigger a remote delete. Headless is a
   two-step flow: a plain run prints a PREVIEW and a confirmation token
-  binding the exact candidate set (nothing deleted); `--confirm <token>`
-  re-plans and deletes only if the token still binds. TUI mode confirms via
-  a dialog on the exact preview. Per-delete fresh rechecks; changed or
-  now-ineligible messages are skipped visibly, never force-deleted; delete
-  opIds are durably persisted before each side effect; local ack state is
-  never modified. Disclosed limits: MCP has no compare-and-swap (an
-  unavoidable read-delete race; no atomicity claim), deletion is MCP-level
-  only (no history/index/backup purge), no secure-erasure and no
-  all-consumer-ack claim is possible, and deletion is reversible only to
-  the extent the backend supports. Refuses in private mode, with the board
-  feature disabled, on an unresolvable credential, on a bad sender id, and
+  binding the exact candidate set (nothing deleted), and ALSO persists the
+  preview + token durably at `<state>/board-cleanup-preview.json` (0600) —
+  the token is delivered via `ui.notify` (reaches stdout in print mode,
+  `extension_ui_request` in RPC mode) and is recoverable from the durable
+  file in EVERY output mode, including JSON output mode where notify
+  delivery is not guaranteed; `--confirm <token>` re-plans and deletes only
+  if the token still binds. TUI mode confirms via a dialog on the exact
+  preview. Local ack evidence comes only from this consumer's durable board
+  delivery state file (read fresh and fail-closed — no state means nothing
+  is eligible); when the backend supplies a `kiwi.etag`, the preview records
+  it and the fresh recheck re-verifies it (content identity, not a CAS).
+  Per-delete fresh rechecks; changed or now-ineligible messages are skipped
+  visibly, never force-deleted; delete opIds are durably persisted before
+  each side effect; local ack state is never modified. Disclosed limits: MCP
+  has no compare-and-swap (an unavoidable read-delete race; no atomicity
+  claim), deletion is MCP-level only (no history/index/backup purge), no
+  secure-erasure and no all-consumer-ack claim is possible, and deletion is
+  reversible only to the extent the backend supports. Refuses in private
+  mode, with the board feature disabled, on an unresolvable credential, on
+  a bad sender id, and
   on any token/candidate mismatch — always with zero deletes.
 - `/kiwifs-queue` — sanitized outbox stats and quarantined-job fingerprints
   (seq, kind, attempts, error name; never payloads).

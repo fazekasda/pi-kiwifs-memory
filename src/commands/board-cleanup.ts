@@ -32,9 +32,11 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { DELIVERY_SCHEMA_VERSION } from "../board/delivery.ts";
 import type { CleanupPreview, CleanupPreviewItem } from "../board/cleanup.ts";
 import type {
   CleanupExecution,
@@ -43,6 +45,140 @@ import type {
 import { NO_CAS_DISCLOSURE } from "../board/cleanup-execute.ts";
 
 export { NO_CAS_DISCLOSURE };
+
+/**
+ * Durable record of ONE headless preview run, written at
+ * `<state>/board-cleanup-preview.json` (0600). ui.notify delivery is
+ * guaranteed in TUI and RPC modes (extension_ui_request on stdout), but in
+ * JSON output mode its delivery is not guaranteed — so the preview and the
+ * confirmation token are ALSO persisted durably and the notice names the
+ * file, making the two-step headless flow recoverable in EVERY mode.
+ * Content-free: candidate ids/paths/created instants (+ backend etag when
+ * the backend supplies one) and counters only — never message bodies.
+ */
+export interface BoardCleanupPreviewRecord {
+  schemaVersion: number;
+  kind: "board-cleanup-preview";
+  token: string;
+  ownFrom: string;
+  plannedAt: string;
+  /** Whether local ack evidence was readable when this preview was planned. */
+  ackStateActive: boolean;
+  candidates: Array<{
+    msgId: string;
+    path: string;
+    created: string;
+    etag?: string | undefined;
+  }>;
+  skippedCount: number;
+  listingTruncated: boolean;
+  readTruncated: boolean;
+  disclosure: string;
+}
+
+/**
+ * Persists the preview record BEFORE anything can be confirmed and returns
+ * the record path (surfaced in the preview notice). Write failure is
+ * non-fatal — it returns undefined so the caller can disclose the
+ * degraded delivery; the notify path still carries the token in TUI,
+ * RPC and print modes.
+ */
+export function writePreviewRecord(
+  stateDir: string,
+  token: string,
+  preview: CleanupPreview,
+  ackStateActive: boolean,
+  plannedAt: Date,
+): string | undefined {
+  const record: BoardCleanupPreviewRecord = {
+    schemaVersion: 1,
+    kind: "board-cleanup-preview",
+    token,
+    ownFrom: preview.ownFrom,
+    plannedAt: plannedAt.toISOString(),
+    ackStateActive,
+    candidates: preview.candidates.map((c) => ({
+      msgId: c.msgId,
+      path: c.path,
+      created: c.created,
+      ...(c.etag !== undefined ? { etag: c.etag } : {}),
+    })),
+    skippedCount: preview.skipped.length,
+    listingTruncated: preview.listingTruncated,
+    readTruncated: preview.readTruncated,
+    disclosure: NO_CAS_DISCLOSURE,
+  };
+  try {
+    const file = join(stateDir, "board-cleanup-preview.json");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    return file;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * READ-ONLY source of ack evidence for cleanup runs: the SAME consumer's
+ * DURABLE delivery state file
+ * (`<state>/board/delivery-<consumerId>.json`) is read directly, fresh per
+ * call. Acks are per-consumer local state; this never invents acks from
+ * anywhere else and NEVER writes or locks the file.
+ * - File absent → undefined (no delivery state yet — NO ack evidence;
+ *   conservative hold, disclosed as "delivery state unavailable").
+ * - File corrupt/newer-schema → undefined (fail closed: NO ack evidence,
+ *   so with the conjunctive §8 predicate NOTHING is eligible — a
+ *   conservative hold, never a broadened delete set).
+ */
+export function readDurableAckState(
+  boardStateDir: string,
+  consumerId: string | undefined,
+): Map<string, number> | undefined {
+  if (consumerId === undefined) return undefined;
+  const file = join(boardStateDir, `delivery-${consumerId}.json`);
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      // No durable delivery state yet: no ack evidence exists AT ALL.
+      return undefined;
+    }
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  const rec = parsed as {
+    schemaVersion?: unknown;
+    entries?: unknown;
+  } | null;
+  if (
+    typeof rec !== "object" ||
+    rec === null ||
+    typeof rec.schemaVersion !== "number" ||
+    rec.schemaVersion > DELIVERY_SCHEMA_VERSION ||
+    typeof rec.entries !== "object" ||
+    rec.entries === null
+  ) {
+    return undefined;
+  }
+  const acks = new Map<string, number>();
+  for (const [msgId, entry] of Object.entries(
+    rec.entries as Record<string, unknown>,
+  )) {
+    const ackedAt = (entry as { ackedAt?: unknown } | null)?.ackedAt;
+    if (typeof ackedAt === "number" && Number.isFinite(ackedAt)) {
+      acks.set(msgId, ackedAt);
+    }
+  }
+  return acks;
+}
 
 /**
  * Q05R3 durable opId ledger for board-cleanup deletes. The executor mints
@@ -131,17 +267,22 @@ export class BoardCleanupOpLog {
 
 /**
  * Deterministic confirmation token binding the EXACT candidate set: a
- * SHA-256 over the sorted `msgId|path|created` tuples, 16 hex chars. The
- * token changes when ANY candidate changes (id, path, or observed created
- * instant), so a headless confirmation can never silently apply to a
- * different set than the one the user saw. Content-free: no bodies, no
- * recipient labels beyond what the deterministic ids already encode.
+ * SHA-256 over the sorted `msgId|path|created[|etag]` tuples, 16 hex chars.
+ * The token changes when ANY candidate changes (id, path, observed created
+ * instant, or — when the backend supplies one — its content identity etag),
+ * so a headless confirmation can never silently apply to a different set
+ * than the one the user saw. Content-free: no bodies, no recipient labels
+ * beyond what the deterministic ids already encode.
  */
 export function cleanupPreviewToken(
   candidates: readonly CleanupPreviewItem[],
 ): string {
   const lines = candidates
-    .map((c) => `${c.msgId}|${c.path}|${c.created}`)
+    .map((c) =>
+      c.etag !== undefined
+        ? `${c.msgId}|${c.path}|${c.created}|${c.etag}`
+        : `${c.msgId}|${c.path}|${c.created}`,
+    )
     .sort();
   const h = createHash("sha256");
   for (const line of lines) h.update(`${line}\n`);
@@ -157,12 +298,8 @@ export function formatCleanupPreview(
   preview: CleanupPreview,
   notes: { ackStateInactive?: boolean } = {},
 ): string {
-  const basisTtl = preview.candidates.filter((c) =>
-    c.basis.includes("ttl-expired"),
-  ).length;
-  const basisAck = preview.candidates.filter((c) =>
-    c.basis.includes("locally-acked"),
-  ).length;
+  const basisTtl = preview.candidates.length;
+  const basisAck = preview.candidates.length;
   const channels = new Map<string, number>();
   for (const c of preview.candidates) {
     channels.set(c.channel, (channels.get(c.channel) ?? 0) + 1);
@@ -181,7 +318,9 @@ export function formatCleanupPreview(
     trunc.push("read bound hit — some listed messages were not inspected");
   const truncText = trunc.length > 0 ? `\nTRUNCATED: ${trunc.join("; ")}` : "";
   const ackNote = notes.ackStateInactive
-    ? "\nNOTE: board delivery state inactive — no local acks considered (TTL-expired basis only; conservative)"
+    ? "\nNOTE: board delivery state unavailable — no local ack evidence could be read. " +
+      "Eligibility requires BOTH client-TTL-expiry AND a local ack by this agent, so " +
+      "NOTHING is eligible now (conservative hold; re-run once board delivery state is available)"
     : "";
   return (
     `board cleanup preview for sender "${preview.ownFrom}": ` +
@@ -191,7 +330,8 @@ export function formatCleanupPreview(
     channelLine +
     truncText +
     ackNote +
-    `\nlimits: delete is bounded (max 100/run); 30-day grace after expiry/ack; ` +
+    `\nlimits: delete is bounded (max 100/run); eligibility requires client-TTL-expiry AND a local ack by this agent; ` +
+    `30-day grace after the LATER of expiry and the local ack; ` +
     `local ack entries are pruned after 14d; ineligible/changed messages are skipped, never force-deleted` +
     `\n${NO_CAS_DISCLOSURE}`
   );
