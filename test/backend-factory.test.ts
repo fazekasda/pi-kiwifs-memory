@@ -192,7 +192,7 @@ test("buildBearerAdapter sends the same bearer header shape for resolvable crede
   });
 });
 
-test("buildBearerAdapter preserves the empty-token fallback verbatim when the credential unresolves despite the caller guard", async () => {
+test("buildBearerAdapter fails closed (undefined, no request) when the credential unresolves despite the caller guard — Q06B0 regression", async () => {
   await withEnv({ [UNSET_ENV_VAR]: undefined }, async () => {
     const server = createFakeServer();
     const seen: (string | undefined)[] = [];
@@ -200,21 +200,19 @@ test("buildBearerAdapter preserves the empty-token fallback verbatim when the cr
       seen.push(v);
     };
     await withGlobalFetch(server.fetch, async () => {
-      // Pre-extraction behavior: the outer hold check fired earlier, but the
-      // construction itself never threw and never substituted a default
-      // credential — the `?? ""` fallback sent an empty token. Preserved.
+      // Q06B0 regression: the pre-Q06B0 `?? ""` fallback sent
+      // `Authorization: Bearer` with an empty token (an unauthenticated
+      // request) when the caller's guard raced a credential change. The
+      // factory now fails closed: undefined, and no request is ever
+      // started without a resolved bearer token.
       const adapter = buildBearerAdapter(
         URL,
         { kind: "env", ref: UNSET_ENV_VAR },
         createMemoryLedger(),
       );
-      assert.ok(adapter);
-      await adapter.connect();
-      for (const header of seen) {
-        // The Headers API strips the trailing space, so the recorded value is
-        // "Bearer" — the wire token is empty either way, exactly as before.
-        assert.equal(header, "Bearer");
-      }
+      assert.equal(adapter, undefined);
+      assert.equal(server.state.requests.length, 0);
+      assert.equal(seen.length, 0);
     });
   });
 });
@@ -257,7 +255,8 @@ test("buildBearerAdapter threads the caller's ledger with the same fail-closed c
         { kind: "env", ref: SET_ENV_VAR },
         ledger,
       );
-      await adapter.connect();
+      assert.ok(adapter);
+      await adapter!.connect();
       const opId = mintOpId();
       await assert.rejects(
         adapter.write(path, DOC, { opId }),

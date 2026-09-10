@@ -15,8 +15,12 @@
  * - `buildBearerAdapter` is for call sites that must distinguish hold
  *   reasons for status text (retrieval, board delivery): the caller checks
  *   `resolveAuthSecret` first to produce its own visible hold reason, then
- *   constructs. The header's `?? ""` fallback is preserved verbatim so the
- *   guard contract stays identical even if a caller's check raced.
+ *   constructs. The caller's guard is advisory only — the factory itself
+ *   re-resolves and returns `undefined` (fail-closed hold) when the
+ *   credential unresolves at construction time, so no request can ever be
+ *   started with an empty bearer token (Q06B0: the previous `?? ""`
+ *   fallback could send `Authorization: Bearer` unauthenticated if the
+ *   caller's check raced an env/file credential change).
  *
  * The op-id ledger is a REQUIRED, typed parameter at this boundary — there
  * is no default ledger, because mutations must refuse to run without a
@@ -74,19 +78,23 @@ export function openBearerAdapter(
 
 /**
  * Site shape used by retrieval and board delivery, where the caller has
- * already checked the credential to produce its own hold reason. Builds the
- * adapter unconditionally; the `?? ""` fallback below is preserved verbatim
- * from the pre-extraction call sites (guard parity — do not "tighten" it
- * into a throw without changing the callers' hold semantics).
+ * already checked the credential to produce its own hold reason. The caller's
+ * guard is advisory only: the factory re-resolves and returns `undefined`
+ * (fail-closed hold) when the credential unresolves, so no request can be
+ * started with an empty bearer token (Q06B0).
  */
 export function buildBearerAdapter(
   url: string,
   auth: AuthRef,
   ledger: OpIdLedger,
-): KiwiFSAdapter {
+): KiwiFSAdapter | undefined {
+  const secret = resolveAuthSecret(auth);
+  if (secret === undefined) {
+    return undefined; // fail closed: absent/empty credential → no unauthenticated requests
+  }
   return new KiwiFSAdapter({
     url,
-    headers: { Authorization: `Bearer ${resolveAuthSecret(auth) ?? ""}` },
+    headers: { Authorization: `Bearer ${secret}` },
     ledger,
   });
 }
