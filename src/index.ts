@@ -57,7 +57,16 @@ import {
 } from "./commands/personal-note.ts";
 import { QueryMetaTombstoneCache } from "./backend/guard.ts";
 import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
-import { validateProjectId } from "./domain/paths.ts";
+import { validateId, validateProjectId } from "./domain/paths.ts";
+import { PathEscapeError } from "./domain/paths.ts";
+import { planBoardCleanup } from "./board/cleanup.ts";
+import { executeBoardCleanup } from "./board/cleanup-execute.ts";
+import {
+  BoardCleanupOpLog,
+  cleanupPreviewToken,
+  formatCleanupExecution,
+  formatCleanupPreview,
+} from "./commands/board-cleanup.ts";
 import { DurableOutbox, OutboxError } from "./outbox/store.ts";
 import { OutboxWorker } from "./outbox/worker.ts";
 import { FileAuditStore } from "./privacy/audit-store.ts";
@@ -1933,12 +1942,7 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
       }
       try {
         const job = outbox.enqueue(enqueueInput);
-        rt?.audit?.record({
-          kind: "command",
-          feature: "commands",
-          decision: "ok (personal-note; scope personal; user-confirmed)",
-          targetId: job.opId,
-        });
+        recordPersonalNoteAudit(rt?.audit, ctx.cwd, job.opId);
         if (ctx.hasUI)
           ctx.ui.notify(
             `personal note saved (scope: personal; queued for idempotent delivery${redactions})`,
@@ -1954,6 +1958,253 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
           );
       } finally {
         owned?.close();
+      }
+    },
+  });
+
+  // Q05R3 audit fallback (Q04 promised coverage): the durable
+  // open-enqueue-close fallback path runs OUTSIDE the session runtime, so
+  // rt?.audit is undefined there and the sanitized personal-note event was
+  // previously dropped. Record through the SAME durable sink path (the
+  // store degrades to a bounded in-memory buffer when another owner holds
+  // the lock; record() never throws). Metadata-only: the opId, never the
+  // statement.
+  const recordPersonalNoteAudit = (
+    rtAudit: AuditSinkLike | undefined,
+    cwd: string,
+    opId: string,
+  ): void => {
+    if (rtAudit) {
+      rtAudit.record({
+        kind: "command",
+        feature: "commands",
+        decision: "ok (personal-note; scope personal; user-confirmed)",
+        targetId: opId,
+      });
+      return;
+    }
+    let fallback: FileAuditStore | undefined;
+    try {
+      fallback = new FileAuditStore({
+        path: join(resolveStateDir(cwd), "audit.log"),
+      });
+    } catch {
+      return; // audit is best-effort; never block the durable enqueue
+    }
+    try {
+      fallback.record({
+        kind: "command",
+        feature: "commands",
+        decision: "ok (personal-note; scope personal; user-confirmed)",
+        targetId: opId,
+      });
+    } finally {
+      fallback.close();
+    }
+  };
+
+  // MANUAL REMOTE board cleanup (Q05R3; architecture.md §8 F8, §13 row 13;
+  // decisions.md #14 — user-approved): preview → explicit confirm → guarded
+  // delete of THIS sender's own TTL-expired or locally-acked messages past
+  // the 30-day grace. DISTINCT from /kiwifs-board-gc below: that command
+  // keeps its local-only prune semantics and its `--yes` flag; `--yes` here
+  // is REFUSED so an old local-prune flag can never trigger a remote
+  // delete. Headless mode is a two-step flow: a plain preview run prints a
+  // confirmation token binding the EXACT candidate set; only
+  // `--confirm <token>` with a token matching a FRESH re-plan executes
+  // (never broadens after confirmation). TUI mode previews + ui.confirm
+  // binds the exact in-memory preview. Per-delete fresh rechecks,
+  // persist-before-side-effect opIds, visible skips, bounded deletes and
+  // the no-CAS/no-purge/no-secure-erasure disclosures are enforced by
+  // executeBoardCleanup (Q05R2) — this handler never deletes directly.
+  pi.registerCommand("kiwifs-board-cleanup", {
+    description:
+      "Preview and, after explicit confirmation, manually delete YOUR OWN expired/acked board messages on the REMOTE board (local delivery state untouched; /kiwifs-board-gc is the separate local-only prune): /kiwifs-board-cleanup <from> [--confirm bc-<token>]",
+    handler: async (args, ctx) => {
+      // ui.notify is part of every run mode (TUI/RPC/json/print); dialog
+      // methods (confirm) are guarded by ctx.hasUI. The try/catch keeps a
+      // bare headless host that throws on ui access from crashing a
+      // preview/refusal.
+      const notify = (message: string, level: "info" | "error"): void => {
+        try {
+          ctx.ui.notify(message, level);
+        } catch {
+          /* headless host without a UI object — nothing to notify into */
+        }
+      };
+      const gate = configGate();
+      if (!gate.ok) {
+        notify(gate.notice, "info");
+        return;
+      }
+      if (!effectiveFeatures(gate.config).board) {
+        notify("board feature disabled (features.board)", "info");
+        return;
+      }
+      const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      // Headless `--yes` is deliberately NOT accepted: it is the local
+      // /kiwifs-board-gc flag, and accepting it here would let a stale
+      // local-prune habit delete remote board messages.
+      if (parts.includes("--yes")) {
+        notify(
+          "refused — --yes belongs to /kiwifs-board-gc (local prune only); remote cleanup requires --confirm <token> from a preview",
+          "error",
+        );
+        return;
+      }
+      let confirmToken: string | undefined;
+      const confirmIdx = parts.indexOf("--confirm");
+      if (confirmIdx >= 0) {
+        confirmToken = parts[confirmIdx + 1] ?? "";
+      }
+      const tokenArgIdx = confirmIdx >= 0 ? confirmIdx + 1 : -1;
+      const positional = parts.filter(
+        (p, i) => p !== "--confirm" && i !== tokenArgIdx,
+      );
+      const ownFrom = positional[0] ?? "";
+      if (!ownFrom) {
+        notify(
+          "usage: /kiwifs-board-cleanup <from> [--confirm bc-<token>] — <from> is YOUR board sender identity (ownership is never guessed)",
+          "info",
+        );
+        return;
+      }
+      try {
+        validateId("from", ownFrom);
+      } catch (err) {
+        notify(
+          `sender identity refused: ${(err as PathEscapeError).message}`,
+          "error",
+        );
+        return;
+      }
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      // Durable ledger for the delete opIds: the executor mints interactive
+      // opIds (NOT outbox job ids), so they persist in the dedicated durable
+      // board-cleanup op log (append + fsync, 0o600) BEFORE each delete —
+      // same rule as ManualOpLog (forget) and ProposalOpLog (lifecycle).
+      // A corrupt log fails closed: no remote deletes.
+      let opLog: BoardCleanupOpLog;
+      try {
+        opLog = new BoardCleanupOpLog(resolveStateDir(ctx.cwd));
+      } catch (err) {
+        notify(
+          `board cleanup unavailable: durable opId ledger failed to open (${errorName(err)})`,
+          "error",
+        );
+        return;
+      }
+      const ledger = opLog.ledger();
+      // Live private-mode gate re-reads config per check (same wiring as
+      // board delivery; a persisted flip takes effect without a restart).
+      const repoGate = {
+        get isPrivate() {
+          const r = loadConfig();
+          return !r.ok || r.config.privateMode;
+        },
+      };
+      const adapter = openConfiguredBackend(gate.config, ledger);
+      if (!adapter) {
+        notify(
+          "backend not configured or credential unresolved — board cleanup unavailable (retryable)",
+          "error",
+        );
+        return;
+      }
+      const repo = new BoardRepository(adapter, { privateMode: repoGate });
+      // Local ack evidence comes ONLY from THIS consumer's durable delivery
+      // state. When delivery is inactive there is NO ack evidence — the
+      // lookup returns nothing (conservative: only TTL-expired basis),
+      // never inferred from anywhere else.
+      const ackStateActive = rt?.delivery !== undefined;
+      const acked = (msgId: string): number | undefined =>
+        rt?.delivery?.state.getEntry(msgId)?.ackedAt;
+      try {
+        await adapter.connect();
+        const preview = await planBoardCleanup(repo, {
+          ownFrom,
+          acked,
+        });
+        if (!preview.ok) {
+          notify(
+            `board cleanup preview failed (${preview.reason}): ${preview.detail}`,
+            "error",
+          );
+          return;
+        }
+        const token = cleanupPreviewToken(preview.candidates);
+        const auditRecord = (deletedCount: number): void => {
+          rt?.audit?.record({
+            kind: "command",
+            feature: "commands",
+            decision: `ok (board-cleanup; ${deletedCount} deleted; user-confirmed)`,
+          });
+        };
+        if (ctx.hasUI) {
+          // TUI: itemize the candidate ids (bounded) and confirm on THIS
+          // exact preview object — the executor binds the preview in memory.
+          const items = preview.candidates
+            .slice(0, 10)
+            .map((c) => `- ${c.msgId} (${c.basis.join("+")})`)
+            .join("\n");
+          const more =
+            preview.candidates.length > 10
+              ? `\n- … and ${preview.candidates.length - 10} more`
+              : "";
+          const proceed = await ctx.ui.confirm(
+            "Remote board cleanup",
+            `${formatCleanupPreview(preview, {
+              ...(ackStateActive ? {} : { ackStateInactive: true }),
+            })}\ncandidates:\n${items || "(none)"}${more}\n\nDelete these ${preview.candidates.length} message(s) from the remote board now? This is MCP-level deletion; your LOCAL ack state is not modified and other consumers may not have acked.`,
+          );
+          if (!proceed) {
+            notify("board cleanup cancelled — nothing was deleted", "info");
+            return;
+          }
+          const result = await executeBoardCleanup(repo, preview, {
+            ownFrom,
+            acked,
+            adapter,
+            ledger,
+            privateMode: repoGate,
+          });
+          notify(formatCleanupExecution(result), result.ok ? "info" : "error");
+          auditRecord(result.ok ? result.deleted.length : 0);
+          return;
+        }
+        // Headless/RPC: STEP 1 (no --confirm) is preview-only, zero deletes.
+        if (confirmToken === undefined) {
+          notify(
+            `${formatCleanupPreview(preview, {
+              ...(ackStateActive ? {} : { ackStateInactive: true }),
+            })}\nconfirmation token: ${token}\nthis was PREVIEW ONLY — nothing was deleted. To delete exactly this candidate set, re-run: /kiwifs-board-cleanup ${ownFrom} --confirm ${token}`,
+            "info",
+          );
+          return;
+        }
+        // STEP 2: the token must bind the FRESH plan's exact candidate set.
+        // A mismatch (anything changed between preview and confirmation)
+        // refuses without ANY delete — the confirmation never broadens.
+        if (cleanupPreviewToken(preview.candidates) !== confirmToken) {
+          notify(
+            `refused — the candidate set changed since your preview (token ${confirmToken} does not bind the current plan; current token: ${token}). Re-run the preview and confirm the new token. Zero deletes were performed.`,
+            "error",
+          );
+          return;
+        }
+        const result = await executeBoardCleanup(repo, preview, {
+          ownFrom,
+          acked,
+          adapter,
+          ledger,
+          privateMode: repoGate,
+        });
+        notify(formatCleanupExecution(result), result.ok ? "info" : "error");
+        auditRecord(result.ok ? result.deleted.length : 0);
+      } catch (err) {
+        notify(`board cleanup failed: ${errorName(err)}`, "error");
+      } finally {
+        // Best-effort close; the adapter has no disconnect — drop the ref.
       }
     },
   });

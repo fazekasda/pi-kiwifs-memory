@@ -464,10 +464,14 @@ export function createManualOps(
 // ---- B6 erasure disclosure (disclosure-only, zero I/O) ---------------------
 
 /**
- * B6: the extension performs NO permanent erasure and provides NO
- * remote-delete capability. `kiwi_forget` is reversible by design (superseded
- * frontmatter; body preserved). This report discloses where record content
- * is retained so an operator can plan any true erasure procedure themselves.
+ * B6: the extension performs NO permanent erasure. `kiwi_forget` is
+ * reversible by design (superseded frontmatter; body preserved). Memory
+ * records (observations/reflections/proposals/backups) have no remote-delete
+ * path; the ONE remote-delete surface is the user-confirmed manual board
+ * cleanup command (Q05R3, decisions.md #14), which deletes only the user's
+ * own board messages at MCP level and purges nothing else. This report
+ * discloses where record content is retained so an operator can plan any
+ * true erasure procedure themselves.
  */
 export function erasureReportLines(): string[] {
   return [
@@ -476,7 +480,9 @@ export function erasureReportLines(): string[] {
     "Permanent erasure is NOT supported by this extension by design:",
     "- kiwi_forget is REVERSIBLE: it marks records superseded (memory_status:",
     "  superseded) and PRESERVES the body. /kiwifs-forget-undo restores them.",
-    "- No remote-delete capability exists anywhere in this extension.",
+    "- No remote-delete capability for MEMORY records exists (the only",
+    "  remote delete is the user-confirmed /kiwifs-board-cleanup command:",
+    "  own board messages only, MCP-level, no index/history/backup purge)",
     "",
     "Where record content is retained (for operator planning):",
     "- Backend record bodies (active AND superseded records, memory/ namespace)",

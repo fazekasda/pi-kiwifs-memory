@@ -49,6 +49,26 @@ explicit confirmation: a UI confirm dialog interactively, or the literal
 - `/kiwifs-board-gc` — prune acked/skipped entries older than 14 days from
   LOCAL delivery state. Local-only, no backend calls, undelivered entries
   untouched. Requires confirmation (`--yes` headless).
+- `/kiwifs-board-cleanup <from> [--confirm bc-<token>]` — manual REMOTE
+  board cleanup of YOUR OWN messages (sender `from` is required and never
+  guessed): previews messages you sent that are client-TTL-expired or
+  locally acked AND past the 30-day grace, then — only after explicit
+  confirmation — deletes exactly those from the remote board. Distinct from
+  `/kiwifs-board-gc` (which stays local-only): `--yes` is refused here so
+  the local-prune flag can never trigger a remote delete. Headless is a
+  two-step flow: a plain run prints a PREVIEW and a confirmation token
+  binding the exact candidate set (nothing deleted); `--confirm <token>`
+  re-plans and deletes only if the token still binds. TUI mode confirms via
+  a dialog on the exact preview. Per-delete fresh rechecks; changed or
+  now-ineligible messages are skipped visibly, never force-deleted; delete
+  opIds are durably persisted before each side effect; local ack state is
+  never modified. Disclosed limits: MCP has no compare-and-swap (an
+  unavoidable read-delete race; no atomicity claim), deletion is MCP-level
+  only (no history/index/backup purge), no secure-erasure and no
+  all-consumer-ack claim is possible, and deletion is reversible only to
+  the extent the backend supports. Refuses in private mode, with the board
+  feature disabled, on an unresolvable credential, on a bad sender id, and
+  on any token/candidate mismatch — always with zero deletes.
 - `/kiwifs-queue` — sanitized outbox stats and quarantined-job fingerprints
   (seq, kind, attempts, error name; never payloads).
 - `/kiwifs-erasure-report` — disclosure of where record content is
@@ -120,10 +140,13 @@ verification and has not been approved or built.
   visible pause at 500 unread by default (nothing dropped).
 - Exactly-once delivery is per consumer state file; the outbox itself is
   outbound-only and never discovers inbound messages.
-- There is no automatic remote deletion of board messages (B5: the backend
+- There is no AUTOMATIC remote deletion of board messages (B5: the backend
   has no TTL primitive). `/kiwifs-board-gc` prunes only LOCAL acked/skipped
-  state older than 14 days and requires confirmation. If you want
-  server-side expiry, that is an operator decision outside this extension.
+  state older than 14 days and requires confirmation. MANUAL remote
+  deletion of your own board messages exists ONLY via the explicit,
+  user-confirmed `/kiwifs-board-cleanup` command above — never automatic,
+  never scheduled, and bounded per run. If you want server-side expiry,
+  that is an operator decision outside this extension.
 - Board send is subject to private mode and the same fail-closed path
   rules as every other write.
 
@@ -133,11 +156,15 @@ verification and has not been approved or built.
   superseded and preserves the body; `/kiwifs-forget-undo` restores it.
   Read-back guards keep forgotten records out of retrieval even if the
   search index still surfaces them.
-- There is NO permanent erasure and NO remote-delete capability in this
-  extension. `/kiwifs-erasure-report` lists where content is retained:
-  backend record bodies (active and superseded), transcript backups,
-  proposal records, the backend's vector/search index, git history if the
-  backend is git-backed, and local durable state.
+- There is NO permanent erasure. `/kiwifs-erasure-report` lists where
+  record content is retained: backend record bodies (active and superseded),
+  transcript backups, proposal records, the backend's vector/search index,
+  git history if the backend is git-backed, and local durable state. The
+  ONE remote-delete surface is the user-confirmed board cleanup command
+  above, which deletes only your own board messages and purges nothing
+  else (no index, history or backup cleanup) — no secure-erasure guarantee
+  is claimed (B6). Forgetting does not remove content from git history,
+  indexes or remote backups.
 - A true purge is an OPERATOR procedure directly against backend storage,
   with verification against every copy listed above. No secure-erasure
   guarantee is claimed (B6). Forgetting does not remove content from git

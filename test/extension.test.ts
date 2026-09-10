@@ -40,6 +40,7 @@ function loadCommand(): { status: Command; verify: Command } {
   assert.deepEqual(
     [
       "kiwifs-backup-verify",
+      "kiwifs-board-cleanup",
       "kiwifs-board-gc",
       "kiwifs-erasure-report",
       "kiwifs-extract-now",

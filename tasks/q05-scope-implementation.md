@@ -301,3 +301,95 @@ run in Q05 or be handed to Q10)
 - Q06 remains unchecked after Q05 regardless of S1–S5; only its dependency
   text (Q04 audit sink now exists) may be factually updated by the commit
   worker, never its status.
+
+## 2c. Q05R3 — explicit remote cleanup command implemented
+
+Same no-commit discipline. On top of Q05R1 (preview planner), Q05R2 (guarded
+executor) and the user-approved manual-cleanup decision (#14):
+
+- `src/commands/board-cleanup.ts` — pure helpers + `BoardCleanupOpLog`
+  (durable opId ledger: append + fsync + 0o600 at
+  `<state>/board-cleanup-oplog.jsonl`, corrupt-log fails closed). The delete
+  opIds are INTERACTIVE (not outbox job ids), so the outbox ledger cannot
+  hold them; the dedicated log mirrors ManualOpLog/ProposalOpLog and
+  persists BEFORE each side effect.
+- `src/index.ts` — `kiwifs-board-cleanup <from> [--confirm bc-<token>]`.
+  DISTINCT from `/kiwifs-board-gc` (local prune untouched, its `--yes` kept);
+  `--yes` here is REFUSED so an old local flag never deletes remotely.
+  Sender identity required (validateId grammar; ownership never guessed).
+  TUI: preview + ui.confirm on the exact preview object. Headless: two-step
+  — preview-only run prints a deterministic candidate-set token (SHA-256
+  over sorted `msgId|path|created`); `--confirm <token>` re-plans and
+  executes only if the token still binds (changed board → refuse, zero
+  deletes). Gates: configGate, features.board, private mode (upfront AND
+  live per-delete via executor), credential resolution, ack evidence only
+  from this consumer's durable delivery state (inactive → TTL basis only,
+  conservative). Every result carries the fixed no-CAS/no-purge/no-secure-
+  erasure/no-all-consumer-ack disclosure. Metadata-only audit events.
+- `src/commands/manual-ops.ts` — erasure-report wording corrected: memory
+  records have no remote-delete path; the only remote delete is the
+  user-confirmed board cleanup command (MCP-level, no purge claims). Docs
+  (`operations.md`, `memory-lifecycle.md`) amended to state the actual
+  capability and its limits; the previously inaccurate "no remote-delete
+  capability exists anywhere" wording is fixed.
+- Q04 follow-up (S4-adjacent, small + promised coverage): the
+  `/kiwifs-personal-note` durable open-enqueue-close fallback previously
+  DROPPED its sanitized audit event (rt?.audit undefined outside the
+  runtime). It now records through the same durable sink path (bounded
+  in-memory degradation when the lock is held; never throws).
+- `test/q05r3-cleanup-command.test.ts` — 12 synthetic tests through the
+  ACTUAL registered command (fake MCP server behind a stubbed global fetch;
+  no live service, no real model): preview-only headless run (zero writes +
+  token), exact-token confirm deleting exactly the own candidate while the
+  other consumer's message stays, wrong-token refusal, changed-set refusal,
+  `--yes` refusal, TUI accept/decline with disclosure assertions, private
+  mode (zero backend calls), grammar refusal, credential fail-closed,
+  disabled extension/board gates, and `/kiwifs-board-gc` unchanged
+  (local-only, never calls the backend).
+- Gates: full suite 598/598; `npm run pack:check` + `devenv test` re-run by
+  the final worker; nothing committed.
+
+## 2d. Q05R1 — preview planner + eligibility rules (on top of §2c refs)
+
+- `src/board/cleanup-rules.ts` — pure eligibility: own-sender AND
+  (client-TTL-expired OR locally-acked) AND strict `>` 30 d grace
+  (GC_GRACE_MS per approved decision #14); fail-closed `malformed` on
+  unparseable `created`/bad `ttl`; ack and TTL grace both evaluated, later
+  settled instant governs. Recipients are routing labels, not
+  confidentiality.
+- `src/board/cleanup.ts` — bounded planner: maxCandidates=200 /
+  maxReads=500; `listingTruncated`/`readTruncated` surfaced; skip reasons
+  visible. Preview items carry channel/from/created/ack basis only — no
+  bodies, no raw paths itemized beyond what the confirm token needs.
+- `test/q05r1-cleanup-preview.test.ts` — 10 synthetic tests (grace edges,
+  ack vs TTL basis, malformed fail-closed, bounds/truncation).
+
+## 2e. Q05R2 — guarded delete executor
+
+- `src/board/cleanup-execute.ts` — per-delete fresh recheck (fresh read
+  with includeExpired, byte-exact msgId+created+from binding against the
+  preview, fresh ack, current now, path-stem integrity), persist opId
+  BEFORE adapter.del, classified skips (`changed`, `delete-failed`,
+  `missing`, `bound-exceeded`), maxDeletes default 100, AbortSignal per
+  candidate, private-mode transition → refusal with partial deletes
+  disclosed, local ack state never mutated, NO_CAS_DISCLOSURE on every
+  ok:true result.
+- Cancellation AFTER ledger persist (CancelledError from adapter.del) is
+  disclosed as UNKNOWN outcome: the opId appears in
+  `unknownDeleteOpIds` (opIds only, never paths/bodies); re-plan replay
+  re-checks idempotently. Final-worker addition, test-pinned.
+- `test/q05r2-cleanup-execute.test.ts` — 18 synthetic tests.
+
+## 2f. Q05RF — final worker (acceptance, traceability closure)
+
+- Fixed review findings: UNKNOWN-outcome disclosure (above), portable
+  fsync fd (`r+`), erasure-report typo `purge;)` → `purge)`.
+- Traceability: this file records R1/R2/RF; `tasks/evidence/q05-evidence.md`
+  aggregates personal (Q05P1/P2) and remote-cleanup (R1–R3) subtask
+  evidence; docs contradictions resolved in R3 (operations.md /
+  memory-lifecycle.md now state the actual MCP-level capability and its
+  limits; "no remote-delete capability anywhere" wording corrected).
+- Gates re-run after last edits: `npm run check` (599/599 expected),
+  `npm run pack:check`, `devenv test`; explicit stage + secret scan;
+  commit only if acceptance complete. `t19-budget-report.json` jitter
+  stays uncommitted.

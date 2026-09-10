@@ -118,7 +118,30 @@ own words, redacted before the confirmation preview and the durable enqueue;
 the record reuses the standard observation schema with `scope: personal` and
 delivers idempotently via the durable outbox (a project identity is NOT
 required). Remote board GC is out of scope of this decision: the user
-cleans the board manually for now.
+cleans the board manually for now — via the explicit `/kiwifs-board-cleanup`
+command (decisions.md #14).
+
+## Manual remote board cleanup (decisions.md #14, Q05R3)
+
+`/kiwifs-board-cleanup <from> [--confirm bc-<token>]` is the ONE remote
+board delete surface, user-approved and user-triggered only. Eligibility
+(decisions.md #14): messages SENT BY the given sender identity, that are
+client-TTL-expired or locally acked by this consumer, AND past the 30-day
+grace. Ownership is never guessed — the sender id is a required explicit
+argument validated against the strict id grammar. TUI mode previews and
+confirms via a dialog bound to the exact preview; headless mode is a two-
+step flow (preview-only run prints a candidate-set token; `--confirm <token>`
+deletes only if the token still binds a fresh re-plan — a changed board
+refuses rather than broadening). `--yes` is deliberately refused: it is the
+`/kiwifs-board-gc` local-prune flag, and accepting it here would let an old
+habit delete remote messages. Delete opIds persist in a dedicated durable
+`board-cleanup-oplog.jsonl` before each side effect; every delete re-runs
+fresh read/ownership/TTL/ack/grace/privacy checks and visibly skips anything
+that changed. Disclosed limits: the read-delete race over MCP is unavoidable
+(no compare-and-swap, no atomicity claim); deletion is MCP-level only (no
+history/index/backup purge); no secure-erasure and no all-consumer-ack claim
+is possible; local ack state is never modified; deletion is reversible only
+to the extent the backend supports. No automatic path exists anywhere.
 
 ## Forgetting and erasure (PRD T18, B6)
 
@@ -136,7 +159,9 @@ side effect.
 write → byte-identical read-back verification). A mismatch fails visibly.
 
 **Permanent erasure is not supported by this extension (B6, disclosure
-only).** No remote-delete capability exists anywhere in the codebase.
+only).** The only remote-delete surface is the user-confirmed manual board
+cleanup command above (own board messages only, MCP-level); memory records
+(observations/reflections/proposals/backups) have no remote-delete path.
 `/kiwifs-erasure-report` lists where record content is retained (backend
 record bodies incl. superseded records, transcript backups, merge-proposal
 records, the backend's vector/search index, git history if the storage is
