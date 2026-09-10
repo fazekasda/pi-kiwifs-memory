@@ -125,10 +125,10 @@ exist anywhere in this tree (verified by grep) — nothing to audit there.
 
 Private-mode (and other control) transitions must carry an explicit
 confirmation, a sanitized reason, and the exact path edited; no silent
-success. Blocked on Q01 evidence for the transition-path inventory.
+success.
 
-Status: unchecked overall. **Q03a (confirmation wiring) COMPLETE** —
-uncommitted; final commit by the designated commit worker. Read-only
+Status: **COMPLETE** (Q03a + Q03b, committed in `ea24277`).
+**Q03a (confirmation wiring)**: Read-only
 inspection confirmed `/kiwifs-forget` and `/kiwifs-board-gc` already follow
 the approved pattern, while `/kiwifs-forget-undo` and `/kiwifs-proposal
 approve|reject|undo` mutated records with no confirmation in either mode.
@@ -140,8 +140,32 @@ Regression: 3 new tests through actual `kiwifsMemory()` registration
 (registration presence, forget-undo confirm/cancel/--yes zero-write matrix,
 proposal per-action confirm matrix) — suite 504/504, `npm run check` pass,
 secret scan clean. Evidence: `tasks/evidence/q03a-confirmation-evidence.md`.
-Remaining Q03 scope (sanitized reason + exact-path disclosure on
-transitions) stays OPEN — not reduced.
+
+**Q03b (reason redaction + namespace guard) COMPLETE** — committed in
+`ea24277`. `sanitizeForgetReason()` (src/commands/manual-ops.ts) wraps the
+T06 `redactText` at the single reason entry point covering both durable
+sinks (local `manual-oplog.jsonl` and `KiwiFSAdapter.forget` →
+`kiwi_forget` `superseded_reason`, src/backend/adapter.ts); fail-closed:
+unclassifiable reason is HELD (omitted), forget still succeeds.
+Guard step 4 (src/backend/guard.ts) now uses
+`pathWithinMemoryNamespace` (src/domain/paths.ts), rejecting `..` segments
+and prefix-boundary siblings. Evidence:
+`tasks/evidence/q03b-forget-redaction-evidence.md`.
+
+**Note on "exact-path disclosure on transitions"**: an earlier draft of
+this section listed it as remaining OPEN, "blocked on Q01 evidence for the
+transition-path inventory" — that clause is a plan-generated extension,
+NOT part of the original audit's three Q03 items, and the promised Q01
+inventory never materialized (`tasks/evidence/q01-repro.md` contains no
+such inventory). It is struck here as stale: the surfaces where a path
+exists already disclose it — every record-mutating confirm dialog names the
+exact target path (registration.ts: "Mark ${path} superseded?", "Mark
+${path} active again?", proposal path in the dialog), and headless
+refusals are unconditional/observable (Q10D,
+`test/q10d-headless-refusal.test.ts`). Nothing genuine remains unimplemented
+and nothing is waived. Verified this session:
+`node --test test/t18-commands.test.ts test/q03b-forget-redaction.test.ts
+test/q10d-headless-refusal.test.ts` — 38/38 pass.
 
 ## Q04 — Bounded audit log
 

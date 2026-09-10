@@ -41,9 +41,13 @@ this host, not receipt labels.
 
 ## Explicitly NOT fixed (out of Q10D scope, tracked)
 
-- **Q03 remaining scope** — sanitized reason + exact-path disclosure text on
-  control transitions: still OPEN per the plan. Non-trivial surface; not a
-  small concrete blocker; not reduced or waived.
+- **Q03 remaining scope** — STALE entry, superseded: Q03b (reason
+  redaction + namespace guard) was completed and committed in `ea24277`
+  (`tasks/evidence/q03b-forget-redaction-evidence.md`); the "exact-path
+  disclosure on transitions" clause was a plan-generated extension not in
+  the original audit (target paths already appear in the confirm/refusal
+  text). See the Q03 section of `tasks/code-quality-plan.md`. Nothing
+  genuine remains unimplemented; nothing reduced or waived.
 - **`privacy.audit.file` config surface** — remains an explicitly documented
   UNAPPROVED proposal, unwired in code and docs.
 - Refusal UX details beyond observability (e.g., distinct exit semantics in
