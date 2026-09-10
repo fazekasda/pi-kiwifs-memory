@@ -40,6 +40,13 @@ export interface PrivateModeGateAdapter {
   assertNetworkAllowed(feature?: FeatureDomain | "network"): void;
   /** Registration-only for the live adapter: see live-gate.ts. */
   onRelease(listener: (jobs: PendingJobRef[]) => void): void;
+  /**
+   * Optional best-effort in-flight cancellation seam (Q02): fired on every
+   * observed normal→private transition. The stateful gate satisfies this
+   * structurally via the same model-request shape; senders that accept an
+   * AbortSignal are aborted mid-flight (sent bytes cannot be recalled).
+   */
+  onCancel?(listener: (reason: string) => void): void;
   heldJobs(): readonly PendingJobRef[];
 }
 

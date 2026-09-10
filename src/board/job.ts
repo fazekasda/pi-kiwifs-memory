@@ -121,12 +121,14 @@ export interface BoardDeliveryBackend {
 export async function sendBoardJob(
   job: OutboxJob,
   backend: BoardDeliveryBackend,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const payload = parseBoardPayload(job);
   const built = buildBoardJobMessage(payload, job.opId);
   try {
     await backend.writeImmutable(built.path, built.content, {
       opId: job.opId,
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     });
   } catch (err) {
     if (err instanceof ConflictError) {

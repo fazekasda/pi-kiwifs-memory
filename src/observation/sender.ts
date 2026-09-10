@@ -212,6 +212,7 @@ export async function sendObservationJob(
   job: OutboxJob,
   scope: string,
   backend: ObservationBackend,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const payload = parseObservationPayload(job);
   const { record, path } = buildObservationRecord(
@@ -221,6 +222,7 @@ export async function sendObservationJob(
   );
   await backend.writeImmutable(path, serializeStoredRecord(record), {
     opId: job.opId,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
 }
 
@@ -248,8 +250,8 @@ export interface BackendSenderDeps {
  */
 export function createObservationSender(
   deps: BackendSenderDeps,
-): (job: OutboxJob) => Promise<void> {
-  return async (job: OutboxJob) => {
+): (job: OutboxJob, signal?: AbortSignal) => Promise<void> {
+  return async (job: OutboxJob, signal?: AbortSignal) => {
     const backend = await deps.openBackend();
     if (!backend) {
       throw new SenderNotWiredError(
@@ -261,7 +263,9 @@ export function createObservationSender(
       // scope (identity fields are validated in the payload itself); they
       // dispatch BEFORE the scope hold so an unresolved project identity
       // never blocks board delivery.
-      await sendBoardJob(job, backend);
+      await sendBoardJob(job, backend, {
+        ...(signal !== undefined ? { signal } : {}),
+      });
       return;
     }
     const scope = deps.scope;
@@ -271,11 +275,15 @@ export function createObservationSender(
       );
     }
     if (job.kind === "reflection") {
-      await sendReflectionJob(job, scope, backend);
+      await sendReflectionJob(job, scope, backend, {
+        ...(signal !== undefined ? { signal } : {}),
+      });
       return;
     }
     if (job.kind === "proposal") {
-      await sendProposalJob(job, scope, backend);
+      await sendProposalJob(job, scope, backend, {
+        ...(signal !== undefined ? { signal } : {}),
+      });
       return;
     }
     if (job.kind === "backup-chunk") {
@@ -294,12 +302,20 @@ export function createObservationSender(
           "backend lacks manifest write support — backup delivery held",
         );
       }
-      await sendBackupJob(job, scope, scope.slice("project/".length), {
-        writeImmutable: backend.writeImmutable.bind(backend),
-        write: manifestWriter.bind(backend),
-      });
+      await sendBackupJob(
+        job,
+        scope,
+        scope.slice("project/".length),
+        {
+          writeImmutable: backend.writeImmutable.bind(backend),
+          write: manifestWriter.bind(backend),
+        },
+        { ...(signal !== undefined ? { signal } : {}) },
+      );
       return;
     }
-    await sendObservationJob(job, scope, backend);
+    await sendObservationJob(job, scope, backend, {
+      ...(signal !== undefined ? { signal } : {}),
+    });
   };
 }

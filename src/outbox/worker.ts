@@ -26,8 +26,13 @@ import {
 import type { OutboxJob } from "./store.ts";
 import type { DurableOutbox } from "./store.ts";
 
-/** Sends one job's payload to the backend. Throws on failure. */
-export type JobSender = (job: OutboxJob) => Promise<void>;
+/**
+ * Sends one job's payload to the backend. Throws on failure.
+ * The optional signal is the worker's best-effort in-flight cancellation
+ * (private-mode transition): supporting senders propagate it to the transport
+ * so an in-flight HTTP request is aborted. Sent bytes cannot be recalled.
+ */
+export type JobSender = (job: OutboxJob, signal?: AbortSignal) => Promise<void>;
 
 export interface OutboxWorkerOptions {
   store: DurableOutbox;
@@ -98,8 +103,18 @@ export class OutboxWorker {
       this.gate.onRelease(() => {
         void this.tick();
       });
+      // Best-effort in-flight cancellation (Q02): a normal→private
+      // transition aborts the request currently being delivered. Sent bytes
+      // cannot be recalled; the aborted job is HELD (never dropped, never
+      // quarantined) and resumes after an explicit resume().
+      this.gate.onCancel?.(() => {
+        this.activeSend?.abort();
+      });
     }
   }
+
+  /** Controller for the one delivery currently in flight, if any. */
+  private activeSend: AbortController | undefined;
 
   /** Backoff = min(cap, base * 2^(attempts-1)) scaled by [1, 1+jitter]. */
   backoffMs(attempts: number): number {
@@ -146,12 +161,17 @@ export class OutboxWorker {
   }
 
   private async deliver(job: OutboxJob, summary: TickSummary): Promise<void> {
+    // Best-effort cancel seam: armed for the duration of THIS delivery so a
+    // transition-time onCancel aborts the in-flight request through the
+    // sender's signal (where the sender/transport supports it).
+    const controller = new AbortController();
+    this.activeSend = controller;
     try {
       if (this.gate) this.gate.assertNetworkAllowed("network");
       // The opId was durably persisted at enqueue; re-assert before the side
       // effect so no sender can mutate under an unpersisted identity.
       this.opIdLedger.assertPersisted(job.opId);
-      await this.send(job);
+      await this.send(job, controller.signal);
       summary.sent.push(job.opId);
       this.audit?.record({
         kind: "outbox",
@@ -169,6 +189,13 @@ export class OutboxWorker {
         summary.pendingAck.push(job.opId);
       }
     } catch (err) {
+      // Transition landed mid-send (the abort surfaced as a CancelledError
+      // or any other failure): fail CLOSED — hold, never retry/quarantine.
+      if (this.gate?.isPrivate) {
+        this.gate.holdWhilePrivate({ opId: job.opId, kind: job.kind });
+        summary.held.push(job.opId);
+        return;
+      }
       if (err instanceof PrivateModeActiveError) {
         this.gate?.holdWhilePrivate({ opId: job.opId, kind: job.kind });
         summary.held.push(job.opId);
@@ -208,6 +235,8 @@ export class OutboxWorker {
       } catch {
         // Persist fault while recording the failure — job stays pending.
       }
+    } finally {
+      if (this.activeSend === controller) this.activeSend = undefined;
     }
   }
 }

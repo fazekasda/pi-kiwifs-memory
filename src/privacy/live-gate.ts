@@ -81,7 +81,14 @@ export class LiveConfigPrivateModeGate implements PrivateModeGateAdapter {
       this.cancelListeners.length > 0
     ) {
       for (const listener of [...this.cancelListeners]) {
-        listener("private mode enabled");
+        // Best-effort: one throwing subscriber must never break the gate
+        // read that observed the transition (the read is the fail-closed
+        // path every worker relies on).
+        try {
+          listener("private mode enabled");
+        } catch {
+          // subscriber fault is contained; remaining listeners still fire
+        }
       }
     }
     return value;

@@ -777,9 +777,10 @@ export async function sendReflectionJob(
     writeImmutable(
       path: string,
       content: string,
-      opts: { opId: string },
+      opts: { opId: string; signal?: AbortSignal },
     ): Promise<unknown>;
   },
+  opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const payload = parseReflectionPayload(job);
   // Payload integrity: the queued set hash must match the records it
@@ -793,6 +794,7 @@ export async function sendReflectionJob(
   const { record, path } = buildReflectionRecord(payload, scope);
   await backend.writeImmutable(path, serializeStoredRecord(record), {
     opId: job.opId,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
 }
 
@@ -804,14 +806,16 @@ export async function sendProposalJob(
     writeImmutable(
       path: string,
       content: string,
-      opts: { opId: string },
+      opts: { opId: string; signal?: AbortSignal },
     ): Promise<unknown>;
   },
+  opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const payload = parseProposalPayload(job);
   const { record, path } = buildProposalRecord(payload, scope);
   await backend.writeImmutable(path, serializeStoredRecord(record), {
     opId: job.opId,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
 }
 

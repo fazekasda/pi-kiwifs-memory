@@ -264,6 +264,7 @@ export async function sendBackupJob(
   scope: string,
   projectId: string,
   backend: BackupBackend,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const payload = parseBackupPayload(job);
   if (payload.type === "manifest") {
@@ -272,6 +273,7 @@ export async function sendBackupJob(
       payload.manifest,
       {
         opId: job.opId,
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       },
     );
     return;
@@ -291,7 +293,10 @@ export async function sendBackupJob(
   await backend.writeImmutable(
     backupChunkPath(projectId, payload.sessionId, payload.seq),
     payload.content,
-    { opId: job.opId },
+    {
+      opId: job.opId,
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    },
   );
 }
 
