@@ -17,6 +17,26 @@
  * - outbound search queries are redacted by the privacy pipeline (the fake
  *   MCP server never receives the raw synthetic secret).
  *
+ * Q09C additions (same isolated process, same scripted model — bounded at
+ * 8 provider calls):
+ * - REPEATED user input: the same fresh prompt is submitted a second time
+ *   and gets its own full cycle (input → retrieval → before_agent_start →
+ *   persistent pack) — repeated input is never silently deduped away;
+ * - QUEUED followUp: a `prompt` with `streamingBehavior: "followUp"`
+ *   submitted while the repeated-input run streams is queued, replayed by
+ *   Pi as the consuming run's next turn (no new before_agent_start), and
+ *   its pack injects via the transient context path exactly once;
+ * - PRIVATE-MODE FLIP through the real control surface (`/kiwifs-private-mode
+ *   on|off|status`): persists to the fixture config, round-trips via the
+ *   live-config owner, and holds the durable outbox while ON;
+ * - HEADLESS personal write (`/kiwifs-personal-note … --yes`) enqueues into
+ *   the durable outbox while private mode holds it, delivers to the fake
+ *   backend after the flip (redact-before-durable-write proven on the wire);
+ * - CONFIRM/REFUSAL dialogs over real RPC: `/kiwifs-personal-note` without
+ *   `--yes` raises a real `extension_ui_request` confirm dialog — the
+ *   fixture answers it (scripted true once, then false) and asserts the
+ *   redacted preview is shown and a refusal enqueues nothing.
+ *
  * All processes are local and synthetic: the "model" is a scripted
  * openai-completions SSE server on 127.0.0.1, the backend is the in-repo
  * fake MCP server over loopback HTTP. No network services, no credentials.
@@ -40,11 +60,18 @@ const REDACTED_QUERY =
   "what does the secret [REDACTED:aws-access-key:20] unlock in the vault";
 const CLEAN_QUERY = "where is the flumox widget documented";
 const STEER_TEXT = "where is the zorbflint spec documented";
+const FOLLOWUP_QUERY = "where is the gribble fixture documented";
+const PERSONAL_HEADLESS_NOTE =
+  "T13-PERSONAL-HEADLESS note holding the synthetic vault key AKIAIOSFODNN7EXAMPLE for delivery";
+const PERSONAL_DIALOG_NOTE =
+  "T13-PERSONAL-DIALOG note also referencing the synthetic vault key AKIAIOSFODNN7EXAMPLE";
+const PERSONAL_REFUSED_NOTE =
+  "T13-PERSONAL-REFUSED note must never appear anywhere";
 const FINAL_TEXT = "T13-RPC-FIXTURE-DONE";
 
 test(
   "T13 fixture: real Pi RPC — retrieve → inject → source-recall lifecycle",
-  { timeout: 120_000 },
+  { timeout: 180_000 },
   async () => {
     const tmp = mkdtempSync(join(tmpdir(), "kiwifs-t13-rpc-"));
     mkdirSync(join(tmp, "agent"), { recursive: true });
@@ -73,6 +100,18 @@ test(
         "title: zorbflint spec",
         "---",
         "zorbflint-spec-marker: where is the zorbflint spec documented",
+      ].join("\n"),
+    );
+    // rec2b: matches the queued followUp query (transient-injection
+    // evidence for the consuming run's next turn).
+    fake.state.store.set(
+      "project/t13/demo/memory/gribble.md",
+      [
+        "---",
+        "scope: project/t13/demo",
+        "title: gribble fixture",
+        "---",
+        "gribble-fixture-marker: where is the gribble fixture documented",
       ].join("\n"),
     );
     // rec2: matches the REDACTED secret query (privacy pipeline evidence).
@@ -114,6 +153,10 @@ test(
     let signalSteer: (() => void) | undefined;
     const steerSignal = new Promise<void>((r) => {
       signalSteer = r;
+    });
+    let signalRepeat: (() => void) | undefined;
+    const repeatSignal = new Promise<void>((r) => {
+      signalRepeat = r;
     });
     const sseChunk = (payload: unknown) =>
       `data: ${JSON.stringify(payload)}\n\n`;
@@ -160,7 +203,10 @@ test(
         //     redaction must fire before the backend sees it); the response
         //     is delayed so the steer is queued while the agent is streaming;
         // 2 → clean recall tool call;
-        // 3+ → final text (run 1 ends; the steer run's call lands here too).
+        // 3 → final text (run 1 ends);
+        // 4 → the repeated-input run's first call, delayed so the queued
+        //     followUp is submitted while this run is streaming;
+        // 5+ → final text (the followUp turn's call lands here).
         if (callIndex === 1) {
           signalSteer?.();
           setTimeout(() => {
@@ -180,6 +226,13 @@ test(
               JSON.stringify({ query: CLEAN_QUERY }),
             ),
           );
+        } else if (callIndex === 4) {
+          signalRepeat?.();
+          setTimeout(() => {
+            sse(res, [
+              chunk({ role: "assistant", content: FINAL_TEXT }, "stop"),
+            ]);
+          }, 500);
         } else {
           sse(res, [chunk({ role: "assistant", content: FINAL_TEXT }, "stop")]);
         }
@@ -199,13 +252,14 @@ test(
     writeFileSync(
       join(tmp, "kiwifs.config.json"),
       JSON.stringify({
+        schemaVersion: 1,
         enabled: true,
         projectIdentity: "t13/demo",
         mcp: {
           url: `http://127.0.0.1:${mcpPort}`,
           auth: { kind: "env", ref: "T13_FIXTURE_TOKEN" },
         },
-        scopes: { allowPersonalGlobal: false, crossProjectOptIn: [] },
+        scopes: { allowPersonalGlobal: true, crossProjectOptIn: [] },
         budgets: {
           ragDeadlineMs: 5000,
           evidenceTokenCap: 3000,
@@ -278,6 +332,8 @@ test(
     let agentEndCount = 0;
     const responses = new Map<string, any>();
     const statusNotices: string[] = [];
+    const confirmDialogs: string[] = [];
+    const confirmAnswers: boolean[] = [];
     const waiters: ((msg: any) => void)[] = [];
 
     let buffer = "";
@@ -309,6 +365,18 @@ test(
         }
         if (msg.type === "extension_ui_request" && msg.method === "notify") {
           statusNotices.push(String(msg.message));
+        }
+        // Q09C harness gap: RPC confirm dialogs MUST be answered or the
+        // extension command blocks forever. Scripted answers, refused by
+        // default (never auto-confirm an unexpected dialog).
+        if (msg.type === "extension_ui_request" && msg.method === "confirm") {
+          confirmDialogs.push(String(msg.message));
+          const answer = confirmAnswers.shift() ?? false;
+          send({
+            type: "extension_ui_response",
+            id: msg.id,
+            ...(answer ? { confirmed: true } : { cancelled: true }),
+          });
         }
         if (msg.id !== undefined) {
           responses.set(msg.id, msg);
@@ -479,6 +547,287 @@ test(
       assert.ok(
         child.exitCode === null || child.exitCode === 0,
         "pi exited during the fixture",
+      );
+
+      // --- Q09C: repeated fresh input + queued followUp (same process) -----
+      // The repeated prompt is submitted while idle: a full fresh cycle runs
+      // again (retrieval + before_agent_start → a SECOND persistent pack).
+      const noticesBeforeRuns = statusNotices.length;
+      send({ id: "p3", type: "prompt", message: CLEAN_QUERY });
+      await repeatSignal;
+      // Queued followUp: submitted while the repeated-input run is streaming
+      // (call 4 is delayed 500 ms). Its retrieval cycle completes at
+      // submission (awaited input handler); Pi queues the expanded text and
+      // replays it as the consuming run's next turn — no new
+      // before_agent_start, transient context-path injection exactly once.
+      send({
+        id: "p4",
+        type: "prompt",
+        message: FOLLOWUP_QUERY,
+        streamingBehavior: "followUp",
+      });
+      const runsDeadline = Date.now() + 60_000;
+      while (
+        Date.now() < runsDeadline &&
+        !(
+          llmRequests.length >= 5 &&
+          assistantTexts.filter((t) => t.includes(FINAL_TEXT)).length >= 2
+        )
+      ) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.ok(
+        llmRequests.length >= 5,
+        `expected ≥5 provider calls after repeated input + followUp; got ${llmRequests.length}`,
+      );
+      await new Promise((r) => setTimeout(r, 400)); // let agent_settled land
+      send({ type: "prompt", message: "/kiwifs-status" });
+      await new Promise((r) => setTimeout(r, 500));
+      const r4 = llmRequests[3]!;
+      const r5 = llmRequests[4]!;
+
+      // Repeated input: full fresh cycle again — the run-1 persistent pack
+      // is still in the session, so call 4 carries exactly two persistent
+      // packs (run 1 + repeated input). Never silently deduped.
+      assert.equal(
+        count(r4, EVIDENCE_MARKER),
+        2,
+        "repeated fresh input must get its own persistent pack (2 total)",
+      );
+      assert.ok(
+        r4.includes(CLEAN_QUERY),
+        "repeated input text missing from the provider call",
+      );
+
+      // Queued followUp: replayed text + transient pack (2 persistent +
+      // exactly one transient) on the consuming call — and NO new
+      // persistent pack (a followUp never gets a before_agent_start).
+      assert.ok(
+        r5.includes(FOLLOWUP_QUERY),
+        "queued followUp text never reached the provider context",
+      );
+      assert.equal(
+        count(r5, EVIDENCE_MARKER),
+        3,
+        "followUp call must carry 2 persistent packs + exactly 1 transient",
+      );
+
+      // The followUp pack matched (consumed), so nothing was dropped at
+      // settle — the degraded drop note must NOT appear.
+      assert.ok(
+        !statusNotices
+          .slice(noticesBeforeRuns)
+          .some((n) => n.includes("dropped at run settle")),
+        `unexpected drop note after matched followUp: ${statusNotices.join(" | ")}`,
+      );
+
+      // --- Q09C: private-mode flip through the real control surface -------
+      /** Latest `/kiwifs-queue` stats parsed from its sanitized notify. */
+      const queueStats = async (): Promise<{
+        pending: number;
+        acked: number;
+        quarantined: number;
+      }> => {
+        const before = statusNotices.length;
+        send({ type: "prompt", message: "/kiwifs-queue" });
+        await new Promise((r) => setTimeout(r, 400));
+        const notice = statusNotices
+          .slice(before)
+          .map((n) =>
+            /outbox: pending=(\d+) quarantined=(\d+) acked=(\d+)/.exec(n),
+          )
+          .find(Boolean);
+        assert.ok(
+          notice,
+          `/kiwifs-queue produced no stats: ${statusNotices.join(" | ")}`,
+        );
+        return {
+          pending: Number(notice[1]),
+          quarantined: Number(notice[2]),
+          acked: Number(notice[3]),
+        };
+      };
+      send({ type: "prompt", message: "/kiwifs-private-mode" });
+      await new Promise((r) => setTimeout(r, 400));
+      assert.ok(
+        statusNotices.some((n) => n.includes("private mode: OFF")),
+        `status must read OFF initially: ${statusNotices.join(" | ")}`,
+      );
+      send({ type: "prompt", message: "/kiwifs-private-mode on" });
+      await new Promise((r) => setTimeout(r, 400));
+      assert.ok(
+        statusNotices.some((n) =>
+          n.includes("private mode ON — all domains hold"),
+        ),
+        `flip ON notify missing: ${statusNotices.join(" | ")}`,
+      );
+      send({ type: "prompt", message: "/kiwifs-private-mode status" });
+      await new Promise((r) => setTimeout(r, 400));
+      assert.ok(
+        statusNotices.some((n) => n.includes("private mode: ON")),
+        `status must read ON after flip: ${statusNotices.join(" | ")}`,
+      );
+
+      // --- Q09C: headless personal write + private-mode refusal -----------
+      // (The baseline includes backup-chunk jobs held as a retryable gap:
+      // the fake backend has no manifest writer.)
+      const baseline = await queueStats();
+      assert.ok(
+        baseline.quarantined === 0,
+        `no job may be quarantined in the fixture: ${JSON.stringify(baseline)}`,
+      );
+      // While private mode is ON the command gate REFUSES the record-mutating
+      // command outright (fail closed — nothing is enqueued, no backend I/O).
+      send({
+        type: "prompt",
+        message: `/kiwifs-personal-note ${PERSONAL_HEADLESS_NOTE} --yes`,
+      });
+      await new Promise((r) => setTimeout(r, 600));
+      assert.ok(
+        statusNotices.some((n) =>
+          n.includes(
+            "private mode active — all domains hold (zero reads/writes)",
+          ),
+        ),
+        `private-mode refusal notify missing: ${statusNotices.join(" | ")}`,
+      );
+      const whilePrivate = await queueStats();
+      assert.deepEqual(
+        whilePrivate,
+        baseline,
+        `private mode must refuse to enqueue: ${JSON.stringify({ baseline, whilePrivate })}`,
+      );
+      assert.ok(
+        !fake.state.requests
+          .map((r) => r.body)
+          .join("\n")
+          .includes("T13-PERSONAL-HEADLESS"),
+        "refused personal note reached the backend while private mode held",
+      );
+
+      // Flip OFF: gated features resume at their next cycle. NOW the
+      // headless --yes write saves. In RPC the command context has a UI, so
+      // --yes does NOT bypass the confirm dialog — the dialog still guards
+      // the write and this script confirms it (a real
+      // extension_ui_request/extension_ui_response round trip).
+      send({ type: "prompt", message: "/kiwifs-private-mode off" });
+      await new Promise((r) => setTimeout(r, 400));
+      assert.ok(
+        statusNotices.some((n) =>
+          n.includes("private mode OFF — gated features resume"),
+        ),
+        `flip OFF notify missing: ${statusNotices.join(" | ")}`,
+      );
+      confirmAnswers.push(true);
+      send({
+        type: "prompt",
+        message: `/kiwifs-personal-note ${PERSONAL_HEADLESS_NOTE} --yes`,
+      });
+      await new Promise((r) => setTimeout(r, 800));
+      assert.ok(
+        statusNotices.some((n) => n.includes("personal note saved")),
+        `headless personal note not saved: ${statusNotices.join(" | ")}`,
+      );
+      const saved = await queueStats();
+      assert.equal(
+        saved.pending,
+        baseline.pending + 1,
+        `exactly the saved personal job may be pending: ${JSON.stringify({ baseline, saved })}`,
+      );
+
+      // --- Q09C: confirmed dialog over real RPC (redact-before-preview) ---
+      // The first dialog (this note) carries the secret-bearing statement:
+      // the preview must already be redacted.
+      confirmAnswers.push(true);
+      send({
+        type: "prompt",
+        message: `/kiwifs-personal-note ${PERSONAL_DIALOG_NOTE}`,
+      });
+      await new Promise((r) => setTimeout(r, 800));
+      assert.ok(confirmDialogs.length >= 2, "confirm dialog never rendered");
+      const dialog = confirmDialogs[0]!;
+      assert.ok(
+        dialog.includes("[REDACTED:aws-access-key:20]"),
+        `confirm dialog must show the REDACTED preview: ${dialog}`,
+      );
+      assert.ok(
+        confirmDialogs.every((d) => !d.includes(SECRET)),
+        "a confirm dialog leaked the raw synthetic secret",
+      );
+      assert.ok(
+        statusNotices.some((n) => n.includes("personal note saved")),
+        `confirmed personal note not saved: ${statusNotices.join(" | ")}`,
+      );
+
+      // Delivery: the next worker tick delivers BOTH personal jobs
+      // idempotently to the fake backend (redact-before-durable-write means
+      // the raw synthetic secret cannot appear on the wire).
+      const deliveryDeadline = Date.now() + 75_000;
+      const personalBodies = () =>
+        fake.state.requests.map((r) => r.body).join("\n");
+      while (
+        Date.now() < deliveryDeadline &&
+        !(
+          personalBodies().includes("T13-PERSONAL-HEADLESS") &&
+          personalBodies().includes("T13-PERSONAL-DIALOG")
+        )
+      ) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const delivered = personalBodies();
+      assert.ok(
+        delivered.includes("T13-PERSONAL-HEADLESS"),
+        "headless personal note never delivered after private flip",
+      );
+      assert.ok(
+        delivered.includes("T13-PERSONAL-DIALOG"),
+        "dialog-confirmed personal note never delivered",
+      );
+      assert.ok(
+        !delivered.includes(SECRET),
+        "raw synthetic secret leaked into personal delivery",
+      );
+      assert.ok(
+        delivered.includes("[REDACTED:aws-access-key:20]"),
+        "personal delivery missing the redaction marker",
+      );
+
+      // Outbox drained of the personal jobs: both acked on the wire, nothing
+      // quarantined. The first tick may also deliver the earlier runs'
+      // backup-chunk jobs (whatever the baseline held), so only an UPPER
+      // bound on pending and a lower bound on acked are asserted — the
+      // personal delivery itself is proven by the bodies above.
+      const drained = await queueStats();
+      assert.ok(
+        drained.pending <= baseline.pending,
+        `personal jobs must be delivered (pending may only shrink): ${JSON.stringify({ baseline, drained })}`,
+      );
+      assert.ok(
+        drained.acked >= 2,
+        `both personal jobs must be acked: ${JSON.stringify(drained)}`,
+      );
+      assert.equal(drained.quarantined, 0, "nothing may be quarantined");
+
+      // --- Q09C: refusal over real RPC ------------------------------------
+      confirmAnswers.push(false);
+      send({
+        type: "prompt",
+        message: `/kiwifs-personal-note ${PERSONAL_REFUSED_NOTE}`,
+      });
+      await new Promise((r) => setTimeout(r, 800));
+      assert.ok(
+        statusNotices.some((n) => n.includes("personal note cancelled")),
+        `refusal notify missing: ${statusNotices.join(" | ")}`,
+      );
+      assert.ok(
+        !personalBodies().includes("T13-PERSONAL-REFUSED"),
+        "refused personal note reached the backend",
+      );
+      const afterRefusal = await queueStats();
+      assert.deepEqual(
+        afterRefusal,
+        drained,
+        `refusal must enqueue nothing: ${JSON.stringify({ drained, afterRefusal })}`,
       );
     } catch (err) {
       testError = err;

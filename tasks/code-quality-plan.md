@@ -210,7 +210,19 @@ interleavings, lock semantics); bounded race tests only. Status: unchecked.
 ## Q09 — Evidence
 
 Consolidated evidence per task: exact commands, failures, passes, budgets.
-Status: unchecked. Depends on Q01–Q08.
+Status: COMPLETE (commit 47c07a1). Q08 leftover closed: bounded outbox tick
+coalescing (worker.ts) — overlapping callers during a blocked send coalesce
+into one queued execution plus one no-lost-wakeup follow-up; every caller
+settles. Evidence: q09a-outbox-coalesce.test.ts (bounded storm,
+late-enqueue follow-up), q09b-runtime-budgets.test.ts (latency-sensitivity
+budgets over real production factories, deterministic injected delays —
+NOT deadline-only; synthetic/offline, NOT a production model evaluation),
+q09c-compat-evidence.md (exact Node 22.19.0 sha256-verified + Node 24,
+audited isolated RPC fixture, automated PTY TUI smoke). Gates recorded in
+tasks/execution-log.md (675/0 both Node versions after final edits,
+pack:check OK, devenv test EXIT=0); t19-budget-report jitter deliberately
+reverted (committed values remain the actual-run record). Depends on
+Q01–Q08 (complete).
 
 ## Q10 — Docs/review
 

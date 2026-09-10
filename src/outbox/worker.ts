@@ -149,18 +149,84 @@ export class OutboxWorker {
    * progress instead of racing it. Two concurrent ticks would both read the
    * same pending head and double-send one job while the first send is still
    * in flight (at-least-once, but a same-process duplicate delivery is never
-   * necessary). Serialized callers each get their own real summary.
+   * necessary). Overlapping callers coalesce (Q09A below): the first gets
+   * its own summary, later ones share the covering tick's summary — bounded
+   * executions, identical delivery guarantees.
    */
   private chain: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Q09A bounded coalescing. `queued` is true while a runTick is queued on
+   * the chain or executing. A `tick()` caller arriving during that window
+   * COALESCES onto it (one waiter promise) instead of queueing another full
+   * runTick — without this, a blocked send lets timer/gate/command callers
+   * grow the execution chain without bound. `wakeup` guarantees no lost
+   * wakeup: a caller that arrived after the queued tick began (its pending()
+   * snapshot may predate the caller's enqueue) schedules exactly ONE
+   * follow-up tick; coalesced callers settle with that follow-up's summary,
+   * which covers the work that arrived late. Bounded: at most one queued
+   * execution plus one follow-up per cycle, regardless of caller volume.
+   */
+  private queued = false;
+  private wakeup = false;
+  private waiters: {
+    resolve: (s: TickSummary) => void;
+    reject: (e: unknown) => void;
+  }[] = [];
+  /** Diagnostics: runTick executions started (test/status observability). */
+  get tickExecutionsStarted(): number {
+    return this.tickExecutions;
+  }
+  private tickExecutions = 0;
+
   tick(): Promise<TickSummary> {
+    if (this.queued) {
+      this.wakeup = true;
+      return new Promise<TickSummary>((resolve, reject) =>
+        this.waiters.push({ resolve, reject }),
+      );
+    }
+    this.queued = true;
+    this.tickExecutions += 1;
     const run = this.chain.then(() => this.runTick());
+    const settled = run.then(
+      (summary) => {
+        this.finishTick(summary);
+        return summary;
+      },
+      (err) => {
+        this.failTick(err);
+        throw err;
+      },
+    );
     // The chain must survive individual tick failures.
-    this.chain = run.then(
+    this.chain = settled.then(
       () => undefined,
       () => undefined,
     );
-    return run;
+    return settled;
+  }
+
+  /** Settles coalesced callers with the tick that covers their work. */
+  private finishTick(summary: TickSummary): void {
+    this.queued = false;
+    if (this.wakeup) {
+      this.wakeup = false;
+      void this.tick(); // follow-up keeps its waiters (no lost wakeup)
+      return;
+    }
+    const ws = this.waiters;
+    this.waiters = [];
+    for (const w of ws) w.resolve(summary);
+  }
+
+  /** A tick that threw (never expected) still settles its coalesced callers. */
+  private failTick(err: unknown): void {
+    this.queued = false;
+    this.wakeup = false;
+    const ws = this.waiters;
+    this.waiters = [];
+    for (const w of ws) w.reject(err);
   }
 
   /**

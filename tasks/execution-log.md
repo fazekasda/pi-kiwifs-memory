@@ -2478,3 +2478,40 @@ wiring, commands, status surfaces) stays open — not reduced, not claimed.
   pack:check OK (isolated Pi RPC load, offline disabled startup);
   devenv test EXIT=0 (55.3s). Secret scan of explicit staged list clean.
 - Unrelated t19-budget-report.json benchmark jitter left unstaged.
+
+## Q09 — validate/consolidate evidence (final worker)
+
+- Q09A fix committed here: src/outbox/worker.ts bounded tick coalescing —
+  overlapping tick() callers during a blocked send coalesce into at most one
+  queued runTick plus one no-lost-wakeup follow-up (previously unbounded
+  chain growth); every caller still settles (coalesced callers share the
+  covering tick's summary; sequential callers keep their own). Failures
+  reject coalesced waiters and the chain survives. Regression:
+  test/q09a-outbox-coalesce.test.ts (500-caller storm, late-enqueue
+  follow-up, exactly-once delivery, private-mode hold, throwing tick).
+- Q09B: test/q09b-runtime-budgets.test.ts — latency-sensitivity budgets over
+  the real production factories (KiwiFSAdapter/RetrievalCoordinator/
+  SessionCoordinator) with deterministic injected delays; NOT deadline-only.
+- Q09C: exact Node 22.19.0 (sha256-verified official tarball) + Node 24.19.0
+  suites; audited isolated RPC fixture extended (followUp replay, private-mode
+  round-trip, --yes does not bypass RPC confirm, redact-before-durable-write
+  on the wire); automated PTY TUI smoke (not human signoff).
+- Gates after final edits (this session):
+  - npm run check (Node v24.19.0): tsc clean, 675 pass / 0 fail, 0 skipped.
+  - npm run pack:check: OK (isolated Pi RPC load, offline disabled startup).
+  - devenv test: EXIT=0 (77.7 s).
+  - Exact Node 22.19.0 re-run AFTER the worker.ts final edit (no stale green):
+    tsc clean, node --test 675 pass / 0 fail (63.6 s).
+- Deliberate t19 jitter handling: full-check runs regenerate
+  tasks/evidence/t19-budget-report.json; the regenerated values (958–965 ms,
+  both Node versions) are wall-clock jitter, not Q09 evidence. Committed
+  values (959–965 ms, documented T19 actual run) kept; regeneration reverted
+  before staging. Recorded in tasks/evidence/q09c-compat-evidence.md §7.
+- Limitations (no live quality claims): all fixtures synthetic/offline — fake
+  MCP backend, scripted SSE model, synthetic tokenizer explicitly NOT
+  model-compatible, extract fixtures measure call volume only. NOTHING here
+  is a production model/quality/latency certification. TUI PTY is an
+  automated smoke. No live backend/model/private config/secrets/SSH/deploy/
+  push/publication used.
+- Secret scan of explicitly staged files (git add <list>, not -A): only
+  benign matches (env-var names, synthetic fixture constants); clean.
