@@ -20,6 +20,7 @@ Primary: observational memory. Secondary: redacted full-session backups and agen
 10. **Privacy:** redact before outbound storage/model/search calls, configurable exclusions, private mode with no feature reads/writes, sanitized activity log.
 11. **Memory lifecycle:** automatic observation writes with inspection/undo. Detect duplicates, propose merges and flag conflicts rather than silently replacing disputed source facts.
 12. **Scopes:** project and personal-global memory, cross-project opt-in. Backend authorization and client organizational scope must be documented separately.
+13. **Personal-scope writes (Q05, user-approved):** personal-global memory writes exist ONLY via an explicit user action (a user-initiated command, confirmed in the TUI or via explicit `--yes` in headless mode). Nothing writes the `personal` scope automatically; project-scoped observations, reflections and proposals are never automatically promoted to `personal`, and no capture/reflection path may call the personal write surface. Personal records reuse the existing record schema, provenance and idempotent outbox delivery (kind `observation`, scope `personal`); personal routing is invalid for project-only features (reflections, merge proposals, backups). Remote board GC is NOT part of this decision: the user handles board cleanup manually for now; any remote GC feature requires its own explicit approval and a separate later task.
 
 ## Development constraint
 

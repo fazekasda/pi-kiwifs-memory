@@ -50,7 +50,11 @@ import {
   setPrivateModeInFile,
   type RuntimeControlSurface,
 } from "./runtime/controls.ts";
-import { createRedactor } from "./privacy/redaction.ts";
+import { createRedactor, redactText } from "./privacy/redaction.ts";
+import {
+  ExplicitPersonalInputError,
+  buildExplicitPersonalEnqueue,
+} from "./commands/personal-note.ts";
 import { QueryMetaTombstoneCache } from "./backend/guard.ts";
 import { loadConfiguredTokenizer } from "./retrieval/tokenizer.ts";
 import { validateProjectId } from "./domain/paths.ts";
@@ -1778,6 +1782,179 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
           result.ok ? result.detail : `NOT restored — ${result.reason}`,
           result.ok ? "info" : "error",
         );
+    },
+  });
+
+  // Q05P2: explicit personal note — the ONLY sanctioned personal-scope
+  // write surface (docs/decisions.md #13, user-approved). A user command,
+  // never an automatic capture/reflection/backup path and never a tool the
+  // model can call: nothing promotes project content and no model call is
+  // made by saving. UI sessions confirm via a preview dialog of the
+  // REDACTED statement; headless/RPC requires the literal --yes token.
+  // Redaction happens BEFORE the confirm preview and before enqueue; the
+  // job reuses the durable outbox (opId persisted before any side effect).
+  pi.registerCommand("kiwifs-personal-note", {
+    description:
+      "Save ONE note to personal-global memory (explicit user action; confirmed; never automatic): /kiwifs-personal-note <statement…> [--entry id1,id2] [--yes]",
+    handler: async (args, ctx) => {
+      const gate = configGate();
+      if (!gate.ok) {
+        if (ctx.hasUI) ctx.ui.notify(gate.notice, "info");
+        return;
+      }
+      if (!gate.config.scopes.allowPersonalGlobal) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "personal-global scope disabled (scopes.allowPersonalGlobal) — note not saved",
+            "info",
+          );
+        return;
+      }
+      const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const headlessYes = parts.includes("--yes");
+      const rest = parts.filter((p) => p !== "--yes");
+      const entryIds: string[] = [];
+      const words: string[] = [];
+      for (let i = 0; i < rest.length; i++) {
+        const w = rest[i]!;
+        if (w === "--entry") {
+          i++;
+          entryIds.push(
+            ...(rest[i] ?? "")
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean),
+          );
+          continue;
+        }
+        if (w.startsWith("--entry=")) {
+          entryIds.push(
+            ...w
+              .slice("--entry=".length)
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean),
+          );
+          continue;
+        }
+        words.push(w);
+      }
+      const statement = words.join(" ").trim();
+      if (!statement) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "usage: /kiwifs-personal-note <statement…> [--entry id1,id2] [--yes]",
+            "info",
+          );
+        return;
+      }
+      // Redact BEFORE the preview and before any durable write (decisions
+      // #10: redact before outbound). Fail closed on unclassifiable content.
+      const red = redactText(statement);
+      if (!red.ok) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "held — content could not be classified safely; nothing was saved",
+            "error",
+          );
+        return;
+      }
+      const preview =
+        red.content.length > 200
+          ? `${red.content.slice(0, 200)}…`
+          : red.content;
+      const redactions =
+        red.findings.length > 0
+          ? ` (${red.findings.length} redaction${red.findings.length === 1 ? "" : "s"} applied)`
+          : "";
+      if (ctx.hasUI) {
+        const proceed = await ctx.ui.confirm(
+          "Save personal note",
+          `Statement${redactions}: ${preview}\n\nScope: personal-global (your own memory space). Saved to the durable outbox and delivered idempotently. Nothing is promoted from project memory and no model call is made.`,
+        );
+        if (!proceed) {
+          ctx.ui.notify("personal note cancelled", "info");
+          return;
+        }
+      } else if (!headlessYes) {
+        // Headless must not touch the UI: notify only through the guarded
+        // path (hasUI is false here; keep the branch UI-free).
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "refused — headless personal-note requires --yes (record-mutating command)",
+            "error",
+          );
+        return;
+      }
+      // Provenance: the live session id when available; "pending" matches
+      // the existing convention for a not-yet-reported session id.
+      let sessionId = "pending";
+      try {
+        sessionId = ctx.sessionManager.getSessionId() ?? "pending";
+      } catch {
+        // fixture/headless contexts without a session manager
+      }
+      let enqueueInput;
+      try {
+        enqueueInput = buildExplicitPersonalEnqueue({
+          sessionId,
+          entryIds,
+          statement: red.content,
+        });
+      } catch (err) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            err instanceof ExplicitPersonalInputError
+              ? (err as Error).message
+              : `personal note refused: ${errorName(err)}`,
+            "error",
+          );
+        return;
+      }
+      const rt = runtimeBox.getRuntime(ctx.cwd);
+      let owned: DurableOutbox | undefined;
+      let outbox = rt?.store;
+      if (!outbox) {
+        // Durable even when the session runtime is not active: the job sits
+        // pending at the same state path and is delivered by the next active
+        // runtime's worker (scope `personal` is never held on project
+        // identity). No network attempt happens here.
+        try {
+          owned = DurableOutbox.open(join(resolveStateDir(ctx.cwd), "outbox"));
+          outbox = owned;
+        } catch (err) {
+          if (ctx.hasUI)
+            ctx.ui.notify(
+              `personal note not saved: ${errorName(err)}`,
+              "error",
+            );
+          return;
+        }
+      }
+      try {
+        const job = outbox.enqueue(enqueueInput);
+        rt?.audit?.record({
+          kind: "command",
+          feature: "commands",
+          decision: "ok (personal-note; scope personal; user-confirmed)",
+          targetId: job.opId,
+        });
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `personal note saved (scope: personal; queued for idempotent delivery${redactions})`,
+            "info",
+          );
+      } catch (err) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            err instanceof OutboxError
+              ? (err as Error).message
+              : `personal note failed: ${errorName(err)}`,
+            "error",
+          );
+      } finally {
+        owned?.close();
+      }
     },
   });
 

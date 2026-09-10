@@ -33,6 +33,16 @@ explicit confirmation: a UI confirm dialog interactively, or the literal
 - `/kiwifs-forget <path> [reason]` — REVERSIBLE: marks the record
   superseded, body preserved. Requires confirmation (`--yes` headless).
 - `/kiwifs-forget-undo <path>` — read-back-verified restore to active.
+- `/kiwifs-personal-note <statement…> [--entry id1,id2] [--yes]` — save ONE
+  user-authored note to personal-global memory (`scope: personal`). The
+  ONLY sanctioned personal-scope write (decisions.md #13): never automatic,
+  never derived from project content, and not exposed as an agent tool.
+  The statement is redacted BEFORE the confirmation preview and before the
+  durable enqueue; delivery rides the durable outbox idempotently and does
+  not depend on project identity. Requires confirmation (UI confirm, or
+  `--yes` headless). `--entry` attaches explicit provenance ids; without it
+  the session reference is the provenance. Refuses in private mode and when
+  `scopes.allowPersonalGlobal` is false.
 - `/kiwifs-backup-verify <session-id> [export-dir]` — verify a backup
   (checksums, completeness, branch links); optionally export to a NEW
   directory (refuses to overwrite).

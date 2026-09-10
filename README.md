@@ -25,7 +25,8 @@ KiwiFS service to Pi sessions and provides three opt-in features:
 
 User commands: `/kiwifs-status`, `/kiwifs-private-mode`,
 `/kiwifs-extract-now`, `/kiwifs-reflect-now`, `/kiwifs-proposal`,
-`/kiwifs-forget`, `/kiwifs-forget-undo`, `/kiwifs-backup-verify`,
+`/kiwifs-forget`, `/kiwifs-forget-undo`, `/kiwifs-personal-note`,
+`/kiwifs-backup-verify`,
 `/kiwifs-board-gc`, `/kiwifs-queue`, `/kiwifs-erasure-report`. All are
 headless/RPC safe; record-mutating ones require explicit confirmation.
 

@@ -107,6 +107,19 @@ only). The proposal lifecycle is available per-session with its own backend
 instance and op log; command wiring (approve/reject/undo surfaces) lands in
 T18.
 
+## Explicit personal memory (decisions.md #13, Q05)
+
+Personal-global memory has exactly ONE write path: the user command
+`/kiwifs-personal-note <statement…> [--entry id1,id2] [--yes]`. Nothing
+writes the `personal` scope automatically; observations, reflections and
+proposals are never promoted from project scope to personal, and no
+capture/reflection path can reach the command. The statement is the user's
+own words, redacted before the confirmation preview and the durable enqueue;
+the record reuses the standard observation schema with `scope: personal` and
+delivers idempotently via the durable outbox (a project identity is NOT
+required). Remote board GC is out of scope of this decision: the user
+cleans the board manually for now.
+
 ## Forgetting and erasure (PRD T18, B6)
 
 **Forget is reversible by design.** `/kiwifs-forget <path> [reason…]` marks a

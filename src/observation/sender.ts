@@ -268,6 +268,26 @@ export function createObservationSender(
       });
       return;
     }
+    // Q05P1: explicit personal records (docs/decisions.md #13). A job whose
+    // OWN durable scope is `personal` was created by an explicit user action
+    // (src/commands/personal-note.ts); it must NOT be held by an unresolved
+    // project scope, and it delivers at `personal/memory/...` via the same
+    // idempotent writeImmutable path. Personal routing is valid for
+    // observation records ONLY — reflection, proposals and backups are
+    // project-only features, and a personal scope there is a wiring error
+    // (permanent validation failure → quarantine, never silently rerouted).
+    if (job.scope === "personal") {
+      if (job.kind !== "observation") {
+        throw new ValidationError(
+          `personal scope is not routable for ${job.kind} jobs (project-only feature)`,
+          "kiwi_write",
+        );
+      }
+      await sendObservationJob(job, "personal", backend, {
+        ...(signal !== undefined ? { signal } : {}),
+      });
+      return;
+    }
     const scope = deps.scope;
     if (scope === undefined) {
       throw new SenderNotWiredError(

@@ -45,6 +45,7 @@ function loadCommand(): { status: Command; verify: Command } {
       "kiwifs-extract-now",
       "kiwifs-forget",
       "kiwifs-forget-undo",
+      "kiwifs-personal-note",
       "kiwifs-private-mode",
       "kiwifs-proposal",
       "kiwifs-queue",
