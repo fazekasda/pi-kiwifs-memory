@@ -30,9 +30,9 @@ import {
   readFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { KiwiFSAdapter } from "../backend/adapter.ts";
+import type { KiwiFSAdapter } from "../backend/adapter.ts";
+import { openBearerAdapter } from "../backend/factory.ts";
 import type { AuthRef } from "../config/schema.ts";
-import { resolveAuthSecret } from "../observation/model.ts";
 import { parseFrontmatter } from "../backend/parse.ts";
 import { redactText } from "../privacy/redaction.ts";
 
@@ -447,13 +447,12 @@ export function createManualOps(
   return {
     openStore: async () => {
       if (!cached) {
-        const secret = resolveAuthSecret(config.auth);
-        if (secret === undefined) return undefined;
-        cached = new KiwiFSAdapter({
-          url: config.url,
-          headers: { Authorization: `Bearer ${secret}` },
-          ledger: opLog.ledger(),
-        });
+        // Shared factory: fail-closed bearer construction — unresolvable
+        // credential → undefined (retryable gap — never an unauthenticated
+        // write; cached stays unset so the next call re-resolves). The
+        // manual op log is the opId ledger, threaded unchanged.
+        cached = openBearerAdapter(config.url, config.auth, opLog.ledger());
+        if (!cached) return undefined;
         await cached.connect();
       }
       return cached;

@@ -2406,3 +2406,43 @@ q02-closure-evidence.md` with prettier (whitespace only; content preserved)
   (pid-first) lock semantics honestly instead of an over-strong
   "never a second writer" claim.
 - Gates: recorded after final edits in this round (see below).
+
+## Q06A — backend factory extraction (backend subtask only; final worker)
+
+Scope: Q06 backend subtask ONLY — behavior-preserving extraction of the
+duplicated `resolveAuthSecret` → `Authorization: Bearer` → `KiwiFSAdapter`
+wiring into a single construction boundary (`src/backend/factory.ts`). No
+config policy, API, or feature redesign. Remaining Q06 scope (session/runtime
+wiring, commands, status surfaces) stays open — not reduced, not claimed.
+
+- `openBearerAdapter`: resolve credential, `undefined` when it does not
+  resolve (fail-closed retryable hold; callers keep `cached` unset so the
+  next call re-resolves — identical to all five pre-extraction sites).
+- `buildBearerAdapter`: for sites whose hold checks already proved the
+  credential resolves; preserves the pre-existing `?? ""` header fallback
+  verbatim (guard parity with the untouched outer hold checks).
+- `resolveBearerSecret`: pure named re-export of `resolveAuthSecret`
+  (resolver itself unchanged, src/observation/model.ts).
+- The opId ledger is a REQUIRED typed parameter — no default/optional
+  ledger, mutations still refuse without a durably persisted opId. The
+  proposal-lifecycle inline ledger object (lifecycle opId policy) stays in
+  src/index.ts, threaded through the factory unchanged.
+- Call sites migrated: src/index.ts ×4 (observation sender, proposal
+  lifecycle, retrieval, board delivery), src/commands/manual-ops.ts ×1.
+  src/backend/live/runner.ts intentionally untouched (raw headers + memory
+  ledger probe harness, different shape). No user-visible command/semantics,
+  outbox identity, on-disk format, cleanup eligibility, scope isolation or
+  privacy transition changed. Net −12 lines in index.ts; no broad rewrite.
+- Regression: `test/backend-factory.test.ts` (9 tests, synthetic only —
+  in-process fetch swap, throwaway env vars, mode-0600 temp files, no
+  sockets, no real credentials): fail-closed on env/file/whitespace,
+  exact wire headers incl. trim semantics, no-I/O-before-connect,
+  OpIdNotPersistedError fail-closed both shapes, timeout/byte-bound
+  threading, re-export contract. Existing suites untouched.
+- Unrelated `t19-budget-report.json` benchmark jitter from a prior worker's
+  accidental run reverted (belongs to the benchmark domain).
+- Independent review: PASS (behavior line-by-line against pre-refactor
+  sites, call-site audit complete, safety guarantees verified).
+- Gates after final edits (recorded below). Secret scan of all staged files
+  (explicit list, not `git add -A`): env-var names and synthetic values
+  only; clean. No commits until this final worker; no push, no publication.

@@ -9,6 +9,7 @@ import type { AuthRef } from "./config/schema.ts";
 import { resolvedStatusLines, statusIsSecretFree } from "./config/status.ts";
 import { effectiveFeatures, type MemoryConfig } from "./config/schema.ts";
 import { KiwiFSAdapter } from "./backend/adapter.ts";
+import { openBearerAdapter, buildBearerAdapter } from "./backend/factory.ts";
 import type { OpIdLedger } from "./backend/opid.ts";
 import {
   createModelExtractor,
@@ -364,9 +365,10 @@ function resolveRecordScope(
  *
  * The MCP transport authenticates exclusively via `AdapterOptions.headers`
  * (src/backend/transport.ts), so the `mcp.auth` reference is resolved to a
- * bearer Authorization header here — same wiring as the live runner. The
- * secret value is resolved per delivery attempt by reference and is never
- * logged, echoed or stored.
+ * bearer Authorization header — same wiring as the live runner. The secret
+ * value is resolved per delivery attempt by reference and is never logged,
+ * echoed or stored. Q06A: construction is delegated to the shared factory
+ * (`openBearerAdapter`), which preserves this exact fail-closed behavior.
  */
 function openConfiguredBackend(
   config: MemoryConfig,
@@ -375,15 +377,7 @@ function openConfiguredBackend(
   if (!config.enabled || config.mcp.url === "" || !config.mcp.auth) {
     return undefined;
   }
-  const secret = resolveAuthSecret(config.mcp.auth);
-  if (secret === undefined) {
-    return undefined; // fail closed: unresolvable credential → retryable hold
-  }
-  return new KiwiFSAdapter({
-    url: config.mcp.url,
-    headers: { Authorization: `Bearer ${secret}` },
-    ledger,
-  });
+  return openBearerAdapter(config.mcp.url, config.mcp.auth, ledger);
 }
 
 /** Per-session runtime built lazily at session_start. */
@@ -553,28 +547,29 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
                 let cached: KiwiFSAdapter | undefined;
                 return async () => {
                   if (!cached) {
-                    const secret = resolveAuthSecret(mcpAuth);
-                    if (secret === undefined) return undefined;
-                    cached = new KiwiFSAdapter({
-                      url: mcpUrl,
-                      headers: { Authorization: `Bearer ${secret}` },
-                      ledger: {
-                        record: (opId: string) => {
-                          if (!opLog.has(opId)) {
-                            throw new Error(
-                              "refusing to record opId that is not durably persisted",
-                            );
-                          }
-                        },
-                        assertPersisted: (opId: string) => {
-                          if (!opLog.has(opId)) {
-                            throw new Error(
-                              "opId was not durably persisted before mutation (refusing side effect)",
-                            );
-                          }
-                        },
+                    // Shared factory: fail-closed bearer construction —
+                    // unresolvable credential → undefined (retryable hold;
+                    // cached stays unset so the next call re-resolves). The
+                    // inline ledger object is the lifecycle's OWN opId
+                    // policy (opIds durably persisted in the proposal op
+                    // log BEFORE any side effect), not adapter wiring.
+                    cached = openBearerAdapter(mcpUrl, mcpAuth, {
+                      record: (opId: string) => {
+                        if (!opLog.has(opId)) {
+                          throw new Error(
+                            "refusing to record opId that is not durably persisted",
+                          );
+                        }
+                      },
+                      assertPersisted: (opId: string) => {
+                        if (!opLog.has(opId)) {
+                          throw new Error(
+                            "opId was not durably persisted before mutation (refusing side effect)",
+                          );
+                        }
                       },
                     });
+                    if (!cached) return undefined;
                     await cached.connect();
                   }
                   return cached;
@@ -672,13 +667,10 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
     } else {
       const mcpAuth: AuthRef = config.mcp.auth;
       const mcpUrl = config.mcp.url;
-      const adapter = new KiwiFSAdapter({
-        url: mcpUrl,
-        headers: {
-          Authorization: `Bearer ${resolveAuthSecret(mcpAuth) ?? ""}`,
-        },
-        ledger: store.ledger(),
-      });
+      // The hold check above already proved the credential resolves;
+      // buildBearerAdapter preserves the pre-extraction `?? ""` header
+      // fallback verbatim (guard parity).
+      const adapter = buildBearerAdapter(mcpUrl, mcpAuth, store.ledger());
       retrieval = new RetrievalCoordinator({
         adapter,
         authorizedScopes: retrievalScopes,
@@ -800,13 +792,10 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
             },
           };
           const boardRepo = new BoardRepository(
-            new KiwiFSAdapter({
-              url: mcpUrl,
-              headers: {
-                Authorization: `Bearer ${resolveAuthSecret(mcpAuth) ?? ""}`,
-              },
-              ledger: store.ledger(),
-            }),
+            // Same shape as retrieval above: the hold checks above proved
+            // the credential resolves; the `?? ""` fallback lives in the
+            // shared factory (guard parity).
+            buildBearerAdapter(mcpUrl, mcpAuth, store.ledger()),
             { privateMode: repoGate },
           );
           delivery = new BoardDeliveryRuntime({
