@@ -179,7 +179,15 @@ and audit are injected uniformly into worker/observer/reflection/delivery —
 closing the Q01 gaps structurally instead of per-callsite patches. The Q01
 failing tests become the acceptance regressions.
 
-Status: unchecked. Depends on Q01 (tests), Q04 (audit sink).
+Status: COMPLETE (pending final commit). Composed of behavior-preserving
+subtasks: Q06A backend factory (commit 62fb957), Q06B session runtime
+extraction (commit ba6975b), Q06C commands/status/controls extraction
+(staged) — `buildSessionRuntime` injects the private-mode gate, config
+validity gate and the Q04 `FileAuditStore` audit sink uniformly into
+worker/observer/reflection/delivery; the Q01 failing tests run green as
+acceptance regressions. index.ts is composition/lifecycle only; no
+circular imports from index; exported seams re-exported for existing
+tests. Evidence: `tasks/evidence/q06-evidence.md`.
 
 ## Q07 — Config lifecycle
 

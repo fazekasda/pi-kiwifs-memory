@@ -16,11 +16,17 @@
  * fail-closed bearer semantics: an unresolved credential yields `undefined`
  * and the retryable hold, never an empty token.
  *
- * Command registration and status text remain in src/index.ts (next workflow
- * chunk). This module never imports src/index.ts (no cycles): the one
- * status-surface coupling (the tokenizer attach note) is reported through
- * the minimal `setTokenizerNoteSink` hook below, which src/index.ts
- * registers.
+ * Command registration and status text remain in src/index.ts (Q06C1: status
+ * probe aggregation lives in src/runtime/status.ts, which index pushes the
+ * runtime-derived probes into via `wireRuntimeStatusProbes`). This module
+ * never imports index or the status module (no cycles): the tokenizer attach
+ * note is OWNED by the runtime instance (`rt.tokenizerNote`, mutated after
+ * the async load) and the status probe reads the CURRENT runtime, so a
+ * superseded session's late note can never surface. Q06C1: the former
+ * `setTokenizerNoteSink` hook is deliberately removed — after the session
+ * extraction it was exported but registered by nobody (an orphan), and the
+ * runtime-owned note plus the current-runtime probe is the single status
+ * path.
  */
 import { join, dirname } from "node:path";
 import { loadConfig } from "../config/loader.ts";
@@ -61,24 +67,13 @@ import { loadConfiguredTokenizer } from "../retrieval/tokenizer.ts";
 import { validateProjectId } from "../domain/paths.ts";
 
 /**
- * Status hook (T13): the tokenizer attach note is surfaced by the status
- * text in src/index.ts; the runtime reports it through this sink instead of
- * importing index state (no circular dependency). index.ts registers the
- * sink at load; before registration the note is simply not surfaced.
+ * Q06C1 sink-orphan fix: the Q06B2 `setTokenizerNoteSink` hook (and its
+ * build-epoch gate) is removed — exported, but registered by nobody after
+ * the session extraction. The tokenizer note is owned by the runtime
+ * instance below and surfaced through the status probe, which reads the
+ * CURRENT runtime; a previous session's late attach/degrade note mutates
+ * only ITS OWN (superseded) runtime and cannot leak into status.
  */
-let tokenizerNoteSink: ((note: string) => void) | undefined;
-export function setTokenizerNoteSink(sink: (note: string) => void): void {
-  tokenizerNoteSink = sink;
-}
-
-/**
- * Q06B2: monotonic build epoch. Each `buildSessionRuntime` capture bumps it;
- * a late async callback (e.g. the tokenizer module load) may only surface
- * through the sink while ITS build is still the current runtime. After a
- * session switch/shutdown the old runtime's stale note is suppressed instead
- * of overwriting the new session's status.
- */
-let runtimeEpoch = 0;
 
 /**
  * Local durable state directory for the session coordinator (generation
@@ -193,9 +188,9 @@ export interface SessionRuntime {
  * failures disable those pieces visibly instead of breaking Pi startup.
  */
 export function buildSessionRuntime(cwd: string): SessionRuntime {
-  // Q06B2: this build is the current runtime owner from here on; async
-  // continuations capture `buildEpoch` and are suppressed once superseded.
-  const buildEpoch = ++runtimeEpoch;
+  // Q06B2: this build owns its runtime instance; async continuations (the
+  // tokenizer module load) mutate THIS instance's fields only, so a stale
+  // session's note can never overwrite a newer session's status.
   const stateDir = resolveStateDir(cwd);
   const configResult = loadConfig();
   const config = configResult.ok ? configResult.config : undefined;
@@ -480,9 +475,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   // injection (TOKENIZER_UNAVAILABLE_NOTE via the coordinator). A failed
   // load never becomes a character-estimate fallback: injection stays
   // skipped and the reason is visible. Q06B2: the note is OWNED by this
-  // runtime instance (mutated on `rt` after return) and the sink is only
-  // notified while this build is still the current one — a previous
-  // session's late attach/degrade note never surfaces after a switch.
+  // runtime instance (mutated on `rt` after return) — a previous session's
+  // late attach/degrade note never reaches the status probe, which reads
+  // the CURRENT runtime.
   let tokenizerNote: string | undefined;
   let tokenizerDegraded = false;
   // T14: incremental transcript backup capture (features.backup). Requires
@@ -599,9 +594,9 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
   }
   // Q06B2: the runtime object is assembled first so async continuations
   // (the tokenizer attach below) mutate THIS instance's fields — the note
-  // is owned by the runtime, not a closure snapshot. The sink is notified
-  // only while this build is still the current runtime: a previous
-  // session's late attach/degrade note never surfaces after a switch.
+  // is owned by the runtime, not a closure snapshot. A previous session's
+  // late attach/degrade note therefore mutates only the superseded runtime;
+  // the status probe reads the CURRENT runtime and never sees it.
   const rt: SessionRuntime = {
     coordinator,
     observer,
@@ -634,9 +629,6 @@ export function buildSessionRuntime(cwd: string): SessionRuntime {
       } else {
         rt.tokenizerNote = `automatic injection stays skipped — ${result.reason}`;
         rt.tokenizerDegraded = true; // structured flag, not keyword matching
-      }
-      if (buildEpoch === runtimeEpoch) {
-        tokenizerNoteSink?.(rt.tokenizerNote!);
       }
     });
   }

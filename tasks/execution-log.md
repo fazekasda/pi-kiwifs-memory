@@ -2446,3 +2446,35 @@ wiring, commands, status surfaces) stays open — not reduced, not claimed.
 - Gates after final edits (recorded below). Secret scan of all staged files
   (explicit list, not `git add -A`): env-var names and synthetic values
   only; clean. No commits until this final worker; no push, no publication.
+
+## Q06C — commands/status/controls extraction + whole-Q06 closure (final worker)
+
+- Extracted all 13 commands into src/commands/{registration,board-commands,
+  backup-commands,control-commands}.ts; src/index.ts (528 lines) is now
+  lifecycle/composition only — 0 registerCommand calls; command modules
+  import session.ts, never index.ts (no cycles).
+- Extracted status surfaces into src/runtime/status.ts (index → status
+  one-way via wireRuntimeStatusProbes); control-surface deps are explicit
+  params only in src/runtime/controls.ts. Shared runtimeBox/configGate
+  instances created in index and threaded explicitly — no hidden globals
+  duplicated in moved modules.
+- Removed the orphaned setTokenizerNoteSink + runtimeEpoch gate seam
+  (zero callers); stale-session note leakage structurally prevented via
+  rt.tokenizerNote on the current-runtime probe (pinned in q06c1).
+- Exported seams preserved via index re-exports (STATUS_MESSAGE,
+  computeOverallState, resolveStatusText, ten set*Probe seams,
+  buildSessionRuntime/resolveStateDir/openConfiguredBackend/
+  crossOptInToScopes/SessionRuntime, buildRuntimeControlSurface) —
+  t18/extension/q02c/q06b2 suites pass unchanged.
+- Command semantics unchanged: confirmation tokens, --yes refusals,
+  privacy holds, cleanup/gc scopes byte-identical; fail-closed dep
+  assertions added, nothing else.
+- New tests (production factories only, no test-only factories):
+  q06c1-status (7), q06c2-commands (3), q06c3-composition (4).
+- Whole-Q06 status updated in code-quality-plan.md; evidence consolidated
+  in tasks/evidence/q06-evidence.md (Q06A commit 62fb957, Q06B commit
+  ba6975b, Q06C this round). Independent read-only acceptance review: PASS.
+- Gates after final edits: tsc clean; npm run check 634/0;
+  pack:check OK (isolated Pi RPC load, offline disabled startup);
+  devenv test EXIT=0 (55.3s). Secret scan of explicit staged list clean.
+- Unrelated t19-budget-report.json benchmark jitter left unstaged.

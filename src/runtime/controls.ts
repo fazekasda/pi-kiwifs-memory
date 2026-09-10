@@ -28,6 +28,7 @@ import {
   fsyncSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import type { RetrievalCoordinator } from "../retrieval/coordinator.ts";
 import { validateConfig } from "../config/schema.ts";
 
 export type ControlResult =
@@ -107,4 +108,50 @@ export interface RuntimeControlSurface {
    * settle (never injected into a later turn).
    */
   readonly cancelPendingRetrieval: () => ControlResult;
+}
+
+/**
+ * T18 chunk 1: command-facing runtime control surface factory (moved here
+ * from index.ts in Q06C3 — runtime-control composition belongs with the
+ * other runtime-control guarantees, and the private-mode command module
+ * consumes it via an explicitly injected factory; index re-exports it so
+ * the public API is unchanged). Chunk 2 wires Pi commands to this.
+ */
+export function buildRuntimeControlSurface(deps: {
+  /** Resolved config file path (KIWIFS_MEMORY_CONFIG or explicit); undefined = no writable file. */
+  configFile: string | undefined;
+  getRetrieval: () => RetrievalCoordinator | undefined;
+  getGeneration: () => number;
+  /**
+   * Q02c: called ONLY after a successful persisted private-mode flip, so the
+   * shared live gate can observe the transition immediately (push) instead
+   * of waiting for its next pull read — cancel subscribers fire at
+   * transition time, not at the next tick. The gate itself decides whether
+   * the observed state is a normal→private transition (fail-closed read).
+   */
+  notifyPrivateTransition?: (value: boolean) => void;
+}): RuntimeControlSurface {
+  return {
+    setPrivateMode: (value) => {
+      if (!deps.configFile) {
+        return {
+          ok: false,
+          reason:
+            "no config file is in effect (KIWIFS_MEMORY_CONFIG unset) — private mode cannot be persisted; set it in the config source you use",
+        };
+      }
+      const result = setPrivateModeInFile(deps.configFile, value);
+      if (result.ok) deps.notifyPrivateTransition?.(value);
+      return result;
+    },
+    cancelPendingRetrieval: () => {
+      const r = deps.getRetrieval();
+      if (!r) return { ok: false, reason: "retrieval not active" };
+      r.setGeneration(deps.getGeneration() + 1);
+      return {
+        ok: true,
+        detail: "in-flight retrieval invalidated (generation bumped)",
+      };
+    },
+  };
 }
