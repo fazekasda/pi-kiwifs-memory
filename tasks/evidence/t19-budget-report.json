@@ -8,11 +8,11 @@
   ],
   "latency50msPerCall": {
     "runs": [
-      969,
+      965,
       959,
-      963,
-      959,
-      958
+      960,
+      960,
+      960
     ],
     "budgetDeadlineMs": 2000,
     "unit": "ms"
@@ -66,7 +66,7 @@
     "opIdStable": true,
     "durableCoverage": "12/12 entries retained"
   },
-  "nodeVersion": "v22.19.0",
+  "nodeVersion": "v24.19.0",
   "retrievalFixtures": {
     "QF-R1": "positive in-scope recall — exact path set r1-a/r1-b/r1-c in FTS score order",
     "QF-R2": "scope precision — out-of-scope candidate guard-rejected (scope step), zero cross-scope items",

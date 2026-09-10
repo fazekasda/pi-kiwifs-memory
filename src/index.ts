@@ -1501,10 +1501,16 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
     description:
       "Approve, reject or undo a KiwiFS merge proposal: /kiwifs-proposal <approve|reject|undo> <proposal-path> [reason…]",
     handler: async (args, ctx) => {
+      // Q03a: proposal transitions are record-mutating — explicit
+      // confirmation everywhere: UI confirm dialog, or the literal --yes
+      // argument in headless/RPC mode. Refusal performs zero writes and
+      // zero network mutations.
       const parts = (args ?? "").trim().split(/\s+/);
-      const action = parts.shift();
-      const proposalPath = parts.shift();
-      const reason = parts.join(" ") || undefined;
+      const headlessYes = parts.includes("--yes");
+      const cleanParts = parts.filter((p) => p !== "--yes");
+      const action = cleanParts.shift();
+      const proposalPath = cleanParts.shift();
+      const reason = cleanParts.join(" ") || undefined;
       if (
         (action !== "approve" && action !== "reject" && action !== "undo") ||
         !proposalPath
@@ -1513,6 +1519,23 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
           ctx.ui.notify(
             "usage: /kiwifs-proposal <approve|reject|undo> <proposal-path> [reason…]",
             "info",
+          );
+        return;
+      }
+      if (ctx.hasUI) {
+        const proceed = await ctx.ui.confirm(
+          `Proposal ${action}`,
+          `${action === "approve" ? "Approve" : action === "reject" ? "Reject" : "Undo"} merge proposal ${proposalPath}? This rewrites the targeted records (verified transitions; stale states fail visibly).`,
+        );
+        if (!proceed) {
+          ctx.ui.notify("proposal cancelled", "info");
+          return;
+        }
+      } else if (!headlessYes) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "refused — headless proposal transitions require --yes (record-mutating command)",
+            "error",
           );
         return;
       }
@@ -1658,10 +1681,33 @@ export default function kiwifsMemory(pi: ExtensionAPI): void {
     description:
       "Restore a forgotten KiwiFS record to active (read-back verified): /kiwifs-forget-undo <path>",
     handler: async (args, ctx) => {
-      const path = (args ?? "").trim().split(/\s+/)[0];
+      // Q03a: forget-undo is record-mutating — explicit confirmation
+      // everywhere: UI confirm dialog, or the literal --yes argument in
+      // headless/RPC mode (same policy as /kiwifs-forget). Refusal performs
+      // zero writes and zero network mutations.
+      const parts = (args ?? "").trim().split(/\s+/);
+      const headlessYes = parts.includes("--yes");
+      const path = parts.filter((p) => p !== "--yes")[0];
       if (!path) {
         if (ctx.hasUI)
           ctx.ui.notify("usage: /kiwifs-forget-undo <path>", "info");
+        return;
+      }
+      if (ctx.hasUI) {
+        const proceed = await ctx.ui.confirm(
+          "Restore forgotten record",
+          `Mark ${path} active again? Adds a provenance line; verified by read-back.`,
+        );
+        if (!proceed) {
+          ctx.ui.notify("forget-undo cancelled", "info");
+          return;
+        }
+      } else if (!headlessYes) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "refused — headless forget-undo requires --yes (record-mutating command)",
+            "error",
+          );
         return;
       }
       const g = manualOpsGate(ctx);

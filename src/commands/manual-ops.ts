@@ -33,6 +33,27 @@ import { KiwiFSAdapter } from "../backend/adapter.ts";
 import type { AuthRef } from "../config/schema.ts";
 import { resolveAuthSecret } from "../observation/model.ts";
 import { parseFrontmatter } from "../backend/parse.ts";
+import { redactText } from "../privacy/redaction.ts";
+
+/**
+ * Q03b: forget reasons are user free-text that persists in TWO durable places
+ * (the local op log JSONL and the backend `superseded_reason` frontmatter),
+ * so the reason is redacted ONCE here — before any persistence — and the
+ * sanitized value flows to both sinks.
+ *
+ * Fail closed on reason only: if the redactor cannot classify the reason
+ * (control chars, internal fault), the reason is HELD (omitted from both the
+ * op log and the backend call) and the forget itself still proceeds — the
+ * reason is optional metadata, but unclassified content is never persisted.
+ * The result detail discloses the hold without disclosing the reason.
+ */
+function sanitizeForgetReason(
+  reason: string,
+): { ok: true; reason: string } | { ok: false; held: true } {
+  const res = redactText(reason);
+  if (!res.ok) return { ok: false, held: true };
+  return { ok: true, reason: res.content };
+}
 
 // ---- durable manual-op log (local audit + opId ledger) ---------------------
 
@@ -209,11 +230,23 @@ export async function forgetMemoryPath(
 ): Promise<ManualOpResult> {
   const opId = randomUUID();
   const at = (deps.now ?? (() => new Date()))().toISOString();
+  // Q03b: redact BEFORE both durable sinks (local op log + backend).
+  const sanitized =
+    deps.reason !== undefined
+      ? sanitizeForgetReason(deps.reason)
+      : { ok: true, reason: undefined as string | undefined };
+  const reasonHeld =
+    deps.reason !== undefined && !sanitized.ok
+      ? "; reason held (could not be classified safely)"
+      : "";
+  const reason: string | undefined = sanitized.ok
+    ? sanitized.reason
+    : undefined;
   deps.opLog.record({
     opId,
     action: "forget",
     path: deps.path,
-    ...(deps.reason !== undefined ? { reason: deps.reason } : {}),
+    ...(reason !== undefined ? { reason } : {}),
     ...(deps.actor !== undefined ? { actor: deps.actor } : {}),
     at,
   });
@@ -227,7 +260,7 @@ export async function forgetMemoryPath(
   }
   try {
     await store.forget(deps.path, {
-      ...(deps.reason !== undefined ? { reason: deps.reason } : {}),
+      ...(reason !== undefined ? { reason } : {}),
       opId,
     });
     // Advisory invalidation: stale tombstones and cached evidence must not
@@ -238,7 +271,7 @@ export async function forgetMemoryPath(
     return {
       ok: true,
       opId,
-      detail: `forgotten (reversible): ${deps.path}${dropped > 0 ? `; ${dropped} cached evidence pack(s) dropped` : ""}; tombstone cache refreshed`,
+      detail: `forgotten (reversible): ${deps.path}${reasonHeld}${dropped > 0 ? `; ${dropped} cached evidence pack(s) dropped` : ""}; tombstone cache refreshed`,
     };
   } catch (err) {
     return {

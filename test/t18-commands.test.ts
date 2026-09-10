@@ -801,3 +801,223 @@ test("serializeFrontmatterDoc keeps unquoted values and quotes specials", () => 
   assert.match(doc, /reason: "has \\"quotes\\""/);
   assert.match(doc, /plain: ok\n---/);
 });
+
+// ---- Q03a: consistent confirmation on record-mutating commands --------------
+
+/** Config file with synthetic (unroutable) backend; enables the config gate. */
+function writeSyntheticConfig(dir: string): string {
+  const cfgFile = join(dir, "kiwifs.config.json");
+  writeFileSync(
+    cfgFile,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: true,
+      mcp: {
+        url: "http://127.0.0.1:1/mcp",
+        auth: { kind: "env", ref: "KIWIFS_T18_SYNTHETIC_TOKEN" },
+      },
+    }),
+  );
+  return cfgFile;
+}
+
+function confirmCtx(
+  hasUI: boolean,
+  cwd: string,
+  notifications: unknown[][],
+  confirmResult: boolean,
+) {
+  const confirms: unknown[][] = [];
+  const base = { hasUI, cwd };
+  const ctx = (hasUI
+    ? {
+        ...base,
+        ui: {
+          notify: (...args: unknown[]) => notifications.push(args),
+          confirm: (...args: unknown[]) => {
+            confirms.push(args);
+            return Promise.resolve(confirmResult);
+          },
+        },
+      }
+    : {
+        ...base,
+        get ui(): never {
+          throw new Error("Headless command must not access UI");
+        },
+      }) as unknown as ExtensionCommandContext;
+  return { ctx, confirms };
+}
+
+test("Q03a: mutating commands are registered with confirmation wiring (read-only commands unaffected)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kiwifs-q03a-reg-"));
+  try {
+    const commands = loadCommands();
+    // Actual registration: every shipped command name is present.
+    for (const name of [
+      "kiwifs-status",
+      "kiwifs-backup-verify",
+      "kiwifs-private-mode",
+      "kiwifs-extract-now",
+      "kiwifs-reflect-now",
+      "kiwifs-proposal",
+      "kiwifs-forget",
+      "kiwifs-forget-undo",
+      "kiwifs-board-gc",
+      "kiwifs-queue",
+      "kiwifs-erasure-report",
+    ]) {
+      assert.ok(
+        commands.has(name),
+        `command ${name} must be registered by kiwifsMemory()`,
+      );
+      assert.equal(typeof commands.get(name)!.handler, "function");
+    }
+    // Read-only inspection commands never require confirmation: they run
+    // headless without --yes and never touch the UI.
+    await withEnv(undefined, join(dir, "state"), async () => {
+      const headless = {
+        hasUI: false,
+        cwd: dir,
+        get ui(): never {
+          throw new Error("Read-only command must not access UI");
+        },
+      } as unknown as ExtensionCommandContext;
+      for (const [name, args] of [
+        ["kiwifs-status", ""],
+        ["kiwifs-queue", ""],
+        ["kiwifs-erasure-report", ""],
+        ["kiwifs-proposal", ""], // usage only — no action selected
+      ] as const) {
+        await commands.get(name)!.handler(args, headless);
+      }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Q03a: forget-undo requires UI confirm or headless --yes; refusal does zero writes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kiwifs-q03a-undo-"));
+  const cfgFile = writeSyntheticConfig(dir);
+  try {
+    await withEnv(cfgFile, join(dir, "state"), async () => {
+      const commands = loadCommands();
+      const oplog = join(dir, "state", "manual-oplog.jsonl");
+      const args = "memory/observation/x.md";
+
+      // UI, confirm refused: cancelled, no oplog, no backend attempt.
+      {
+        const notify: unknown[][] = [];
+        const { ctx, confirms } = confirmCtx(true, dir, notify, false);
+        await commands.get("kiwifs-forget-undo")!.handler(args, ctx);
+        assert.equal(confirms.length, 1, "UI confirm dialog must be shown");
+        assert.match(String(confirms[0]![1]), /x\.md/);
+        assert.match(String(notify.at(-1)![0]), /cancelled/);
+        assert.equal(existsSync(oplog), false, "no durable write on refusal");
+      }
+
+      // UI, confirm accepted: proceeds past the gate (unresolved credential
+      // → visible retryable refusal; still zero network writes).
+      {
+        const notify: unknown[][] = [];
+        const { ctx, confirms } = confirmCtx(true, dir, notify, true);
+        await commands.get("kiwifs-forget-undo")!.handler(args, ctx);
+        assert.equal(confirms.length, 1);
+        assert.match(String(notify.at(-1)![0]), /NOT restored/);
+      }
+
+      // Headless without --yes: refused before any store/oplog access.
+      {
+        const notify: unknown[][] = [];
+        const { ctx } = confirmCtx(false, dir, notify, false);
+        await commands.get("kiwifs-forget-undo")!.handler(args, ctx);
+        assert.equal(
+          existsSync(oplog),
+          false,
+          "no durable write without --yes",
+        );
+      }
+
+      // Headless with --yes: proceeds past the confirmation gate (same
+      // visible refusal path as the accepted UI confirm — no network).
+      {
+        const notify: unknown[][] = [];
+        const { ctx } = confirmCtx(false, dir, notify, false);
+        await commands.get("kiwifs-forget-undo")!.handler(`${args} --yes`, ctx);
+        // Past the gate; headless has no notifier, so observable behavior
+        // is "no crash, no confirmation dialog, no durable write".
+        assert.equal(existsSync(oplog), false);
+      }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Q03a: proposal approve/reject/undo require UI confirm or headless --yes; refusal does zero mutations", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kiwifs-q03a-proposal-"));
+  const cfgFile = writeSyntheticConfig(dir);
+  try {
+    await withEnv(cfgFile, join(dir, "state"), async () => {
+      const commands = loadCommands();
+      const proposalPath = "memory/merge-proposals/p-1.md";
+
+      // UI, confirm refused: cancelled before runtime/config access.
+      for (const action of ["approve", "reject", "undo"] as const) {
+        const notify: unknown[][] = [];
+        const { ctx, confirms } = confirmCtx(true, dir, notify, false);
+        await commands
+          .get("kiwifs-proposal")!
+          .handler(`${action} ${proposalPath}`, ctx);
+        assert.equal(confirms.length, 1, `UI confirm shown for ${action}`);
+        assert.match(String(confirms[0]![0]), new RegExp(action, "i"));
+        assert.match(String(notify.at(-1)![0]), /cancelled/);
+      }
+
+      // UI, confirm accepted: proceeds past the gate (no runtime in this
+      // synthetic env → visible lifecycle-unavailable notice; no writes).
+      {
+        const notify: unknown[][] = [];
+        const { ctx, confirms } = confirmCtx(true, dir, notify, true);
+        await commands
+          .get("kiwifs-proposal")!
+          .handler(`approve ${proposalPath}`, ctx);
+        assert.equal(confirms.length, 1);
+        assert.match(String(notify.at(-1)![0]), /lifecycle unavailable|failed/);
+      }
+
+      // Headless without --yes: refused (error notice), zero mutations.
+      {
+        const notify: unknown[][] = [];
+        const { ctx, confirms } = confirmCtx(false, dir, notify, false);
+        await commands
+          .get("kiwifs-proposal")!
+          .handler(`approve ${proposalPath}`, ctx);
+        assert.equal(confirms.length, 0, "headless must not touch the UI");
+        assert.equal(
+          existsSync(join(dir, "state", "manual-oplog.jsonl")),
+          false,
+          "no durable write on headless refusal",
+        );
+      }
+
+      // Headless with --yes: past the gate, same visible refusal path.
+      {
+        const notify: unknown[][] = [];
+        const { ctx } = confirmCtx(false, dir, notify, false);
+        await commands
+          .get("kiwifs-proposal")!
+          .handler(`approve ${proposalPath} --yes`, ctx);
+        // Past the gate; headless has no notifier, so observable behavior is
+        // "no crash, no confirmation dialog, no durable write".
+        assert.equal(
+          existsSync(join(dir, "state", "manual-oplog.jsonl")),
+          false,
+        );
+      }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

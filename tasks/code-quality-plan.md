@@ -107,13 +107,41 @@ Acceptance re-run by the commit worker after review fixes: full suite
 500/500, typecheck clean, `npm run check` / `npm run pack:check` /
 `devenv test` — see the commit receipt in `tasks/execution-log.md`.
 
+Closure follow-up (this session, uncommitted): the receipt had deferred
+outbox IN-FLIGHT cancellation, but Q02 requires best-effort cancellation.
+Closed in production composition — `JobSender` now carries an optional
+AbortSignal, the worker arms a per-delivery controller aborted via
+`gate.onCancel`, the sender chain threads the signal into the existing
+transport seam, aborted jobs are HELD (no retry/quarantine/drop, no false
+ack), and a throwing cancel subscriber can no longer break the gate read.
+Regression `test/q02-inflight-cancel.test.ts` (1/1) proves through the
+SHIPPED `buildSessionRuntime` that a genuinely in-flight delivery request is
+actually aborted at transition, the job stays pending, and resume delivers
+exactly once with zero unhandled rejections. Suite now 501/501; details in
+`tasks/evidence/q02-closure-evidence.md`. `queueMicrotask` deferral does NOT
+exist anywhere in this tree (verified by grep) — nothing to audit there.
+
 ## Q03 — Confirmation/reason/path
 
 Private-mode (and other control) transitions must carry an explicit
 confirmation, a sanitized reason, and the exact path edited; no silent
 success. Blocked on Q01 evidence for the transition-path inventory.
 
-Status: unchecked.
+Status: unchecked overall. **Q03a (confirmation wiring) COMPLETE** —
+uncommitted; final commit by the designated commit worker. Read-only
+inspection confirmed `/kiwifs-forget` and `/kiwifs-board-gc` already follow
+the approved pattern, while `/kiwifs-forget-undo` and `/kiwifs-proposal
+approve|reject|undo` mutated records with no confirmation in either mode.
+Fix (command registration sites only): both now require a UI confirm dialog
+naming action + target path, or the literal `--yes` token headless (stripped
+before arg parsing); refusal returns before config/runtime/store access —
+zero durable writes, zero network mutations. Read-only commands untouched.
+Regression: 3 new tests through actual `kiwifsMemory()` registration
+(registration presence, forget-undo confirm/cancel/--yes zero-write matrix,
+proposal per-action confirm matrix) — suite 504/504, `npm run check` pass,
+secret scan clean. Evidence: `tasks/evidence/q03a-confirmation-evidence.md`.
+Remaining Q03 scope (sanitized reason + exact-path disclosure on
+transitions) stays OPEN — not reduced.
 
 ## Q04 — Bounded audit log
 

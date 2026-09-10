@@ -17,6 +17,7 @@
  */
 
 import { createRedactor } from "../privacy/redaction.ts";
+import { pathWithinMemoryNamespace } from "../domain/paths.ts";
 import { parseFrontmatter } from "./parse.ts";
 import type { ScoredHit } from "./parse.ts";
 import type { KiwiFSAdapter } from "./adapter.ts";
@@ -144,8 +145,11 @@ export async function guardCandidate(
       reason: "scope missing or unauthorized",
     };
   }
-  // Step 4 — path prefix inside the scope's memory/ namespace.
-  if (!path.startsWith(`${scope}/memory/`)) {
+  // Step 4 — path inside the scope's memory/ namespace. Q03b: hardened
+  // containment helper (not a raw prefix match) — rejects `..` segments and
+  // prefix-boundary abuse (`memory-evil/`) and validates the scope form,
+  // without weakening the authorized-scope gate from step 3.
+  if (!pathWithinMemoryNamespace(path, scope)) {
     return {
       ok: false,
       step: "path-prefix",

@@ -2315,3 +2315,74 @@ Secret scan of all staged files (changed + new): clean. Only env-var NAMES
 (`KIWIFS_MCP_APIKEY`, `OPENROUTER_API_KEY`) and placeholder values appear;
 the private endpoint URL and its token appear in no tracked or newly
 written file. Staging is explicit (listed files), not `git add -A`.
+
+## Q02 closure — outbox in-flight cancellation (this session, uncommitted)
+
+The Q01/Q02 commit receipt (af996c4) had described outbox in-flight
+cancellation as a future follow-up; Q02's acceptance requires best-effort
+cancellation. Closed on the production path (read-only inspection first, then
+a bounded fix — no Q06/Q07 redesign):
+
+- Inspection confirmed: new requests are blocked after transition in every
+  domain, model extractor/reflector already aborted in-flight attempts via
+  `gate.onCancel`, but the outbox delivery path had NO cancellation seam (no
+  signal anywhere between worker and transport). The `queueMicrotask`
+  dispatch deferral referenced in the handoff does not exist anywhere in this
+  tree (repo-wide grep) — no microtask-deferred work to audit; the only
+  deferred dispatch (`onRelease → void tick()`) cannot reject.
+- Fix: `JobSender(job, signal?)`; per-delivery AbortController in the worker
+  aborted by `gate.onCancel`; signal threaded through the observation/
+  reflection/proposal/backup/board senders into the already-supported
+  `KiwiFSAdapter`/`McpHttpTransport` caller-signal seam. Catch path re-checks
+  the gate first: a mid-send transition HOLDS the aborted job (fail closed —
+  never retried into the private window, never quarantined, never dropped,
+  ack only after send resolves). Live-gate cancel listeners are invoked
+  best-effort (one throwing subscriber cannot break the fail-closed read).
+  `PrivateModeGateAdapter.onCancel?` added as an optional seam.
+- Regression: `test/q02-inflight-cancel.test.ts` — through the shipped
+  `buildSessionRuntime`, a stalled in-flight delivery request is actually
+  aborted at transition (listener observes socket close), tick resolves
+  held with the job pending and unquarantined, zero unhandled rejections,
+  resume delivers exactly once. Synthetic 127.0.0.1 listener only.
+- Gates re-run: `npm run check` (501/501), typecheck clean, exact-floor
+  `npx -y node@22.19.0 --test test/*.test.ts` fail 0 (last full-suite run,
+  budget report re-pinned to v22.19.0). Evidence: `tasks/evidence/
+q02-closure-evidence.md`. No commits, no push.
+
+## Q03a — consistent confirmation on record-mutating commands (2025 session)
+
+Scope: Q03a ONLY (confirmation wiring per the approved policy). The remaining
+Q03 scope (sanitized reason + exact-path disclosure on transitions) stays
+open — not reduced, not claimed.
+
+- Read-only inspection: `/kiwifs-forget` and `/kiwifs-board-gc` already
+  implement the approved pattern (UI `ctx.ui.confirm` / headless literal
+  `--yes`). `/kiwifs-forget-undo` and `/kiwifs-proposal
+approve|reject|undo` mutated records with NO confirmation in either mode;
+  read-only inspection commands (`kiwifs-status`, `kiwifs-queue`,
+  `kiwifs-erasure-report`, `kiwifs-backup-verify`) are confirmation-free by
+  design and were left untouched.
+- Fix (`src/index.ts`, registration sites only — no command-module refactor):
+  `kiwifs-forget-undo` and `kiwifs-proposal` now validate args first, then
+  require explicit confirmation everywhere: a UI confirm dialog naming the
+  action and target path, or the literal `--yes` token in headless/RPC mode.
+  Refusal/cancellation happens before any config/runtime/store access:
+  zero durable writes, zero network mutations. The headless refusal message
+  mirrors `/kiwifs-forget` ("requires --yes (record-mutating command)").
+  `--yes` is stripped from parsed args before path/reason extraction.
+- Regression (`test/t18-commands.test.ts`, +3 tests): actual command
+  registration through `kiwifsMemory()` (all 11 shipped commands present,
+  handlers callable; read-only commands run headless with no UI access and
+  no confirmation); forget-undo confirm/cancel/--yes matrix with zero-write
+  assertions (manual-oplog.jsonl never created on refusal); proposal
+  confirm/cancel matrix for approve/reject/undo plus headless `--yes`
+  passage. One real defect was caught by these tests during authoring: a
+  test-helper spread invoked the headless `get ui()` thrower — fixed in the
+  helper, not in production.
+- Also formatted the pre-existing untracked `tasks/evidence/
+q02-closure-evidence.md` with prettier (whitespace only; content preserved)
+  because `npm run check` includes repo-wide format check.
+- Gates (measured): `npm run check` — pass, suite **504/504** (501 prior +
+  3 new), typecheck clean, prettier clean. Secret scan of `src/index.ts` and
+  `test/t18-commands.test.ts`: clean (env-var names and synthetic refs only).
+  No commits, no push — final worker owns the commit.
