@@ -30,7 +30,7 @@ Q05R3 wires the explicit COMMAND (`src/index.ts` `kiwifs-board-cleanup`, helpers
 
 ## Development constraint
 
-All subagents must use `openrouter/z-ai/glm-5.3-flash` unless the user changes this instruction. No npm publication without approval. Current work is research, planning and architecture, not implementation.
+All subagents must use `openrouter/z-ai/glm-5.3-flash` unless the user changes this instruction. No npm publication without approval. Implementation follows the approved quality plan (`tasks/code-quality-plan.md`); the main thread coordinates, workers implement.
 
 ## Still to specify
 

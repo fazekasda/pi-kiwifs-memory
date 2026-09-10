@@ -1,7 +1,8 @@
 # pi-kiwifs-memory
 
 A KiwiFS memory extension for [Pi](https://pi.dev). It connects a running
-KiwiFS service to Pi sessions and provides three opt-in features:
+KiwiFS service to Pi sessions and provides the following features (three
+opt-in feature domains — observation, backup, board — plus retrieval):
 
 - **Observational memory.** After agent responses settle, unprocessed turns
   are batched and sent to a configurable model (default
@@ -40,7 +41,7 @@ three domains, with pending work held and never deleted.
 
 - Pi 0.85.0 (the version this was developed and tested against; the package
   peer dependency is intentionally open, not a tested-version claim).
-- Node.js >= 22.19.0. The test suite runs on exact Node 22.19.0 and Node 24.
+- Node.js >= 22.19.0. The test suite runs on exact Node 22.19.0 and Node 24.19.0.
 - An existing KiwiFS service with its MCP endpoint. The extension connects
   to your service; it does not install or manage a backend. Tested against
   KiwiFS v0.19.62.
@@ -182,7 +183,7 @@ Do not also use `-e` while the same extension is installed locally.
 - `src/config/`, `src/scope/`, `src/backend/`, `src/privacy/`, `src/outbox/`,
   `src/pi/`, `src/observation/`, `src/retrieval/`, `src/inject/`,
   `src/backup/`, `src/board/`, `src/runtime/`, `src/domain/`: feature modules.
-- `test/`: offline test suite (472 tests), including the fault matrix,
+- `test/`: offline test suite (675 tests), including the fault matrix,
   budget/quality baselines and long-session bounding audits. The live
   integration suite is opt-in: `KIWIFS_LIVE_TESTS=1 npm run test:live`.
 - `scripts/check-package.mjs`: verifies the npm package file allowlist.
@@ -223,10 +224,13 @@ leak. These are documented behavior, not aspirational TODOs.
   bearer apikey on the authenticated `/mcp` endpoint; standalone MCP ports
   are unauthenticated. The extension's own credential handling proves
   nothing about server-side enforcement.
-- **Erasure is reversible forgetting only.** No remote delete, no automatic
-  erasure, no automatic board GC. A true purge is a manual operator
-  procedure against backend storage, with no secure-erasure guarantee;
-  git history and search indexes retain content regardless.
+- **Erasure is reversible forgetting only.** No automatic erasure and no
+  automatic board GC. The ONE remote-delete surface is the explicit,
+  user-confirmed `/kiwifs-board-cleanup` (your own board messages only;
+  conjunctive eligibility, exact-preview confirmation, no CAS/atomicity
+  claim) — see `docs/operations.md`. A true purge of everything else is a
+  manual operator procedure against backend storage, with no secure-erasure
+  guarantee; git history and search indexes retain content regardless.
 - **Backups are redacted and not byte-identical.** Restoring a backup back
   into Pi sessions is deferred and not attempted.
 - **Board recipient labels are not confidentiality.** Anyone holding the

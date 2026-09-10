@@ -170,7 +170,16 @@ explicitly documented, UNAPPROVED proposal (not wired).
 
 Reconcile personal-scope writes with remote garbage collection; define which
 records are GC-eligible, keep no automatic GC / history rewrite without
-explicit approval. Status: unchecked.
+explicit approval. Status: COMPLETE (committed). Personal writes are
+explicit-only (`/kiwifs-personal-note`, decisions.md #13); remote board
+cleanup was user-approved as decisions.md #14 and implemented in three
+chunks (R1 eligibility + read-only preview planner; R2 guarded delete
+executor; R3 `/kiwifs-board-cleanup` command with two-step headless token
+flow), then NARROWED by the Q05RF closure correction to the approved
+CONJUNCTIVE eligibility (own-sender AND expired AND locally acked AND >30 d,
+grace from the later instant) with durable preview-token persistence and
+fresh-etag recheck. Evidence: `tasks/evidence/q05-evidence.md`,
+tests `q05p1-personal-domain`, `q05p2-personal-command`, q05r* cleanup tests.
 
 ## Q06 — Composition refactor
 
@@ -205,7 +214,12 @@ contract ratified in `tasks/plans/Q07A-lifecycle-contract-draft.md` §7.
 ## Q08 — Deterministic concurrency
 
 Make cross-domain concurrency deterministic (tick/reflection/delivery
-interleavings, lock semantics); bounded race tests only. Status: unchecked.
+interleavings, lock semantics); bounded race tests only. Status: COMPLETE
+(commit 2363b52): worker single-flight tick, typed corrupt-state errors
+(fail-closed on corrupt durable state), quiesce barrier at shutdown;
+Q09 later closed the outbox tick-coalescing leftover. Tests:
+`test/q08a-concurrency.test.ts`, `test/q08b-corrupt-state.test.ts`
+(plus `test/q09a-outbox-coalesce.test.ts`).
 
 ## Q09 — Evidence
 
@@ -228,4 +242,16 @@ Q01–Q08 (complete).
 
 Update docs/privacy.md, docs/architecture.md, docs/decisions.md to match the
 implemented gates/audit; final review pass. No requirement reductions without
-explicit approval. Status: unchecked. Depends on all.
+explicit approval. Status: Q10A (docs sync) COMPLETE (uncommitted): README
+feature/test-count/erasure wording, architecture §5/§6/§8/§12/§13 row 13
+(private-mode in-flight cancellation, tick coalescing, board-cleanup as the
+remote-delete surface with conjunctive eligibility, local-only board-gc),
+privacy.md implemented-tense gate/audit wording, decisions.md development
+constraint; stale statuses (Q05/Q08) reconciled here. Q10D (small blocker
+fixes) COMPLETE (uncommitted): headless refusals for the four record-mutating
+commands are now observable (`notifyAlways` — `if (ctx.hasUI)` dead code
+removed from the `!hasUI` branches); regression
+`test/q10d-headless-refusal.test.ts` (5 tests); suite 680/680 on Node 24,
+pack:check OK; finding→fix→test matrix and remaining risks in
+`docs/quality-review.md`. `t19-budget-report.json` jitter reverted.
+Depends on all.

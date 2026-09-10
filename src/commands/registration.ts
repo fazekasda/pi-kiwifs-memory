@@ -33,6 +33,25 @@ import {
   unforgetMemoryPath,
 } from "./manual-ops.ts";
 
+/**
+ * Q10D: headless refusals must be observable. `ui.notify` is available in
+ * every run mode (TUI/RPC/json/print) — only dialog methods need the
+ * `ctx.hasUI` guard — so a refusal notice is emitted unconditionally, with
+ * the same try/catch as the board-cleanup registration keeps a bare
+ * headless host that throws on `ui` access from crashing the handler.
+ */
+export function notifyAlways(
+  ctx: { ui?: { notify: (message: string, level?: "info" | "error") => void } },
+  message: string,
+  level: "info" | "error" = "error",
+): void {
+  try {
+    ctx.ui?.notify(message, level);
+  } catch {
+    /* headless host without a UI object — nothing to notify into */
+  }
+}
+
 /** Structural mirror of index's RuntimeBox (no import from index: no cycles). */
 export interface CommandRuntimeBox {
   /** Lazily-built per-session runtime (undefined until built or init failed). */
@@ -206,11 +225,11 @@ export function registerProposalCommands(
           return;
         }
       } else if (!headlessYes) {
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            "refused — headless proposal transitions require --yes (record-mutating command)",
-            "error",
-          );
+        // Q10D: emit the refusal unconditionally (observable in headless).
+        notifyAlways(
+          ctx,
+          "refused — headless proposal transitions require --yes (record-mutating command)",
+        );
         return;
       }
       const gate = configGate();
@@ -337,11 +356,11 @@ export function registerForgetCommands(
           return;
         }
       } else if (!headlessYes) {
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            "refused — headless forget requires --yes (record-mutating command)",
-            "error",
-          );
+        // Q10D: emit the refusal unconditionally (observable in headless).
+        notifyAlways(
+          ctx,
+          "refused — headless forget requires --yes (record-mutating command)",
+        );
         return;
       }
       const rt = runtimeBox.getRuntime(ctx.cwd);
@@ -390,11 +409,11 @@ export function registerForgetCommands(
           return;
         }
       } else if (!headlessYes) {
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            "refused — headless forget-undo requires --yes (record-mutating command)",
-            "error",
-          );
+        // Q10D: emit the refusal unconditionally (observable in headless).
+        notifyAlways(
+          ctx,
+          "refused — headless forget-undo requires --yes (record-mutating command)",
+        );
         return;
       }
       const g = manualOpsGate(ctx);
@@ -561,13 +580,11 @@ export function registerPersonalNoteCommand(
           return;
         }
       } else if (!headlessYes) {
-        // Headless must not touch the UI: notify only through the guarded
-        // path (hasUI is false here; keep the branch UI-free).
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            "refused — headless personal-note requires --yes (record-mutating command)",
-            "error",
-          );
+        // Q10D: emit the refusal unconditionally (observable in headless).
+        notifyAlways(
+          ctx,
+          "refused — headless personal-note requires --yes (record-mutating command)",
+        );
         return;
       }
       // Provenance: the live session id when available; "pending" matches

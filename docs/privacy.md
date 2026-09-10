@@ -28,9 +28,13 @@ wire the redactor exported from `src/privacy/redaction.ts`.
   writes in any of the three feature domains (observation, backup, board),
   no new capture/backup/board jobs. Pending outbox jobs are **held, never
   deleted** (no drop-oldest); resuming is an explicit `resume()` call that
-  releases held jobs and is recorded as a visible transition event. T07's
-  outbox worker must consult `assertNetworkAllowed()` before every send and
-  route accepted work through `holdWhilePrivate()`.
+  releases held jobs and is recorded as a visible transition event. The
+  outbox worker consults `assertNetworkAllowed()` before every send and
+  routes accepted work through `holdWhilePrivate()` — wired through
+  production composition since Q02/Q06 (Q01's audit gaps closed: the worker
+  now receives the production gate and the Q04 audit sink), with best-effort
+  in-flight cancellation via an AbortSignal armed on `gate.onCancel` (aborted
+  jobs are held, never retried, quarantined or false-acked).
   **Hard T07 requirement:** a listener must be registered via
   `onResume()` (or resume handled inline) _before_ the gate is ever enabled.
   `resume()` releases held references only to registered listeners; with no
@@ -45,8 +49,9 @@ degraded}`. Payload snippets exist only at user-enabled `snippets`
   secret-bearing is downgraded to an `audit-suppressed` stub rather than
   persisted.
 
-  **Q04a (proposal, not yet approved config):** durable storage is provided
-  by `FileAuditStore` (`src/privacy/audit-store.ts`): JSONL with bounded
+  **Q04a (durable store shipped; the config surface remains an unapproved
+  proposal):** durable storage is provided by `FileAuditStore`
+  (`src/privacy/audit-store.ts`): JSONL with bounded
   rotation (256 KiB × 3 files default), private permissions (dir 0700,
   files 0600), best-effort single-owner lock file, trailing-corruption
   repair, and content-free degraded status on disk-full/fs faults (events
