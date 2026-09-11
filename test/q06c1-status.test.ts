@@ -30,6 +30,7 @@ import * as index from "../src/index.ts";
 import {
   computeOverallState,
   resolveStatusText,
+  setBoardDiscoveryFallbackProbe,
   setTokenizerDegradedProbe,
   setTokenizerNoteProbe,
   STATUS_MESSAGE,
@@ -278,6 +279,85 @@ export const tokenizer = { id: "q06c1-stale-tokenizer", countTokens: () => 1 };`
     assert.match(rt1.tokenizerNote ?? "", /q06c1-stale-tokenizer/);
     await wired.fire("session_shutdown");
   } finally {
+    h.cleanup();
+  }
+});
+
+test("B03a: board discovery fallback surfaces as degraded status and clears after a healthy changes cycle", async () => {
+  const h = await makeHarness();
+  try {
+    // Real shipped wiring: registerSessionHandlers pushes the runtime-derived
+    // probes in; the fallback flag is read from the delivery status snapshot
+    // (set by a non-retryable changes-feed rejection, cleared by a healthy
+    // completed cycle — cycle semantics covered by test/board-delivery.test.ts).
+    h.writeConfig({
+      ...BASE_CFG,
+      features: { observation: true, backup: false, board: true },
+      board: { consumerId: "synthetic-consumer" },
+    });
+    const wired = wire(h);
+    await wired.fire("session_start");
+    const rt = wired.box.getRuntime(h.dir)!;
+    assert.ok(rt.delivery, "delivery configured for board feature");
+    const realDelivery = rt.delivery;
+    // Fallback active: status text discloses the bounded listing mode and the
+    // overall state is degraded. Wording states the listing mode without
+    // claiming every KiwiFS deployment is affected.
+    const fakeDelivery = {
+      statusSnapshot: () => ({
+        runState: "polling",
+        unread: 0,
+        consecutiveEmptyPolls: 0,
+        discoveryFallback: true,
+      }),
+      lastErrorFingerprint: () => undefined,
+      holdReason: undefined,
+      stop: () => {},
+    } as unknown as NonNullable<typeof rt.delivery>;
+    rt.delivery = fakeDelivery;
+    const during = index.resolveStatusText();
+    assert.match(during, /board discovery: listing-fallback/);
+    assert.match(during, /changes feed rejected/);
+    assert.match(during, /bounded query_meta discovery in use/);
+    assert.match(during, /state: degraded/);
+    // Healthy changes cycle: the snapshot no longer reports the fallback and
+    // status returns to non-degraded (no stale fallback note).
+    rt.delivery = {
+      ...fakeDelivery,
+      statusSnapshot: () => ({
+        runState: "idle",
+        unread: 0,
+        consecutiveEmptyPolls: 1,
+      }),
+    } as unknown as NonNullable<typeof rt.delivery>;
+    const after = index.resolveStatusText();
+    assert.doesNotMatch(after, /listing-fallback/);
+    assert.match(after, /state: healthy/);
+    // Restore the real delivery before shutdown (it owns stop()).
+    rt.delivery = realDelivery;
+    await wired.fire("session_shutdown");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("B03a: the structured board discovery-fallback probe seam works through the extracted module", async () => {
+  const h = await makeHarness();
+  try {
+    const wired = wire(h);
+    await wired.fire("session_start");
+    setBoardDiscoveryFallbackProbe(() => true);
+    const during = index.resolveStatusText();
+    assert.match(during, /board discovery: listing-fallback/);
+    assert.match(during, /state: degraded/);
+    setBoardDiscoveryFallbackProbe(() => false);
+    assert.doesNotMatch(index.resolveStatusText(), /listing-fallback/);
+    assert.match(index.resolveStatusText(), /state: healthy/);
+    // index re-export remains intact for existing public API consumers.
+    assert.equal(typeof index.setBoardDiscoveryFallbackProbe, "function");
+    await wired.fire("session_shutdown");
+  } finally {
+    setBoardDiscoveryFallbackProbe(undefined);
     h.cleanup();
   }
 });

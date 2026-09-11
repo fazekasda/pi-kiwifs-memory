@@ -160,6 +160,32 @@ verification and has not been approved or built.
   that is an operator decision outside this extension.
 - Board send is subject to private mode and the same fail-closed path
   rules as every other write.
+- Changes-feed degradation: the reference test deployment used in the
+  T19 live run rejected every `kiwi_changes` call with a persistent
+  server-side IsError HTTP 500 once the feed had entries. This is an
+  observed deployment defect — the extension does not claim that every
+  KiwiFS deployment is affected, and on a healthy feed the fallback
+  never runs. When the failure does occur:
+  - Availability faults (transport/network) still PAUSE the cycle; only
+    a NON-retryable domain rejection (IsError result) switches that
+    cycle's inbound discovery to ONE bounded `kiwi_query_meta` listing
+    pass per cycle.
+  - The listing is bounded (≤20 pages, ≤1000 candidate paths per
+    cycle), post-filtered strictly to board-message paths, and skips
+    already-handled paths so a stable listing order cannot starve the
+    backlog. Hitting the bound is DISCLOSED (`listing truncated`), not
+    hidden — remaining messages arrive in later cycles.
+  - Fallback candidates go through the same fresh-read parse, TTL,
+    dedupe and recipient pipeline as feed-delivered messages; the
+    fallback discovers exactly the deliverable set and no more.
+  - The stored changes cursor is untouched in fallback mode. When the
+    feed recovers, the next healthy cycle replays from the cursor and
+    dedupe by `msg_id` absorbs overlap; the fallback state clears after
+    a healthy changes cycle.
+  - Visibility: the board status snapshot and `kiwifs_board_inbox` show
+    `discovery=listing-fallback (changes feed rejected; bounded
+query_meta discovery in use)`. This is a disclosure of a degraded
+    backend, never a health claim.
 
 ## Forgetting, retention, purge (erasure limits)
 
@@ -216,6 +242,15 @@ notes name the failing piece. Common notes and their meaning:
 - `retrieval: degraded — …` — a retrieval cycle degraded (deadline, out-of
   -scope or superseded candidates rejected, keyword-only hybrid fallback).
   Keyword-only results are never presented as semantic.
+- `discovery=listing-fallback (changes feed rejected; bounded query_meta
+discovery in use)` — the board's `kiwi_changes` poll was rejected
+  (observed live as the reference deployment's persistent HTTP 500 once
+  the feed has entries) and delivery switched to one bounded
+  `kiwi_query_meta` listing pass for that cycle. Message delivery
+  continues; see “Board operations” for cursor, truncation and recovery
+  behavior. It clears after a healthy changes cycle. A transport or
+  network failure instead pauses polling — the fallback never runs
+  during an availability outage.
 - `tokenizer: automatic injection stays skipped — …` — see the tokenizer
   requirement in `docs/configuration.md`. Tools still work.
 - `outbox: … capture=PAUSED (coverage gap)` — high-water limit reached;

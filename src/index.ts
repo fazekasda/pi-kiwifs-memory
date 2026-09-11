@@ -74,6 +74,7 @@ export {
   resolveStatusText,
   setBackupNoteProbe,
   setBoardNoteProbe,
+  setBoardDiscoveryFallbackProbe,
   setCapturePausedProbe,
   setCoordinatorErrorProbe,
   setObserverErrorProbe,
@@ -165,6 +166,11 @@ export function registerSessionHandlers(
       const lines = runtime?.backup?.pendingStatus() ?? [];
       return lines.length > 0 ? lines.join("; ") : undefined;
     },
+    // B03a: structured board-discovery-fallback flag (bounded query_meta
+    // listing active because the changes feed was rejected) — status must
+    // disclose and degrade; it clears after a healthy changes cycle.
+    boardDiscoveryFallback: () =>
+      runtime?.delivery?.statusSnapshot().discoveryFallback === true,
     boardNote: () => {
       if (runtime?.deliveryHeldReason) return runtime.deliveryHeldReason;
       const d = runtime?.delivery;

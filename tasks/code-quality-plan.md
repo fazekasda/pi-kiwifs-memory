@@ -266,13 +266,13 @@ Q01–Q08 (complete).
 
 Update docs/privacy.md, docs/architecture.md, docs/decisions.md to match the
 implemented gates/audit; final review pass. No requirement reductions without
-explicit approval. Status: Q10A (docs sync) COMPLETE (uncommitted): README
+explicit approval. Status: Q10A (docs sync) COMPLETE (committed): README
 feature/test-count/erasure wording, architecture §5/§6/§8/§12/§13 row 13
 (private-mode in-flight cancellation, tick coalescing, board-cleanup as the
 remote-delete surface with conjunctive eligibility, local-only board-gc),
 privacy.md implemented-tense gate/audit wording, decisions.md development
 constraint; stale statuses (Q05/Q08) reconciled here. Q10D (small blocker
-fixes) COMPLETE (uncommitted): headless refusals for the four record-mutating
+fixes) COMPLETE (committed): headless refusals for the four record-mutating
 commands are now observable (`notifyAlways` — `if (ctx.hasUI)` dead code
 removed from the `!hasUI` branches); regression
 `test/q10d-headless-refusal.test.ts` (5 tests); suite 680/680 on Node 24,

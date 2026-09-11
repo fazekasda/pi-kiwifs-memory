@@ -71,6 +71,9 @@ test("preconditions fail closed with no network traffic when the config is unsaf
     assert.equal(report.outcome, "setup-blocked");
     assert.equal(server.state.requests.length, 0); // no traffic at all
     assert.equal(report.authNote.includes("setup-blocked"), true);
+    // Report identity fields are present even when setup blocks the run.
+    assert.ok(!Number.isNaN(Date.parse(report.timestamp)));
+    assert.equal(typeof report.runnerVersion, "string");
   }
 });
 
@@ -125,6 +128,11 @@ test("clean pass: routing check, CRUD/FTS round trip and manifest-owned cleanup"
   // Auth note is connectivity evidence, never an enforcement claim.
   assert.ok(report.authNote.includes("never"));
   assert.ok(!JSON.stringify(report).includes("Bearer synthetic")); // redacted diagnostics
+  // B06 report-identity fields: timestamp, runner version, candidate SHA and
+  // a stable backend capability fingerprint.
+  assert.ok(!Number.isNaN(Date.parse(report.timestamp)));
+  assert.ok(report.runnerVersion.length > 0);
+  assert.ok(/^[0-9a-f]{16}$/.test(report.capabilityFingerprint!));
 });
 
 test("partial failure still cleans up manifest-owned records (reverse order, verified)", async () => {
@@ -174,6 +182,36 @@ test("partial failure still cleans up manifest-owned records (reverse order, ver
     "manifest-owned cleanup must succeed despite a failed step",
   );
   assert.deepEqual(report.cleanup?.leftovers, []);
+});
+
+test("report records candidate SHA and is fingerprint-stable across capability discovery", async () => {
+  const server = createFakeServer();
+  const a = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: server.fetch,
+    randomId: () => "feedface1234",
+    candidateSha: "0123456789abcdef0123456789abcdef01234567",
+    runnerVersion: "9.9.9-test",
+  });
+  const b = await runLiveSuite({
+    config: validConfig(),
+    fetchImpl: server.fetch,
+    randomId: () => "feedface1235",
+    candidateSha: "0123456789abcdef0123456789abcdef01234567",
+    runnerVersion: "9.9.9-test",
+  });
+  for (const report of [a, b]) {
+    assert.equal(
+      report.candidateSha,
+      "0123456789abcdef0123456789abcdef01234567",
+    );
+    assert.equal(report.runnerVersion, "9.9.9-test");
+  }
+  // Same advertised capability set → same fingerprint, independent of run id.
+  assert.equal(a.capabilityFingerprint, b.capabilityFingerprint);
+  // Cleanup outcome remains part of the report contract.
+  assert.deepEqual(a.cleanup?.leftovers, []);
+  assert.deepEqual(b.cleanup?.leftovers, []);
 });
 
 test("run ids are random and paths stay beneath integration-tests/", () => {

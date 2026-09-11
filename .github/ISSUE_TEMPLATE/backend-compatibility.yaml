@@ -1,0 +1,72 @@
+name: Backend compatibility problem
+description: >-
+  The extension fails against a KiwiFS service, or a KiwiFS capability
+  (FTS, changes feed, ETag, scopes) behaves unexpectedly.
+title: "[backend] "
+labels: ["backend"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never include** in this issue: credentials, tokens, backend URLs
+        that embed credentials, configuration files, raw transcripts, or
+        stored memory contents. Use placeholders and sanitize all
+        diagnostics. Note: the extension does not install or manage a
+        KiwiFS backend; compatibility issues are diagnosed against the
+        version of KiwiFS you run yourself.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: >-
+        KiwiFS backend version (e.g. `v0.19.62`), extension commit or
+        version, Pi version, Node.js version.
+    validations:
+      required: true
+  - type: dropdown
+    id: capability
+    attributes:
+      label: Affected capability
+      options:
+        - MCP initialization / tool discovery
+        - Write path (create/update/delete)
+        - Retrieval / FTS / hybrid attribution
+        - ETag / conditional behavior
+        - Scope isolation
+        - kiwi_changes feed or its bounded fallback
+        - Board tools
+        - Redirects
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce (sanitized)
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: >-
+        `/kiwifs-status` output and log excerpts, with endpoint URLs
+        (especially any containing credentials), tokens, and memory
+        contents removed.
+  - type: checkboxes
+    id: attestation
+    attributes:
+      label: Sanitization attestation
+      options:
+        - label: >-
+            This report contains no credentials, tokens, config files,
+            raw transcripts, stored memory contents, or credentialed
+            backend URLs.
+          required: true

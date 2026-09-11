@@ -47,6 +47,12 @@ let lastCapturePaused: (() => boolean) | undefined;
 let lastBackupNote: (() => string | undefined) | undefined;
 /** Last board delivery note/status, surfaced via status (fail-visible, T17). */
 let lastBoardNote: (() => string | undefined) | undefined;
+/**
+ * B03a: structured board-discovery-fallback flag (bounded `kiwi_query_meta`
+ * listing active because the changes feed was rejected). Structured flag, not
+ * a keyword match — same pattern as the tokenizer/capture-paused probes.
+ */
+let lastBoardDiscoveryFallback: (() => boolean) | undefined;
 /** Outbox queue summary, surfaced via status (fail-visible, T18). */
 let lastQueueNote: (() => string | undefined) | undefined;
 /** Quarantined-job count probe for the overall state line (T18). */
@@ -110,6 +116,13 @@ export function setBoardNoteProbe(
   lastBoardNote = probe;
 }
 
+/** Test/inspection hook for the structured board discovery-fallback flag (B03a). */
+export function setBoardDiscoveryFallbackProbe(
+  probe: (() => boolean) | undefined,
+): void {
+  lastBoardDiscoveryFallback = probe;
+}
+
 /** Test/inspection hook for the queue summary probe (T18). */
 export function setQueueNoteProbe(
   probe: (() => string | undefined) | undefined,
@@ -139,6 +152,8 @@ export interface RuntimeStatusProbes {
   tokenizerDegraded: () => boolean;
   backupNote: () => string | undefined;
   boardNote: () => string | undefined;
+  /** B03a: bounded query_meta discovery fallback active (changes feed rejected). */
+  boardDiscoveryFallback?: () => boolean;
   queueNote: () => string | undefined;
   queueQuarantined: () => number;
   capturePaused: () => boolean;
@@ -153,6 +168,7 @@ export function wireRuntimeStatusProbes(p: RuntimeStatusProbes): void {
   lastTokenizerDegraded = p.tokenizerDegraded;
   lastBackupNote = p.backupNote;
   lastBoardNote = p.boardNote;
+  lastBoardDiscoveryFallback = p.boardDiscoveryFallback;
   lastQueueNote = p.queueNote;
   lastQueueQuarantined = p.queueQuarantined;
   lastCapturePaused = p.capturePaused;
@@ -231,6 +247,14 @@ export function resolveStatusText(): string {
   if (backupNote) text += `\nbackup: ${backupNote}`;
   const boardNote = lastBoardNote?.();
   if (boardNote) text += `\nboard delivery: ${boardNote}`;
+  // B03a: disclosed board-discovery degradation. Wording states the bounded
+  // listing mode without claiming every KiwiFS deployment is affected (the
+  // observed changes-feed rejection belongs to the reference test deployment).
+  const boardDiscoveryFallback = lastBoardDiscoveryFallback?.() === true;
+  if (boardDiscoveryFallback) {
+    text +=
+      "\nboard discovery: listing-fallback — changes feed rejected; bounded query_meta discovery in use (cursor untouched; dedupe absorbs overlap when the feed resumes)";
+  }
   const auditNote = lastAuditNote?.();
   if (auditNote) text += `\n${auditNote}`;
   const queueNote = lastQueueNote?.();
@@ -255,6 +279,11 @@ export function resolveStatusText(): string {
       lastTokenizerDegraded?.() === true ? tokenizerNote : undefined,
       backupNote,
       boardNote?.startsWith("HELD") ? boardNote : undefined,
+      // B03a: structured flag — an active bounded query_meta discovery
+      // fallback keeps the state DEGRADED (disclosed, never a health claim).
+      boardDiscoveryFallback
+        ? "board discovery listing-fallback (changes feed rejected)"
+        : undefined,
       // T18 review fix: a paused capture (coverage gap) is degraded.
       lastCapturePaused?.() === true
         ? "capture paused (coverage gap)"

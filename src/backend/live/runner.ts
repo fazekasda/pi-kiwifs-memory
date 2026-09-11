@@ -21,7 +21,17 @@ import { createMemoryLedger } from "../opid.ts";
 import { KiwiFSAdapter, REQUIRED_TOOLS } from "../adapter.ts";
 import { McpHttpTransport } from "../transport.ts";
 import { mintOpId } from "../opid.ts";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+
+/**
+ * Runner version reported in the sanitized live-run report (B06: the report
+ * must identify which runner produced the evidence). Pinned literal matching
+ * package.json — must be bumped in the same commit as any package.json
+ * version change (e.g. the B09 prerelease bump to 0.1.0-beta.0), or live-run
+ * evidence would name a version that no longer exists. Overridable for tests
+ * via RunLiveOptions.
+ */
+const DEFAULT_RUNNER_VERSION = "0.1.0-beta.0";
 
 export interface LiveRunnerConfig {
   enabled?: boolean;
@@ -53,9 +63,26 @@ export interface LiveStep {
 
 export interface LiveReport {
   outcome: LiveOutcome;
+  /** ISO-8601 UTC timestamp of when the run started. */
+  timestamp: string;
+  /** Version of this runner that produced the report. */
+  runnerVersion: string;
+  /** Release candidate SHA this run validates (B06); absent when not supplied. */
+  candidateSha?: string;
   runId?: string;
   /** Advertised tool names (capability-driven; counts never hard-coded). */
   advertisedTools?: string[];
+  /**
+   * Stable fingerprint of the backend's advertised capabilities: sha256 of
+   * the sorted tool-name list (first 16 hex chars). Lets a later reviewer
+   * tie the report to the exact capability set observed. Scope note: the
+   * fingerprint covers advertised tool NAMES only — not descriptions or
+   * parameter schemas — so two backends that renamed/reworded tools without
+   * changing names would share a fingerprint. Sufficient for "advertised
+   * capabilities" as documented; state this explicitly if reports are ever
+   * compared across backend upgrades.
+   */
+  capabilityFingerprint?: string;
   requiredToolsMissing?: string[];
   steps: LiveStep[];
   /** Manifest-owned cleanup result; leftovers are reported, never ignored. */
@@ -135,6 +162,10 @@ export interface RunLiveOptions {
   now?: () => number;
   /** Test hook: override the random run id (12 hex chars). */
   randomId?: () => string;
+  /** Release candidate SHA to record in the report (CLI: KIWIFS_CANDIDATE_SHA). */
+  candidateSha?: string;
+  /** Test hook: override the reported runner version. */
+  runnerVersion?: string;
   requestTimeoutMs?: number;
   runDeadlineMs?: number;
 }
@@ -152,6 +183,11 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
   if (reasons.length > 0) {
     return {
       outcome: "setup-blocked",
+      timestamp: new Date(t0).toISOString(),
+      runnerVersion: opts.runnerVersion ?? DEFAULT_RUNNER_VERSION,
+      ...(opts.candidateSha !== undefined
+        ? { candidateSha: opts.candidateSha }
+        : {}),
       steps: [],
       authNote: "no connectivity attempted (setup-blocked)",
       reasons,
@@ -166,6 +202,8 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
   const runMs =
     opts.runDeadlineMs ?? opts.config.timeouts?.runMs ?? DEFAULT_RUN_MS;
 
+  const timestamp = new Date(t0).toISOString();
+  const runnerVersion = opts.runnerVersion ?? DEFAULT_RUNNER_VERSION;
   const runController = new AbortController();
   const runTimer = setTimeout(() => runController.abort(), runMs);
   // Cleanup NEVER shares the run signal: when the run deadline fires, the run
@@ -506,6 +544,19 @@ export async function runLiveSuite(opts: RunLiveOptions): Promise<LiveReport> {
     }
     return {
       outcome,
+      timestamp,
+      runnerVersion,
+      ...(opts.candidateSha !== undefined
+        ? { candidateSha: opts.candidateSha }
+        : {}),
+      ...(advertisedTools !== undefined
+        ? {
+            capabilityFingerprint: createHash("sha256")
+              .update([...advertisedTools].sort().join("\n"))
+              .digest("hex")
+              .slice(0, 16),
+          }
+        : {}),
       runId,
       ...(advertisedTools !== undefined ? { advertisedTools } : {}),
       ...(requiredMissing !== undefined
@@ -584,7 +635,15 @@ export async function main(): Promise<number> {
     );
     return 2;
   }
-  const report = await runLiveSuite({ config });
+  // The candidate SHA is injected by the operator (never a secret); the
+  // config itself is consumed programmatically and its values never printed.
+  const candidateSha = process.env["KIWIFS_CANDIDATE_SHA"];
+  const report = await runLiveSuite({
+    config,
+    ...(candidateSha !== undefined && candidateSha !== ""
+      ? { candidateSha }
+      : {}),
+  });
   // Redacted report only: outcomes, tool names, paths, timings.
   console.log(JSON.stringify(report, null, 2));
   switch (report.outcome) {

@@ -192,7 +192,11 @@ requirement is deliberate (decisions.md #7, architecture.md §13 row 5):
 without a reliable tokenizer the cap cannot be enforced, so injection is
 never silently approximated. A synthetic word-counting module would produce
 wrong counts against the real model; the extension treats unreliable counts
-as failure, not as an estimate.
+as failure, not as an estimate. Beta status and the state of the evaluated
+community GLM-5 tokenizer candidate are recorded in
+[docs/beta-privacy.md](docs/beta-privacy.md) ("Tokenizer status"); no
+tokenizer compatibility is claimed for the default model route until
+separately validated.
 
 ### features
 
@@ -238,4 +242,6 @@ remote. If neither resolves, observation and backup are held with a visible
 
 `1` is the only supported value. A newer version in the config is rejected
 with a visible message and never rewritten destructively; an older version
-is rejected with a pointer to the upgrade path.
+is rejected with a pointer to the upgrade path. Install, upgrade, downgrade
+and rollback steps that preserve pending outbox work are in
+[docs/rollback.md](docs/rollback.md).

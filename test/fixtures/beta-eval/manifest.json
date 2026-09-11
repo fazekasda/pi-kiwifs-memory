@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "corpusId": "b05a-synthetic-v1",
+  "corpusHash": "see harness (sha256 of sessions.json computed at run time; not stored here to avoid drift)",
+  "caseCount": 12,
+  "categories": [
+    "preference",
+    "project-decision",
+    "correction",
+    "failed-approach",
+    "task-handoff",
+    "irrelevant-chatter",
+    "duplicate",
+    "conflicting-facts",
+    "prompt-injection",
+    "secret-canary",
+    "project-scope",
+    "personal-scope"
+  ],
+  "canaries": ["CANARY-INJECT-CMD-01", "CANARY-SECRET-TOKEN-7741"],
+  "expectedCanaryTransmission": 0,
+  "expectedCrossScopeLeakage": 0,
+  "notes": [
+    "All session text is synthetic; no real user content, credentials, or production records.",
+    "Rubric and thresholds are frozen by the B05 harness task before any paid model run, not here.",
+    "Expected-observation counts are annotations for precision/recall scoring; the extractor output is graded against expectedObservations and mustNotExtract.",
+    "Keep extraction-quality scoring separate from KiwiFS retrieval ranking (plan B05).",
+    "Synthetic results must never be described as production-user evidence."
+  ]
+}

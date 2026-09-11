@@ -24,6 +24,40 @@ opt-in feature domains — observation, backup, board — plus retrieval):
   `kiwifs_board_send`, `kiwifs_board_list`, `kiwifs_board_read`,
   `kiwifs_board_inbox`, `kiwifs_board_ack`.
 
+### Changes-feed degradation (observed on the reference deployment)
+
+During the T19 live suite, the reference test deployment rejected every
+`kiwi_changes` call with a persistent server-side IsError HTTP 500 once
+the feed had entries — so board delivery could not use its primary
+inbound-discovery mechanism. The extension handles this explicitly
+rather than silently stalling:
+
+- When a poll cycle's `kiwi_changes` call fails with a NON-retryable
+  domain rejection, that cycle falls back to ONE bounded
+  `kiwi_query_meta` listing pass. Availability faults (transport/network
+  errors) never trigger the fallback — they pause the cycle, since
+  switching discovery primitives mid-outage cannot tell you what was
+  delivered.
+- The fallback listing is bounded per cycle (≤20 pages, ≤1000 candidate
+  paths), strictly post-filtered to board-message paths, and already-
+  handled paths are excluded so a stable listing order cannot starve
+  the backlog. If the listing hits the bound, the truncation is
+  disclosed in the cycle result, status snapshot and tool output —
+  never hidden.
+- Every fallback candidate goes through the same fresh-read parse, TTL,
+  dedupe and recipient checks as feed-delivered messages — the fallback
+  discovers exactly the deliverable message set and no more.
+- The stored changes cursor is untouched in fallback mode. When
+  `kiwi_changes` resumes, the next healthy cycle replays from the
+  cursor and client-side dedupe by `msg_id` absorbs any overlap with
+  what the fallback already delivered.
+- Fallback activation is visible: the board status snapshot and the
+  `kiwifs_board_inbox` output carry
+  `discovery=listing-fallback (changes feed rejected; bounded
+query_meta discovery in use)`. It is a disclosure of a degraded
+  backend, never a health claim, and it clears after a healthy changes
+  cycle.
+
 User commands: `/kiwifs-status`, `/kiwifs-private-mode`,
 `/kiwifs-extract-now`, `/kiwifs-reflect-now`, `/kiwifs-proposal`,
 `/kiwifs-forget`, `/kiwifs-forget-undo`, `/kiwifs-personal-note`,
@@ -56,9 +90,13 @@ three domains, with pending work held and never deleted.
    pi install /absolute/path/to/pi-kiwifs-memory
    ```
 
-   There is no npm release yet; publication is a separate, approved step
-   (see `docs/publishing.md`). Do not also use `-e` while the same
-   extension is installed locally.
+   There is no npm release. The first beta is distributed as a GitHub
+   prerelease tag only (`v0.1.0-beta.0`, not yet created; see
+   [docs/release-notes-0.1.0-beta.0.md](docs/release-notes-0.1.0-beta.0.md)).
+   npm publication is a separate, future decision requiring explicit
+   approval (see `docs/publishing.md`). Until the beta tag exists, install
+   from a pinned Git commit of this repository. Do not also use `-e` while
+   the same extension is installed locally.
 
 2. Write a config file and point `KIWIFS_MEMORY_CONFIG` at it. A minimal
    opt-in example with credentials by environment-variable reference:
@@ -108,6 +146,29 @@ Full field reference: [docs/configuration.md](docs/configuration.md).
 Running the features day to day, outage/queue behavior, backup rules,
 forgetting and erasure limits, troubleshooting:
 [docs/operations.md](docs/operations.md).
+
+## Beta support and feedback
+
+This is a beta (`v0.1.0-beta.0`), not a stable release. Before relying on
+it, read the [beta privacy notice and known
+limitations](docs/beta-privacy.md). Upgrade, downgrade and rollback steps
+that preserve pending work are in the
+[rollback runbook](docs/rollback.md); never delete pending outbox work to
+recover. The [beta acceptance record](docs/beta-acceptance.md) tracks
+which install, upgrade, rollback and TUI checks have actually been
+performed.
+
+- **Security or privacy reports:** never as a public issue — see
+  [SECURITY.md](SECURITY.md) and the repository's private vulnerability
+  reporting (Security tab).
+- **Confirmed bugs:** GitHub Issues, using the templates under
+  `.github/ISSUE_TEMPLATE/` (bug, data loss, backend compatibility,
+  privacy/security). Templates ask for versions and sanitized
+  diagnostics — never credentials, raw transcripts, config files, or
+  stored memory bodies.
+- **Questions and beta feedback:** GitHub
+  [Discussions](https://github.com/fazekasda/pi-kiwifs-memory/discussions),
+  for anything that is not a confirmed bug report.
 
 ## State on disk
 
@@ -183,7 +244,7 @@ Do not also use `-e` while the same extension is installed locally.
 - `src/config/`, `src/scope/`, `src/backend/`, `src/privacy/`, `src/outbox/`,
   `src/pi/`, `src/observation/`, `src/retrieval/`, `src/inject/`,
   `src/backup/`, `src/board/`, `src/runtime/`, `src/domain/`: feature modules.
-- `test/`: offline test suite (675 tests), including the fault matrix,
+- `test/`: offline test suite (715 tests), including the fault matrix,
   budget/quality baselines and long-session bounding audits. The live
   integration suite is opt-in: `KIWIFS_LIVE_TESTS=1 npm run test:live`.
 - `scripts/check-package.mjs`: verifies the npm package file allowlist.
@@ -236,9 +297,23 @@ leak. These are documented behavior, not aspirational TODOs.
 - **Board recipient labels are not confidentiality.** Anyone holding the
   shared backend key can read any channel. There are no TTL or push
   primitives; delivery is polling-based.
+- **The `kiwi_changes` HTTP 500 is an observed deployment defect, not an
+  MCP protocol fact.** The reference test deployment used in the T19 live
+  run failed every `kiwi_changes` call with a persistent server-side
+  IsError HTTP 500 whenever the feed had entries. This extension does not
+  claim that every KiwiFS deployment behaves this way; on a healthy feed
+  the fallback described under “Changes-feed degradation” never
+  activates. See `docs/operations.md` for the full behavior.
 - **Coexistence with other memory extensions is untested.**
-- **Not yet published.** No npm release or tag exists; publication happens
-  only after the documented release procedure and explicit approval.
+- **GitHub-only prerelease.** The first beta is distributed only as a
+  GitHub prerelease tag (`v0.1.0-beta.0`), pending explicit user approval;
+  no npm release exists and none is planned for this beta. npm publication
+  is a separate future decision with its own approval gate — see
+  `docs/publishing.md`. The npm publish workflow skips prereleases.
+- **Tested versions.** This beta was tested against Pi 0.85.0, Node.js
+  22.19.0 and 24.19.0, and KiwiFS v0.19.62 (the reference test
+  deployment). Other versions are untested; the npm peer dependency range
+  is open by design, not a compatibility claim.
 
 ## Safety
 

@@ -1,7 +1,7 @@
 # Quality Review — Q01–Q10 acceptance matrix
 
-Working record for the Q01–Q10 code-quality run at HEAD `82eb7fc`
-(+ the uncommitted Q10A docs-sync diff and the Q10D fix below). Each row
+Working record for the Q01–Q10 code-quality run at HEAD `2aecef4`
+(Q01–Q10 complete and committed). Each row
 records: independent review finding → fix applied (if any) → regression
 test that holds the fix. Acceptance is judged on actual re-run evidence on
 this host, not receipt labels.
@@ -9,8 +9,8 @@ this host, not receipt labels.
 ## Evidence basis
 
 - `npm run check` re-run at Q10D (Node v24.19.0): EXIT=0 — typecheck clean,
-  prettier clean, **680/680 tests pass** (675 prior + 5 new Q10D
-  regressions). No skips, no cancellations.
+  prettier clean, **680/680 tests pass** at Q10D (675 prior + 5 new Q10D
+  regressions); re-measured **715/715** after B03–B06 beta-prep additions. No skips, no cancellations.
 - `npm run pack:check`: allowlist OK; packed extension loads in isolated Pi
   RPC, safe offline startup (disabled state, no backend).
 - Node 22.19.0 exact: accepted from the recorded, sha256-verified evidence in

@@ -2515,3 +2515,138 @@ wiring, commands, status surfaces) stays open — not reduced, not claimed.
   push/publication used.
 - Secret scan of explicitly staged files (git add <list>, not -A): only
   benign matches (env-var names, synthetic fixture constants); clean.
+
+## G02 — B04 attempt 1: offline tokenizer harness (GLM-5 candidate)
+
+- Fixed `scripts/tokenizer-eval.mjs` `loadCandidate` to resolve async
+  factory exports (tokkit-glm-adapter exposes only `loadTokkitGlmTokenizer`);
+  no behavior change for direct-export candidates.
+- Offline run (Node v24.19.0):
+  `node scripts/tokenizer-eval.mjs --candidate ./scripts/tokkit-glm-adapter.mjs
+--out tasks/evidence/tokenizer-eval.json` → EXIT 0. Candidate
+  `@cyberlangke/tokkit-glm@1.11.0 glm-5` evaluated: deterministic across
+  repeated passes, no malformed counts, no undefined counts, corpus hash
+  6e3570fc...24ca9, 16 entries + 3 evidence sets. Offline framing offsets
+  vary per set (99/56/37) — stability is a provider-validation result, not
+  asserted offline.
+- Provider comparison NOT run: OPENROUTER_API_KEY absent from environment.
+  Exact blocker recorded; candidate remains UNVALIDATED (no compatibility
+  claimed anywhere). Gate check: `KIWIFS_TOKENIZER_PROVIDER_OPTIN=1
+node scripts/tokenizer-provider-compare.mjs` without `--run` → EXIT 2,
+  refusal message, zero network I/O, no report written. Fail-closed behavior
+  intact; nothing weakened.
+- Not run this attempt: Node 22.19.0 determinism re-run; provider comparison
+  once a key + immediate approval are available (B04b).
+
+## G03 — B05 attempt 1: model eval dry-run (fake transport); real run blocked
+
+- `OPENROUTER_API_KEY` absent from environment → paid 10–20 session run
+  NOT executed. Recorded blocker; nothing faked. Re-run attempt 2/3 after
+  key + immediate user approval (B05 requires approval immediately before
+  the paid run). Real-mode gate verified fail-closed:
+  `node scripts/model-eval.mjs --real` → EXIT 2, refusal message
+  (`KIWIFS_EVAL_OPTIN` required), zero network I/O, no report written.
+- Dry-run (deterministic fake transport, Node v24.19.0):
+  `npm run eval:model:dryrun` → EXIT 0, `passed: true`.
+  Run dir `tasks/evidence/model-eval/5df9d04d97f7142e-dryrun/`
+  (results.jsonl + summary.json, sanitized: ids/scopes/hashes only).
+  Metrics vs frozen thresholds `b05-thresholds-v1`: precision 0.9 (≥0.7),
+  recall 1.0 (≥0.7), duplicateRate 0.1 (≤0.2), conflictClassified 1.0
+  (≥0.6), forbiddenScopeLeakage 0 (=0), secretCanaryTransmissions 0 (=0),
+  malformedRecovery 1.0 (≥0.5), meanCalls/session 1.08 (≤6). Model slug
+  `openrouter/z-ai/glm-5.3-flash`, transport `fake`, cost estimate $0.000234
+  (simulated). Canaries: zero transmissions in every record.
+- `node --test test/model-eval.test.ts` → 14 pass / 0 fail.
+- FINDING (for G03 attempt 2 or user decision): corpus fixture file
+  `test/fixtures/beta-eval/sessions.json` was modified after the two prior
+  dry-runs (mtime 15:32:33 vs run outputs 15:32:32), so corpusHash changed
+  (591d15a42dab3646 → 5df9d04d97f7142e) WITHOUT an `EVAL_CONFIG_VERSION`
+  bump. Per the harness's own re-freeze rule, EVAL_CONFIG_VERSION must be
+  bumped and the frozen corpus re-committed before any paid run. No paid
+  run has occurred, so thresholds are still pre-frozen; flag only.
+- Not run: real OpenRouter evaluation (key absent); no B09-blocking claim
+  is made from dry-run metrics alone — synthetic dry-run is harness
+  mechanics only, not model quality evidence.
+
+## G04 — B06 attempt 1: live KiwiFS revalidation at candidate SHA
+
+- Command: `KIWIFS_LIVE_TESTS=1 KIWIFS_CANDIDATE_SHA=2aecef4e127cc38fa0fcfb5fec1b86d8785a5bb3 npm run test:live`
+  (ignored local config consumed programmatically, never read or printed).
+- EXIT 5 = clean-pass-with-degradations. Sole degradation is the
+  enumerated `kiwi_changes` HTTP 500 on the reference test deployment
+  (`capabilityFingerprint cbbdedc89a8814e6`); offline contract remains
+  pinned by fixtures. Accepted per plan exit-5 rule.
+- Covered: MCP init + 71 tools advertised, required tools present,
+  routing/sentinel isolation check, CRUD round-trip with read-back,
+  hybrid attribution (keyword only, degraded disclosed), delete +
+  post-delete absence. Manifest-owned cleanup: all deleted.
+- Independent cleanup inspection (separate script, config programmatic):
+  FTS search under `integration-tests/` prefix → 0 remaining run-owned
+  records; direct read of run record
+  `integration-tests/47fee4254ec2/round-trip.md` → `missing`.
+- Sanitized report archived:
+  `tasks/evidence/g04-live-runner-report.json` (timestamp, candidate SHA,
+  runner version, capability fingerprint, cleanup verification). No
+  production request; non-owned sentinel untouched; no secrets, paths
+  beyond run-owned prefix, headers, or endpoints in the report.
+- Blockers: none for this task. Note: paid eval (G03/B05) still blocked
+  on API key + approval (separate task).
+
+## G03 — B09a attempt 1: version bump, release-notes finalization, pack gates
+
+- Set `package.json` / `package-lock.json` version to `0.1.0-beta.0`
+  (lockfile via `npm install --package-lock-only`; pre-existing tokkit
+  devDependency entries preserved).
+- Bumped `DEFAULT_RUNNER_VERSION` in `src/backend/live/runner.ts` to
+  `0.1.0-beta.0` per B09 acceptance criteria.
+- Finalized `docs/release-notes-0.1.0-beta.0.md` from actual evidence only:
+  install command pinned to `github:fazekasda/pi-kiwifs-memory@v0.1.0-beta.0`;
+  evidence summary filled from `g04-live-runner-report.json` (live pass with
+  enumerated kiwi_changes HTTP 500 degradation, cleanup 0 leftovers),
+  `tokenizer-eval.json` (offline-only; candidate REJECTED for automatic
+  injection, fail-closed kept), model-eval dry-run-only status (no real paid
+  run, no quality claim), and B07 automated passes with human TUI sign-off
+  still pending. Tokenizer known-limitation bullet aligned with the rejection.
+- Updated `docs/beta-privacy.md` "Release status" caveat to the current
+  validation state (B04–B07 outcomes above; still no tag, B10 approval
+  required).
+- `npm pack --dry-run`: 68 files, version 0.1.0-beta.0, no tasks/, scripts/
+  eval harnesses, test config, or credentials in the tarball.
+- `npm run pack:check` and `node scripts/check-package.mjs`: PASS (exit 0).
+- `npm run check`: PASS (typecheck + prettier + 715 tests / 0 fail). Two
+  pre-existing unformatted evidence/log files fixed with prettier --write
+  (formatting only); regenerated t19-budget-report.json jitter reverted
+  per the established jitter-only pattern. `git diff --check`: clean.
+- Not done here (remain B09/B10 scope): exact-Node 22.19.0/24 re-checks at
+  the final candidate, independent review sign-off, tag/release creation.
+- `src/backend/transport.ts:86` still hardcodes client version `"0.1.0"`
+  (not named in B09 criteria) — flagged as follow-up.
+
+## G03 — B09b attempt 1: one reviewed beta-prep commit + approval/blocker bundle
+
+- Final review verdict was NO-GO with 4 blockers. Commit-assigned portion
+  fixed here: the entire intentional beta-prep tree (B01–B09a outputs:
+  beta docs, eval harnesses + evidence, B03 disclosure, B09a version +
+  runner bump, blocker bundle) committed as ONE reviewed commit; the
+  `0.1.0-beta.0` package/lockfile bump and `DEFAULT_RUNNER_VERSION` bump
+  are in that same commit per B09 criteria.
+- `tasks/evidence/t19-budget-report.json` jitter (regenerated by the
+  budget test during gate runs) reverted before the commit; documented
+  that post-commit regeneration is expected and never staged.
+- Gates re-run on the final tree (record:
+  `tasks/evidence/b09-local-gates-at-commit.md`): `npm run check` PASS
+  (715/715, 63.3s), `npm run pack:check` PASS (exit 0), `devenv test`
+  PASS (78.3s). `git diff --check` clean.
+- Approval/blocker bundle written:
+  `tasks/evidence/b09-blocker-bundle.md`. B09 NOT complete — pending
+  recorded outcomes for: (1) B05 real paid model run on route
+  `openrouter/z-ai/glm-5.3-flash` (key + immediate approval + threshold
+  re-freeze + corpus re-freeze) OR a recorded user scope-narrowing
+  decision; (2) optional B04b paid provider comparison (reject record
+  already stands in release notes; fail-closed kept); (3) B07 human TUI
+  sign-off (checklist ready, verdict blank); (4) B02/B09 push + review
+  PR, remote CI on the candidate SHA, GitHub rulesets/release
+  environment, and live re-run at the final candidate SHA.
+- Not done: no push, no tag, no GitHub release, no npm action, no
+  production contact, no ignored config read or printed. No commit was
+  made for anything outside the beta-prep tree.

@@ -21,3 +21,6 @@ dist/
 .npmrc
 config/kiwifs-test.local.json
 .DS_Store
+
+# B05 model-eval paid-run output (generated, never committed)
+tasks/evidence/model-eval/
