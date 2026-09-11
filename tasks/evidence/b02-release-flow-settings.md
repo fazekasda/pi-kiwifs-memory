@@ -40,32 +40,29 @@ PR: https://github.com/fazekasda/pi-kiwifs-memory/pull/4 (`beta/0.1.0-beta.0` �
   `if: ${{ !github.event.release.prerelease }}` (unchanged; verified in the
   candidate tree).
 
-## Manual blocker: `v*` tag ruleset
+## Ruleset `release-tags-protected` (id 22926960, target `tag`, enforcement `active`)
 
-The REST API rejected every attempt to create a `push`-target ruleset scoped to
-`refs/tags/v*` on this repository:
+Created via `POST /repos/fazekasda/pi-kiwifs-memory/rulesets` using
+`"target": "tag"` (not `push`). An earlier attempt with target `push` was
+rejected by the API (HTTP 422, `Target ref_name is not supported for push
+rulesets`); the `tag` target accepted the same condition and rules.
 
-- `POST /repos/fazekasda/pi-kiwifs-memory/rulesets` with
-  `conditions.ref_name.include = ["refs/tags/v*"]` (and variants `v*`,
-  `refs/tags/*`, `~ALL` + exclude `refs/heads/*`) returns HTTP 422:
-  `Target ref_name is not supported for push rulesets`.
-- An unscoped `push` ruleset was rejected rather than created: it would also
-  block branch deletion/force-pushes repo-wide, which is broader than the plan
-  calls for. (Also observed HTTP 500 from the API for `push` rulesets with a
-  `ref` conditions key.)
+- Applies to `refs/tags/v*` (include only; exclude empty).
+- Rules:
+  - `deletion` — protected tags cannot be deleted.
+  - `non_fast_forward` — protected tags cannot be moved to a different commit.
+- Bypass actors: none (`bypass_actors: []`, `current_user_can_bypass: never`).
+- Branch impact: none. The ruleset targets `tag` only and its ref condition
+  matches only `refs/tags/v*`; it does not apply to any branch ref.
+- Verified by read-back: `GET /repos/fazekasda/pi-kiwifs-memory/rulesets/22926960`
+  returns the identical definition above (name, target `tag`, enforcement
+  `active`, include `refs/tags/v*`, both rules, empty bypass list).
 
-Exact manual step (repo owner, Settings → Rules → Rulesets → New ruleset →
-"Push ruleset"):
-
-1. Name: `release-tags-protected`.
-2. Enforcement: Active. Bypass list: empty.
-3. Target condition: ref name includes `refs/tags/v*`.
-4. Rules: `Restrict deletions`, `Restrict updates` (no allowed actors).
-5. Save. Read-back: `GET /repos/fazekasda/pi-kiwifs-memory/rulesets` should list
-   it with target `push`.
-
-If the web UI also refuses the `refs/tags/v*` condition, fall back to a legacy
-tag protection (`refs/tags/v*`) if still offered, and record the outcome here.
+Follow-up from earlier attempt now closed: the manual web-UI step previously
+recorded here is no longer needed. Deletion/update restriction should still be
+smoke-tested with a disposable `vtest-*` tag (rename `vtest-*` → matches the
+condition only for `v*` prefixed names; a disposable `vtest-*` tag does match
+`refs/tags/v*`).
 
 ## CI status at record time
 
@@ -83,8 +80,8 @@ tag protection (`refs/tags/v*`) if still offered, and record the outcome here.
 
 1. Commit and push the prettier fix to `beta/0.1.0-beta.0`; confirm all three
    required checks pass against the new head SHA.
-2. Create the `release-tags-protected` push ruleset via the web UI (steps above)
-   and read it back.
+2. ~~Create the `release-tags-protected` push ruleset via the web UI~~ — done via
+   API with target `tag` (id 22926960), see above.
 3. Optional hardening: set `prevent_self_review: true` on the `release`
    environment once a second reviewer exists; today the sole reviewer can
    self-approve, which is noted but not weakened.
