@@ -3,6 +3,29 @@
 Research checked on 2026-09-08 against installed Pi 0.85.0 documentation,
 the Pi package catalog, devenv documentation, and npm documentation.
 
+## Beta release status (v0.1.0-beta.0)
+
+The first release is a **GitHub-only prerelease**, created only after the
+beta release plan's gates pass and with explicit user approval (plan task
+B10 in `tasks/beta-release-plan.md`). For this beta:
+
+- Install reference: the Git tag `v0.1.0-beta.0`
+  (`pi install git:github.com/fazekasda/pi-kiwifs-memory@v0.1.0-beta.0`),
+  not `main` and not an npm name.
+- **npm publication is out of scope and future-only.** No npm version,
+  dist-tag, or registry action happens under the beta plan. Any later npm
+  beta is a separate decision after beta feedback (plan task B11), with
+  its own approval gate.
+- The `publish.yml` workflow skips GitHub prereleases by design; a push to
+  `main` alone never publishes to npm. A prerelease does not enter the
+  npm publish job.
+- Install from the immutable tag, not a moving ref; see
+  `docs/rollback.md` for upgrade/downgrade steps that preserve pending
+  outbox work.
+
+The sections below describe the eventual npm publication path, kept for
+that future decision.
+
 ## What the Pi extension repository means
 
 Pi distributes extensions as **Pi packages** through npm or Git. The official
@@ -57,13 +80,16 @@ Nix build and can need network access. `direnv allow` approves this checkout's
 shell configuration. No global Nix or shell configuration is modified by this repo.
 
 CI tests Node 22.19.0 and Node 24, then separately runs `devenv test` on Linux.
+Exact tested versions for the beta are Pi 0.85.0, Node.js 22.19.0 and
+24.19.0, and KiwiFS v0.19.62; see the README's tested-versions note.
 Action references use commit SHAs. Dependabot proposes npm and action updates.
 Update Nix inputs deliberately with `devenv update`, run `devenv test`, then commit
 the changed lockfile. Keep the devenv CLI version in CI and README aligned.
 
 ## Before the first release
 
-1. Implement and test the intended memory behavior. The current version is only a scaffold.
+1. The extension implements and tests the intended memory behavior (see
+   `tasks/prd-kiwifs-memory.md`, tasks T01–T20).
 2. Confirm npm account ownership of the `@fazekasda` scope and check name availability.
 3. Enable npm two-factor authentication.
 4. Run `devenv test` and review `npm run pack:check` output.
@@ -89,7 +115,7 @@ npm publish --access public
 Complete npm's interactive authentication and 2FA prompts. `prepublishOnly` runs
 checks first, including a packed-extension RPC smoke test with isolated settings
 and no provider credentials. The smoke test requires `tar`, provided by the Nix
-shell and Linux CI runners. This publication was not performed during scaffold setup.
+shell and Linux CI runners. No publication has been performed as of T20.
 
 After initial publication, create its matching Git tag if needed, but do not publish
 a GitHub release for that already-published version with the automated job enabled.

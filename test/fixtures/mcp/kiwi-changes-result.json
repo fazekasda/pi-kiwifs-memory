@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 24,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Changes since 4b81ce2 (limit 50):\n- M project/demo-proj/memory/observations/2026/02/obs-0002.md (actor: mcp-agent, 2026-02-08T11:04:11Z)\n- D project/demo-proj/memory/observations/2026/01/obs-0009.md (actor: mcp-agent, 2026-02-08T11:05:03Z)\n\nlast_seq: c91d0a4"
+      }
+    ]
+  }
+}

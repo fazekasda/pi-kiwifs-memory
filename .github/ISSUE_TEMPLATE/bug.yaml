@@ -1,0 +1,58 @@
+name: General bug report
+description: >-
+  Anything broken that does not fit the privacy, data-loss, or backend
+  categories — CLI commands, TUI behavior, install issues, model calls.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never include** in this issue: credentials, tokens, backend URLs
+        that contain credentials, configuration files, raw session
+        transcripts, or stored memory contents. Sanitize everything before
+        pasting.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Extension commit or version, Pi version, Node.js version, and KiwiFS backend version if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce (sanitized)
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: >-
+        Log excerpts or command output with credentials, tokens, URLs
+        with credentials, and memory contents removed. Do not paste full
+        transcripts.
+  - type: checkboxes
+    id: attestation
+    attributes:
+      label: Sanitization attestation
+      options:
+        - label: >-
+            This report contains no credentials, tokens, config files,
+            raw transcripts, stored memory contents, or credentialed
+            backend URLs.
+          required: true

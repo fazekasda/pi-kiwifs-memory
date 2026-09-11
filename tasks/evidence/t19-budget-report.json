@@ -1,0 +1,82 @@
+{
+  "synthetic": true,
+  "liveServices": false,
+  "modelCalls": false,
+  "limitations": [
+    "synthetic tokenizer is NOT production-model-compatible (word/punct fixture)",
+    "extraction model is a scripted stub — scheduling/coverage/volume only, NOT observation quality"
+  ],
+  "latency50msPerCall": {
+    "runs": [
+      964,
+      959,
+      959,
+      959,
+      960
+    ],
+    "budgetDeadlineMs": 2000,
+    "unit": "ms"
+  },
+  "latencyBaselineZeroDelayNote": "50 ms simulated per-request backend latency applied to every fake-server call (guard read-backs included)",
+  "deadlineEnforcement": {
+    "backendDelayMs": 600,
+    "configuredDeadlineMs": 400,
+    "measuredElapsedMs": 401,
+    "outcome": "degraded (deadline exceeded, nothing injected)"
+  },
+  "contextUsage": {
+    "tokenizerId": "synthetic-word-punct-v1 (NOT model-compatible; test fixture)",
+    "tokenCap": 3000,
+    "recordsOffered": 8,
+    "wordsPerRecord": 400,
+    "itemsKept": 6,
+    "tokenCount": 2645,
+    "framingBaselineTokens": 25
+  },
+  "extraction": {
+    "thresholdTrigger": "12 turns (≥10-turn threshold)",
+    "batches": 1,
+    "modelCalls": 1,
+    "entriesInBatch": 12,
+    "inputBudgetTokens": 6000,
+    "outputBudgetTokens": 3000
+  },
+  "extractionSplit": {
+    "entries": 60,
+    "batch1Entries": 33,
+    "batch2Entries": 27,
+    "modelCalls": 2,
+    "unionCoverage": "complete, disjoint"
+  },
+  "queueCap": {
+    "maxPendingBatches": 2,
+    "batchesFed": 5,
+    "entriesTotal": 60,
+    "acceptedEntries": 12,
+    "pendingBatchCount": 2,
+    "coverage": "accepted ∪ pending == all entries, disjoint (merge-into-oldest, nothing dropped)"
+  },
+  "repeatSettleCallVolume": {
+    "settles": 6,
+    "modelCalls": 1,
+    "expectation": "one call per unique source range; repeats cost zero calls"
+  },
+  "failureCoverage": {
+    "attempts": 1,
+    "opIdStable": true,
+    "durableCoverage": "12/12 entries retained"
+  },
+  "nodeVersion": "v24.19.0",
+  "retrievalFixtures": {
+    "QF-R1": "positive in-scope recall — exact path set r1-a/r1-b/r1-c in FTS score order",
+    "QF-R2": "scope precision — out-of-scope candidate guard-rejected (scope step), zero cross-scope items",
+    "QF-R3": "superseded exclusion — guard-rejected (status step), zero superseded items",
+    "QF-R4": "keyword-only hybrid attribution disclosed as degraded, never counted as semantic",
+    "QF-R5": "empty result set → empty pack + visible note, no fabrication",
+    "QF-C1": "one batch under the 6,000-token input budget with FULL source coverage",
+    "QF-C2": "budget overflow splits into disjoint batches; union coverage complete",
+    "QF-C3": "queue cap merges overflow into the oldest batch; no entry lost",
+    "QF-C4": "repeated settles over the same coverage cost zero model calls",
+    "QF-C5": "failed extraction retains the SAME opId and full durable coverage"
+  }
+}

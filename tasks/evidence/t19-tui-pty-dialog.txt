@@ -1,0 +1,39 @@
+T18 live TUI confirm-dialog gate — CLOSED via automated PTY harness (T19 chunk 3).
+AUTOMATED EVIDENCE — not human manual signoff.
+Harness: herdr sidecar pane (real PTY terminal), pi v0.85.0 TUI, isolated env
+(HOME/PI_CODING_AGENT_DIR/KIWIFS_MEMORY_STATE_DIR under a temp dir), synthetic
+config (mcp.url = unreachable loopback port 9; auth = env ref of a dummy token;
+projectIdentity = t19-tui-gate.synthetic/local), extension loaded from
+src/index.ts via -e; --no-session --no-extensions (discovery) etc.
+Zero model calls (no prompt sent); zero real services reachable; state dir
+deleted after evidence capture.
+
+[1] Command typed: /kiwifs-forget integration-tests/t19-tui-gate/synthetic.md
+    Dialog rendered in the live TUI (verbatim from ANSI snapshot):
+
+        Forget memory record
+        Mark integration-tests/t19-tui-gate/synthetic.md
+        superseded? Body is preserved; reversible via
+        /kiwifs-forget-undo.
+
+        → Yes
+          No
+
+        ↑↓ navigate  enter select  escape/ctrl+c cancel
+
+[2] Explicit cancel interaction: down + enter → TUI notification verbatim:
+        forget cancelled
+    No backend call attempted on the cancel path.
+
+[3] Explicit confirm interaction (command re-run, dialog re-rendered, enter on
+    "Yes"): the gated action executed and failed safely against the synthetic
+    unreachable backend; Pi's sanitized extension-error rendering (verbatim):
+        Extension "command:kiwifs-forget" error:
+        transport fault: fetch failed
+    No URL, credential or record content in the error; nothing mutated (the
+    target record never existed anywhere; the backend endpoint is a dead
+    loopback port).
+
+Interaction was driven with herdr pane send-keys (down/enter) after visually
+reading the rendered dialog via herdr pane read --ansi; wait-output guards
+bounded every step. All captures automated.

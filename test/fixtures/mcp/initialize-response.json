@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": { "tools": {}, "resources": {} },
+    "serverInfo": { "name": "kiwifs", "version": "1.0.0" }
+  }
+}

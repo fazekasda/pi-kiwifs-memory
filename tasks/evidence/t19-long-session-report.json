@@ -1,0 +1,171 @@
+{
+  "synthetic": true,
+  "liveServices": false,
+  "modelCalls": false,
+  "limitations": [
+    "extraction model is a scripted stub — state bounding and handle cleanup only, NOT observation quality",
+    "retrieval tokenizer is the synthetic word fixture — NOT production-model-compatible",
+    "handle evidence: process.getActiveResourcesInfo() counts plus a child-process natural-drain exit"
+  ],
+  "longSession": {
+    "cycles": 60,
+    "reloadEpochs": 4,
+    "turnsExtracted": 120,
+    "snapshots": [
+      {
+        "cycle": 10,
+        "outboxJobsBytes": 3334,
+        "outboxRetainedBytes": 3335,
+        "observerStateBytes": 40,
+        "coordinatorStateBytes": 208,
+        "backupStateBytes": 1858,
+        "deliveryStateBytes": 443,
+        "outboxJobs": {
+          "pending": 0,
+          "quarantined": 0,
+          "acked": 1,
+          "bytes": 3335,
+          "paused": false
+        },
+        "observerPendingBatches": 0,
+        "coordinatorConsumedEntries": 20
+      },
+      {
+        "cycle": 20,
+        "outboxJobsBytes": 5924,
+        "outboxRetainedBytes": 5925,
+        "observerStateBytes": 40,
+        "coordinatorStateBytes": 328,
+        "backupStateBytes": 3598,
+        "deliveryStateBytes": 443,
+        "outboxJobs": {
+          "pending": 0,
+          "quarantined": 0,
+          "acked": 1,
+          "bytes": 5925,
+          "paused": false
+        },
+        "observerPendingBatches": 0,
+        "coordinatorConsumedEntries": 40
+      },
+      {
+        "cycle": 30,
+        "outboxJobsBytes": 8514,
+        "outboxRetainedBytes": 8515,
+        "observerStateBytes": 40,
+        "coordinatorStateBytes": 448,
+        "backupStateBytes": 5338,
+        "deliveryStateBytes": 443,
+        "outboxJobs": {
+          "pending": 0,
+          "quarantined": 0,
+          "acked": 1,
+          "bytes": 8515,
+          "paused": false
+        },
+        "observerPendingBatches": 0,
+        "coordinatorConsumedEntries": 60
+      },
+      {
+        "cycle": 40,
+        "outboxJobsBytes": 11105,
+        "outboxRetainedBytes": 11106,
+        "observerStateBytes": 40,
+        "coordinatorStateBytes": 568,
+        "backupStateBytes": 7078,
+        "deliveryStateBytes": 443,
+        "outboxJobs": {
+          "pending": 0,
+          "quarantined": 0,
+          "acked": 1,
+          "bytes": 11106,
+          "paused": false
+        },
+        "observerPendingBatches": 0,
+        "coordinatorConsumedEntries": 80
+      },
+      {
+        "cycle": 50,
+        "outboxJobsBytes": 13695,
+        "outboxRetainedBytes": 13696,
+        "observerStateBytes": 40,
+        "coordinatorStateBytes": 689,
+        "backupStateBytes": 8818,
+        "deliveryStateBytes": 443,
+        "outboxJobs": {
+          "pending": 0,
+          "quarantined": 0,
+          "acked": 1,
+          "bytes": 13696,
+          "paused": false
+        },
+        "observerPendingBatches": 0,
+        "coordinatorConsumedEntries": 100
+      },
+      {
+        "cycle": 60,
+        "outboxJobsBytes": 16285,
+        "outboxRetainedBytes": 16286,
+        "observerStateBytes": 40,
+        "coordinatorStateBytes": 829,
+        "backupStateBytes": 10558,
+        "deliveryStateBytes": 443,
+        "outboxJobs": {
+          "pending": 0,
+          "quarantined": 0,
+          "acked": 1,
+          "bytes": 16286,
+          "paused": false
+        },
+        "observerPendingBatches": 0,
+        "coordinatorConsumedEntries": 120
+      }
+    ],
+    "final": {
+      "outboxJournalBytes": 16285,
+      "outboxStats": {
+        "pending": 0,
+        "quarantined": 0,
+        "acked": 1,
+        "bytes": 16286,
+        "paused": false
+      },
+      "observerStateBytes": 40,
+      "observerPendingBatches": 0,
+      "coordinatorStateBytes": 829,
+      "coordinatorConsumedEntries": 120,
+      "backupStateBytes": 10558,
+      "deliveryStateBytes": 443,
+      "deliveryTrackedEntries": 2,
+      "boardMessagesDeliveredOnce": 2
+    },
+    "growthNote": "outbox journal / observer state / delivery state are BOUNDED (retention, 20-batch cap, 2,000-entry dedupe cap). session-coordinator.json's consumed-coverage registry and backup-state.json's manifest grow PROPORTIONALLY to consumed entries / captured content by design (coverage correctness — architecture.md §3.3, decisions.md #8); they are per-session state bounded by session length, not unbounded leaks",
+    "handleAuditInProcess": {
+      "baselineResources": {
+        "PipeWrap": 2
+      },
+      "beforeShutdownResources": {
+        "PipeWrap": 2,
+        "Timeout": 1
+      },
+      "afterShutdownResources": {
+        "PipeWrap": 2
+      },
+      "coordinatorTimerStopped": true,
+      "consumerLockReleased": true,
+      "closedStoreRefusesWork": true,
+      "consumerIdReacquirable": true
+    }
+  },
+  "childDrain": {
+    "child": "test/fixtures/t19-long-session-child.ts",
+    "cycles": 10,
+    "reloadEpochs": 3,
+    "resourcesAtDrain": {
+      "PipeWrap": 1
+    },
+    "coordinatorTimerStopped": true,
+    "consumerLockReleased": true,
+    "note": "child exited by draining: no ref'd timer, interval or socket survives session_shutdown"
+  }
+}

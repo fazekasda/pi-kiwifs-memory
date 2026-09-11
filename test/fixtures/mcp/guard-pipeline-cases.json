@@ -1,0 +1,89 @@
+{
+  "cases": [
+    {
+      "name": "guard-1-read-back-missing",
+      "step": 1,
+      "candidate": "project/demo-proj/memory/observations/2026/02/gone.md",
+      "behavior": "fresh kiwi_read returns isError (missing path)",
+      "expect": "reject",
+      "citation": "mcp-contracts.md §8 step 1; fixture kiwi-read-iserror-missing-path.json"
+    },
+    {
+      "name": "guard-2-superseded-status",
+      "step": 2,
+      "candidate": "project/demo-proj/memory/observations/2026/02/obs-0003.md",
+      "readBack": {
+        "frontmatter": {
+          "scope": "project/demo-proj",
+          "memory_status": "superseded"
+        }
+      },
+      "behavior": "content exists but memory_status is superseded (kiwi_forget preserves the body)",
+      "expect": "reject",
+      "citation": "mcp-contracts.md §8 step 2; memory_tools.go:108-153; fixture kiwi-forget-page.md"
+    },
+    {
+      "name": "guard-2-unknown-status",
+      "step": 2,
+      "candidate": "project/demo-proj/memory/observations/2026/02/obs-0004.md",
+      "readBack": {
+        "frontmatter": {
+          "scope": "project/demo-proj",
+          "memory_status": "quarantined"
+        }
+      },
+      "behavior": "memory_status is neither absent nor active",
+      "expect": "reject",
+      "citation": "mcp-contracts.md §8 step 2 (absent/active only)"
+    },
+    {
+      "name": "guard-3-out-of-scope",
+      "step": 3,
+      "candidate": "project/other-proj/memory/observations/2026/02/obs-0042.md",
+      "readBack": { "frontmatter": { "scope": "project/other-proj" } },
+      "authorizedScopeSet": ["project/demo-proj", "personal"],
+      "behavior": "read-back $.scope not in the session's authorized scope set (the only gate on hybrid/brief legs)",
+      "expect": "reject",
+      "citation": "mcp-contracts.md §8 step 3; fixture kiwi-brief-result.json (out-of-scope page)"
+    },
+    {
+      "name": "guard-4-path-escape",
+      "step": 4,
+      "candidate": "project/demo-proj/backup/session-1/000001.md",
+      "readBack": { "frontmatter": { "scope": "project/demo-proj" } },
+      "behavior": "path is outside the scope's memory/ namespace (raw backup chunk surfacing in recall)",
+      "expect": "reject",
+      "citation": "mcp-contracts.md §8 step 4"
+    },
+    {
+      "name": "guard-5-redaction-required",
+      "step": 5,
+      "candidate": "project/demo-proj/memory/observations/2026/02/obs-0005.md",
+      "readBack": {
+        "frontmatter": {
+          "scope": "project/demo-proj",
+          "memory_status": "active"
+        },
+        "body": "Deploy key is SYNTHETIC-SECRET-0000-DEADBEEF for the fixture environment."
+      },
+      "behavior": "content passes all gates but contains a secret pattern; privacy redaction must transform or reject before injection",
+      "expect": "redact-or-reject",
+      "citation": "mcp-contracts.md §8 step 5; decisions.md #10"
+    },
+    {
+      "name": "guard-cache-miss-never-permits",
+      "step": "advisory",
+      "candidate": "project/demo-proj/memory/observations/2026/02/obs-0003.md",
+      "readBack": {
+        "frontmatter": {
+          "scope": "project/demo-proj",
+          "memory_status": "superseded"
+        }
+      },
+      "tombstoneCache": "empty and stale (no entry for the candidate)",
+      "behavior": "tombstone cache is advisory only; the read-back status check is the gate, so a cache miss cannot permit injection",
+      "expect": "reject",
+      "citation": "mcp-contracts.md §8; architecture-review.md F7"
+    }
+  ]
+}

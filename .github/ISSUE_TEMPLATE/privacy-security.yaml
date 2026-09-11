@@ -1,0 +1,80 @@
+name: Privacy or security concern
+description: >-
+  Suspected data exposure, scope leakage, redaction failure, or other
+  privacy/security problem. Not for general bugs.
+title: "[privacy] "
+labels: ["privacy"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you continue**
+
+        - If this report describes a vulnerability that could harm other
+          users (for example, a way to leak other users' records), **do not
+          post it here**. Use GitHub private vulnerability reporting
+          (Security tab → "Report a vulnerability") as described in
+          [SECURITY.md](../blob/main/SECURITY.md).
+        - **Never include** in this issue: credentials, tokens, backend
+          URLs that contain credentials, configuration files, raw session
+          transcripts, stored memory contents, or any other private data.
+          Describe the problem in sanitized terms only.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Sanitized description. Do not paste real memory or session content.
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Suspected scope leakage (records seen from the wrong scope)
+        - Redaction failure (unredacted sensitive content observed)
+        - Forgetting/deletion did not behave as documented
+        - Private mode did not hold all reads/writes
+        - Backup or export exposed content unexpectedly
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: >-
+        Extension commit or version, Pi version (`pi --version`), Node.js
+        version, and KiwiFS backend version if applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce (sanitized)
+      description: >-
+        Reproduce with synthetic placeholders like `<REDACTED>` instead of
+        real content. If reproduction requires real private data, say so
+        without including it and suggest how a maintainer could reproduce
+        it synthetically.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: >-
+        Relevant log excerpts with credentials, tokens, URLs with
+        credentials, and memory contents removed. Do not paste full
+        transcripts.
+  - type: checkboxes
+    id: attestation
+    attributes:
+      label: Sanitization attestation
+      options:
+        - label: >-
+            This report contains no credentials, tokens, config files,
+            raw transcripts, stored memory contents, or credentialed
+            backend URLs.
+          required: true

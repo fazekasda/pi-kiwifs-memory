@@ -1,0 +1,50 @@
+{
+  "description": "T06 redaction cases: outbound content samples (with embedded synthetic secrets) and the expected finding types. Post-conditions are asserted in test/privacy.test.ts.",
+  "cases": [
+    {
+      "name": "api key embedded in prose",
+      "input": "Use this key for the deploy: sk-synthetic0123456789abcdefghijklmnopqrst and keep it secret.",
+      "expectTypes": ["api-key"]
+    },
+    {
+      "name": "credentials in a connection URL",
+      "input": "connect with postgres://synuser:synpass0123456789@db.example.test:5432/syn",
+      "expectTypes": ["credential-url"]
+    },
+    {
+      "name": "JWT in a header sample",
+      "input": "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c",
+      "expectTypes": ["bearer-token"]
+    },
+    {
+      "name": "PEM private key block",
+      "input": "cert:\n-----BEGIN RSA PRIVATE KEY-----\nMII synthetic body line\nFAKEFAKEFAKEFAKEFAKE=\n-----END RSA PRIVATE KEY-----\nend cert",
+      "expectTypes": ["private-key-block"]
+    },
+    {
+      "name": "key=value assignment",
+      "input": "in config.toml: password = synth3t1c-passw0rd-value",
+      "expectTypes": ["key-value-assignment"]
+    },
+    {
+      "name": "aws access key",
+      "input": "exported AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE for the sandbox",
+      "expectTypes": ["aws-access-key"]
+    },
+    {
+      "name": "unpatterned high-entropy token",
+      "input": "the service returned Zm8qX9dL2wQe7Rt5vNh1Jc4Yb6Uk3Sa8Pi0Gd5Mf on request",
+      "expectTypes": ["high-entropy"]
+    },
+    {
+      "name": "benign prose passes untouched",
+      "input": "Fixed the flaky retry test by seeding the random jitter source deterministically.",
+      "expectTypes": []
+    },
+    {
+      "name": "multiple secrets in one payload",
+      "input": "ghp_synthetic0000000000000000000000000001 and xoxb-synthetic-123456-abcdef leaked into the log paste",
+      "expectTypes": ["github-token", "slack-token"]
+    }
+  ]
+}

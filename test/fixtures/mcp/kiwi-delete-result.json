@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 15,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Deleted integration-tests/run-fixture/demo/observations/2026/02/obs-0001.md (committed 4b81ce2)"
+      }
+    ]
+  }
+}

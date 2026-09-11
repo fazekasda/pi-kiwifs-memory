@@ -1,0 +1,22 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      { "name": "kiwi_read", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_write", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_append", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_delete", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_search", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_search_semantic", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_search_hybrid", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_brief", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_changes", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_query_meta", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_remember", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_forget", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_health_check", "inputSchema": { "type": "object" } },
+      { "name": "kiwi_canvas_edit", "inputSchema": { "type": "object" } }
+    ]
+  }
+}

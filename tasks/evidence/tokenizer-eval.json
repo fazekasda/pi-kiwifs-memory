@@ -1,0 +1,61 @@
+{
+  "task": "B04a",
+  "scope": "offline deterministic corpus evaluation; provider comparison NOT performed",
+  "node": "v24.19.0",
+  "corpusHash": "6e3570fca65cd4aa1b065e05267af137dae4680379b6866b71d4e5cf3ee24ca9",
+  "reference": {
+    "tokenizerId": "synthetic-word-punct-v1 (NOT model-compatible; test fixture)",
+    "deterministic": true,
+    "aggregate": {
+      "totalRawTokens": 3155,
+      "minEntryTokens": 8,
+      "maxEntryTokens": 2640,
+      "undefinedCounts": 0,
+      "framingOffsets": [
+        {
+          "set": "mixed-3",
+          "offset": 100
+        },
+        {
+          "set": "long-single",
+          "offset": 54
+        },
+        {
+          "set": "empty",
+          "offset": 35
+        }
+      ],
+      "framingOffsetsStable": false
+    }
+  },
+  "candidate": {
+    "status": "evaluated",
+    "tokenizerId": "@cyberlangke/tokkit-glm@1.11.0 glm-5 (CANDIDATE — not validated)",
+    "corpusHash": "6e3570fca65cd4aa1b065e05267af137dae4680379b6866b71d4e5cf3ee24ca9",
+    "entryCount": 16,
+    "evidenceSetCount": 3,
+    "deterministic": true,
+    "malformed": [],
+    "aggregate": {
+      "totalRawTokens": 3426,
+      "minEntryTokens": 11,
+      "maxEntryTokens": 2820,
+      "undefinedCounts": 0,
+      "framingOffsets": [
+        {
+          "set": "mixed-3",
+          "offset": 99
+        },
+        {
+          "set": "long-single",
+          "offset": 56
+        },
+        {
+          "set": "empty",
+          "offset": 37
+        }
+      ],
+      "framingOffsetsStable": false
+    }
+  }
+}

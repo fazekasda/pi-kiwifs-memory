@@ -1,10 +1,183 @@
 # pi-kiwifs-memory
 
-Development scaffold for a KiwiFS memory extension for [Pi](https://pi.dev).
+A KiwiFS memory extension for [Pi](https://pi.dev). It connects a running
+KiwiFS service to Pi sessions and provides the following features (three
+opt-in feature domains — observation, backup, board — plus retrieval):
 
-Only `/kiwifs-status` exists today. It reports that the extension loaded.
-Memory storage, retrieval, and KiwiFS integration are not implemented.
-The command makes no network requests and writes no files.
+- **Observational memory.** After agent responses settle, unprocessed turns
+  are batched and sent to a configurable model (default
+  `openrouter/z-ai/glm-5.3-flash`) for observation extraction. Writes go
+  through a durable local outbox, so Pi keeps working during backend
+  outages and nothing pending is dropped. Reflection summaries and
+  duplicate/merge proposals are generated over accepted records; merge
+  proposals apply only after explicit approval.
+- **Retrieval.** Each eligible user input triggers one bounded retrieval
+  cycle (2 s total deadline by default) across the authorized scopes. Up to
+  3,000 tokens of read-back-verified, redacted evidence is injected as
+  untrusted, source-labeled data. The agent also gets explicit tools:
+  `kiwifs_memory_search` and `kiwifs_memory_read`.
+- **Redacted session backups.** The transcript tree is captured in redacted
+  chunks with a manifest (binaries omitted and recorded). Verify and export
+  with `/kiwifs-backup-verify`.
+- **Agent-to-agent message board.** Channels on the shared backend, with
+  durable per-consumer delivery and local acknowledgment. Tools:
+  `kiwifs_board_send`, `kiwifs_board_list`, `kiwifs_board_read`,
+  `kiwifs_board_inbox`, `kiwifs_board_ack`.
+
+### Changes-feed degradation (observed on the reference deployment)
+
+During the T19 live suite, the reference test deployment rejected every
+`kiwi_changes` call with a persistent server-side IsError HTTP 500 once
+the feed had entries — so board delivery could not use its primary
+inbound-discovery mechanism. The extension handles this explicitly
+rather than silently stalling:
+
+- When a poll cycle's `kiwi_changes` call fails with a NON-retryable
+  domain rejection, that cycle falls back to ONE bounded
+  `kiwi_query_meta` listing pass. Availability faults (transport/network
+  errors) never trigger the fallback — they pause the cycle, since
+  switching discovery primitives mid-outage cannot tell you what was
+  delivered.
+- The fallback listing is bounded per cycle (≤20 pages, ≤1000 candidate
+  paths), strictly post-filtered to board-message paths, and already-
+  handled paths are excluded so a stable listing order cannot starve
+  the backlog. If the listing hits the bound, the truncation is
+  disclosed in the cycle result, status snapshot and tool output —
+  never hidden.
+- Every fallback candidate goes through the same fresh-read parse, TTL,
+  dedupe and recipient checks as feed-delivered messages — the fallback
+  discovers exactly the deliverable message set and no more.
+- The stored changes cursor is untouched in fallback mode. When
+  `kiwi_changes` resumes, the next healthy cycle replays from the
+  cursor and client-side dedupe by `msg_id` absorbs any overlap with
+  what the fallback already delivered.
+- Fallback activation is visible: the board status snapshot and the
+  `kiwifs_board_inbox` output carry
+  `discovery=listing-fallback (changes feed rejected; bounded
+query_meta discovery in use)`. It is a disclosure of a degraded
+  backend, never a health claim, and it clears after a healthy changes
+  cycle.
+
+User commands: `/kiwifs-status`, `/kiwifs-private-mode`,
+`/kiwifs-extract-now`, `/kiwifs-reflect-now`, `/kiwifs-proposal`,
+`/kiwifs-forget`, `/kiwifs-forget-undo`, `/kiwifs-personal-note`,
+`/kiwifs-board-cleanup`,
+`/kiwifs-backup-verify`,
+`/kiwifs-board-gc`, `/kiwifs-queue`, `/kiwifs-erasure-report`. All are
+headless/RPC safe; record-mutating ones require explicit confirmation.
+
+Privacy: content is redacted before every outbound edge (model calls,
+backend writes, queries, queue, audit log). Configurable exclusions never
+capture matched content. Private mode holds ALL reads and writes in all
+three domains, with pending work held and never deleted.
+
+## Requirements
+
+- Pi 0.85.0 (the version this was developed and tested against; the package
+  peer dependency is intentionally open, not a tested-version claim).
+- Node.js >= 22.19.0. The test suite runs on exact Node 22.19.0 and Node 24.19.0.
+- An existing KiwiFS service with its MCP endpoint. The extension connects
+  to your service; it does not install or manage a backend. Tested against
+  KiwiFS v0.19.62.
+
+## Setup
+
+1. Install the extension:
+
+   ```sh
+   pi install git:github.com/fazekasda/pi-kiwifs-memory
+   # or, from a local checkout:
+   pi install /absolute/path/to/pi-kiwifs-memory
+   ```
+
+   There is no npm release. The first beta is distributed as a GitHub
+   prerelease tag only (`v0.1.0-beta.0`, not yet created; see
+   [docs/release-notes-0.1.0-beta.0.md](docs/release-notes-0.1.0-beta.0.md)).
+   npm publication is a separate, future decision requiring explicit
+   approval (see `docs/publishing.md`). Until the beta tag exists, install
+   from a pinned Git commit of this repository. Do not also use `-e` while
+   the same extension is installed locally.
+
+2. Write a config file and point `KIWIFS_MEMORY_CONFIG` at it. A minimal
+   opt-in example with credentials by environment-variable reference:
+
+   ```json
+   {
+     "schemaVersion": 1,
+     "enabled": true,
+     "mcp": {
+       "url": "https://kiwifs.example.internal/mcp",
+       "auth": { "kind": "env", "ref": "KIWIFS_MCP_APIKEY" }
+     },
+     "model": {
+       "route": "openrouter/z-ai/glm-5.3-flash",
+       "auth": { "kind": "env", "ref": "OPENROUTER_API_KEY" }
+     },
+     "budgets": {
+       "tokenizer": { "module": "/abs/path/to/my-tokenizer.mjs" }
+     },
+     "board": { "consumerId": "laptop-1" }
+   }
+   ```
+
+   ```sh
+   export KIWIFS_MEMORY_CONFIG="$HOME/.config/kiwifs/memory.json"
+   export KIWIFS_MCP_APIKEY="..."
+   export OPENROUTER_API_KEY="..."
+   ```
+
+   Never put secret values in the config file; the schema rejects inline
+   credentials. Point `mcp.url` at an apikey-authenticated MCP endpoint. A
+   standalone unauthenticated MCP port must never be used across an
+   untrusted network; see `docs/operations.md`.
+
+3. Supply a tokenizer module for your model (`budgets.tokenizer`). Without
+   one, automatic context injection stays skipped with a visible note and
+   the explicit search/read tools keep working. The extension never
+   approximates the token cap with character estimates and never silently
+   falls back. See `docs/configuration.md` for the module contract.
+
+4. Start Pi and run `/kiwifs-status`. It shows the overall state
+   (`healthy`, `degraded`, `private`, `disabled`) and the resolved
+   non-secret settings. If anything failed to initialize, the reason is on
+   that screen, not buried in a log.
+
+Full field reference: [docs/configuration.md](docs/configuration.md).
+Running the features day to day, outage/queue behavior, backup rules,
+forgetting and erasure limits, troubleshooting:
+[docs/operations.md](docs/operations.md).
+
+## Beta support and feedback
+
+This is a beta (`v0.1.0-beta.0`), not a stable release. Before relying on
+it, read the [beta privacy notice and known
+limitations](docs/beta-privacy.md). Upgrade, downgrade and rollback steps
+that preserve pending work are in the
+[rollback runbook](docs/rollback.md); never delete pending outbox work to
+recover. The [beta acceptance record](docs/beta-acceptance.md) tracks
+which install, upgrade, rollback and TUI checks have actually been
+performed.
+
+- **Security or privacy reports:** never as a public issue — see
+  [SECURITY.md](SECURITY.md) and the repository's private vulnerability
+  reporting (Security tab).
+- **Confirmed bugs:** GitHub Issues, using the templates under
+  `.github/ISSUE_TEMPLATE/` (bug, data loss, backend compatibility,
+  privacy/security). Templates ask for versions and sanitized
+  diagnostics — never credentials, raw transcripts, config files, or
+  stored memory bodies.
+- **Questions and beta feedback:** GitHub
+  [Discussions](https://github.com/fazekasda/pi-kiwifs-memory/discussions),
+  for anything that is not a confirmed bug report.
+
+## State on disk
+
+Per project: `<project>/.kiwifs/memory/` (override with
+`KIWIFS_MEMORY_STATE_DIR`) holds the outbox queue, board delivery state,
+session-coordinator state and op logs, with `0700` permissions. Add
+`.kiwifs/` to your project's `.gitignore`; this queue holds redacted
+payloads and must not be committed. The config file path comes from
+`KIWIFS_MEMORY_CONFIG`.
 
 ## Development
 
@@ -65,39 +238,82 @@ pi remove /absolute/path/to/pi-kiwifs-memory
 
 Do not also use `-e` while the same extension is installed locally.
 
-## Install from GitHub
-
-With Pi already installed:
-
-```sh
-pi install git:github.com/fazekasda/pi-kiwifs-memory
-```
-
-This installs the current development scaffold. For a future tagged release,
-append `@v0.1.0` once that tag exists.
-
-After the first npm release, installation will also work with:
-
-```sh
-pi install npm:@fazekasda/pi-kiwifs-memory
-```
-
-The scaffold setup does not publish an npm release.
-
 ## Layout
 
-- `src/index.ts`: Pi extension entry point and status command.
-- `test/extension.test.ts`: command registration, UI, and headless tests.
+- `src/index.ts`: Pi extension entry point, session runtime and command wiring.
+- `src/config/`, `src/scope/`, `src/backend/`, `src/privacy/`, `src/outbox/`,
+  `src/pi/`, `src/observation/`, `src/retrieval/`, `src/inject/`,
+  `src/backup/`, `src/board/`, `src/runtime/`, `src/domain/`: feature modules.
+- `test/`: offline test suite (715 tests), including the fault matrix,
+  budget/quality baselines and long-session bounding audits. The live
+  integration suite is opt-in: `KIWIFS_LIVE_TESTS=1 npm run test:live`.
 - `scripts/check-package.mjs`: verifies the npm package file allowlist.
-- `scripts/smoke-package.mjs`: loads the packed extension in isolated Pi RPC and runs its command.
+- `scripts/smoke-package.mjs`: packs the extension and loads it in an
+  isolated Pi RPC process (no user credentials or installed extensions)
+  with no backend configured, asserting command registration and a safe
+  offline startup.
 - `devenv.nix`, `devenv.yaml`, `.envrc`: Nix development environment.
 - `.github/workflows/ci.yml`: Node compatibility and Nix checks.
 - `.github/workflows/publish.yml`: release-triggered npm trusted publishing.
-- [Publishing research and release steps](docs/publishing.md).
+- [Configuration guide](docs/configuration.md), [operations guide](docs/operations.md),
+  [privacy notes](docs/privacy.md), [memory lifecycle](docs/memory-lifecycle.md),
+  [architecture](docs/architecture.md), [decisions](docs/decisions.md),
+  [publishing research and release steps](docs/publishing.md).
 
 Pi loads TypeScript directly, so releases ship `src/`, not a compiled bundle.
 Runtime dependencies must go in `dependencies`; development tools belong in
 `devDependencies`. Pi supplies its own core packages at runtime.
+
+## Known limitations
+
+Read before trusting this extension with anything you cannot afford to
+leak. These are documented behavior, not aspirational TODOs.
+
+- **Redaction is best effort.** Pattern and entropy scanning misses
+  unrecognized secret formats and low-entropy secrets, and over-redacts
+  random-looking identifiers. `docs/privacy.md` details the limits.
+- **No reliable bundled tokenizer.** Automatic injection requires a
+  user-supplied model-compatible tokenizer; without one, injection is
+  skipped visibly. Synthetic tokenizers used in tests are not valid for
+  production models.
+- **Semantic search under-recall is permanent** (backend design): scope
+  filtering happens after candidate selection server-side, and superseded
+  or deleted records can surface from vector legs; read-back guards reject
+  them, and keyword-only hybrid results are disclosed as degraded, never
+  counted as semantic evidence.
+- **The MCP transport must be network-protected.** Authentication is a
+  bearer apikey on the authenticated `/mcp` endpoint; standalone MCP ports
+  are unauthenticated. The extension's own credential handling proves
+  nothing about server-side enforcement.
+- **Erasure is reversible forgetting only.** No automatic erasure and no
+  automatic board GC. The ONE remote-delete surface is the explicit,
+  user-confirmed `/kiwifs-board-cleanup` (your own board messages only;
+  conjunctive eligibility, exact-preview confirmation, no CAS/atomicity
+  claim) — see `docs/operations.md`. A true purge of everything else is a
+  manual operator procedure against backend storage, with no secure-erasure
+  guarantee; git history and search indexes retain content regardless.
+- **Backups are redacted and not byte-identical.** Restoring a backup back
+  into Pi sessions is deferred and not attempted.
+- **Board recipient labels are not confidentiality.** Anyone holding the
+  shared backend key can read any channel. There are no TTL or push
+  primitives; delivery is polling-based.
+- **The `kiwi_changes` HTTP 500 is an observed deployment defect, not an
+  MCP protocol fact.** The reference test deployment used in the T19 live
+  run failed every `kiwi_changes` call with a persistent server-side
+  IsError HTTP 500 whenever the feed had entries. This extension does not
+  claim that every KiwiFS deployment behaves this way; on a healthy feed
+  the fallback described under “Changes-feed degradation” never
+  activates. See `docs/operations.md` for the full behavior.
+- **Coexistence with other memory extensions is untested.**
+- **GitHub-only prerelease.** The first beta is distributed only as a
+  GitHub prerelease tag (`v0.1.0-beta.0`), pending explicit user approval;
+  no npm release exists and none is planned for this beta. npm publication
+  is a separate future decision with its own approval gate — see
+  `docs/publishing.md`. The npm publish workflow skips prereleases.
+- **Tested versions.** This beta was tested against Pi 0.85.0, Node.js
+  22.19.0 and 24.19.0, and KiwiFS v0.19.62 (the reference test
+  deployment). Other versions are untested; the npm peer dependency range
+  is open by design, not a compatibility claim.
 
 ## Safety
 
@@ -105,6 +321,8 @@ Pi extensions run with your full user permissions. Review extensions before inst
 Nix and devenv provide development tools, not a sandbox for extension execution.
 Do not commit credentials, Pi session history, or memory data. `.pi/`, `.env*`,
 and `.npmrc` are ignored; npm publishes only the file allowlist in `package.json`.
+Add `.kiwifs/` to your project's `.gitignore` yourself (step 2 above); the
+package allowlist cannot ship local state because it lists only `src/`.
 
 ## License
 

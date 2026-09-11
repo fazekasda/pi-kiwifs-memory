@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 13,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Written integration-tests/run-fixture/demo/observations/2026/02/obs-0001.md (ETag: etag-77ab)"
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Brief pack (estimated 512 tokens, budget 3000):\n\n=== project/demo-proj/memory/observations/2026/02/obs-0001.md ===\nSynthetic in-scope observation body.\n\n=== project/other-proj/memory/observations/2026/02/obs-0042.md ===\nSynthetic OUT-OF-SCOPE body that the adapter guard must drop (brief has no scope parameter; read-back scope check is the only gate).\n\nDropped for budget:\n- project/demo-proj/memory/reflections/2026/01/refl-0002.md (380 tokens)"
+      }
+    ]
+  }
+}

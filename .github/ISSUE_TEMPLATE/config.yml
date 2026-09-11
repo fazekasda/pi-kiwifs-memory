@@ -1,0 +1,13 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security or privacy report
+    url: https://github.com/fazekasda/pi-kiwifs-memory/security/advisories/new
+    about: >-
+      Please do not open a public issue for suspected security or privacy
+      problems. Use GitHub private vulnerability reporting (Security tab)
+      as described in SECURITY.md.
+  - name: Questions and beta feedback (Discussions)
+    url: https://github.com/fazekasda/pi-kiwifs-memory/discussions
+    about: >-
+      Setup questions, usage questions, and beta feedback that are not
+      confirmed bug reports.
