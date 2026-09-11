@@ -6,11 +6,11 @@ commit immediately after these runs.
 
 ## Results
 
-| Gate       | Command              | Result                                                                                                          |
-| ---------- | -------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Check      | `npm run check`      | PASS — typecheck + `prettier --check` + tests: **715 pass, 0 fail, 0 skipped** (63347 ms)                        |
-| Pack check | `npm run pack:check` | PASS (exit 0) — allowlist check + isolated Pi RPC smoke; loads offline, safe disabled startup, no backend       |
-| Devenv     | `devenv test`        | PASS — "Running tests in 78.3s / Tests passed :)", exit 0                                                       |
+| Gate       | Command              | Result                                                                                                    |
+| ---------- | -------------------- | --------------------------------------------------------------------------------------------------------- |
+| Check      | `npm run check`      | PASS — typecheck + `prettier --check` + tests: **715 pass, 0 fail, 0 skipped** (63347 ms)                 |
+| Pack check | `npm run pack:check` | PASS (exit 0) — allowlist check + isolated Pi RPC smoke; loads offline, safe disabled startup, no backend |
+| Devenv     | `devenv test`        | PASS — "Running tests in 78.3s / Tests passed :)", exit 0                                                 |
 
 ## Notes
 
